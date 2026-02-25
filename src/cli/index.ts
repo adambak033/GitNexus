@@ -20,7 +20,7 @@ program
 
 program
   .command('setup')
-  .description('One-time setup: configure MCP for Cursor, Claude Code, OpenCode')
+  .description('One-time setup: configure MCP for Cursor, Claude Code, OpenCode, Codex')
   .action(setupCommand);
 
 program
