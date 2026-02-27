@@ -268,7 +268,11 @@ async function setupCodex(result: SetupResult): Promise<void> {
 
   try {
     const entry = getMcpEntry();
-    await execFileAsync('codex', ['mcp', 'add', 'gitnexus', '--', entry.command, ...entry.args]);
+    await execFileAsync(
+      'codex',
+      ['mcp', 'add', 'gitnexus', '--', entry.command, ...entry.args],
+      { shell: process.platform === 'win32' }
+    );
     result.configured.push('Codex');
     return;
   } catch {
