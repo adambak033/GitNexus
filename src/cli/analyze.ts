@@ -276,6 +276,13 @@ export const analyzeCommand = async (
   // ── Phase 5: Finalize (98–100%) ───────────────────────────────────
   updateBar(98, 'Saving metadata...');
 
+  // Count embeddings in the index (cached + newly generated)
+  let embeddingCount = 0;
+  try {
+    const embResult = await executeQuery(`MATCH (e:CodeEmbedding) RETURN count(e) AS cnt`);
+    embeddingCount = embResult?.[0]?.cnt ?? 0;
+  } catch { /* table may not exist if embeddings never ran */ }
+
   const meta = {
     repoPath,
     lastCommit: currentCommit,
@@ -286,6 +293,7 @@ export const analyzeCommand = async (
       edges: stats.edges,
       communities: pipelineResult.communityResult?.stats.totalCommunities,
       processes: pipelineResult.processResult?.stats.totalProcesses,
+      embeddings: embeddingCount,
     },
   };
   await saveMeta(storagePath, meta);
