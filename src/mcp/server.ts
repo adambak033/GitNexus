@@ -13,7 +13,7 @@
 
 import { createRequire } from 'module';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { CompatibleStdioServerTransport } from './compatible-stdio-transport.js';
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
@@ -277,7 +277,7 @@ export async function startMCPServer(backend: LocalBackend): Promise<void> {
   const server = createMCPServer(backend);
 
   // Connect to stdio transport
-  const transport = new StdioServerTransport();
+  const transport = new CompatibleStdioServerTransport();
   await server.connect(transport);
 
   // Graceful shutdown helper
