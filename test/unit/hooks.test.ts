@@ -21,37 +21,12 @@ import { spawnSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import { runHook, parseHookOutput } from '../utils/hook-test-helpers.js';
 
 // ─── Paths to both hook variants ────────────────────────────────────
 
 const CJS_HOOK = path.resolve(__dirname, '..', '..', 'hooks', 'claude', 'gitnexus-hook.cjs');
 const PLUGIN_HOOK = path.resolve(__dirname, '..', '..', '..', 'gitnexus-claude-plugin', 'hooks', 'gitnexus-hook.js');
-
-// ─── Helper: run a hook script with JSON input on stdin ─────────────
-
-function runHook(hookPath: string, input: Record<string, any>): { stdout: string; stderr: string; status: number | null } {
-  const result = spawnSync(process.execPath, [hookPath], {
-    input: JSON.stringify(input),
-    encoding: 'utf-8',
-    timeout: 10000,
-    stdio: ['pipe', 'pipe', 'pipe'],
-  });
-  return {
-    stdout: result.stdout || '',
-    stderr: result.stderr || '',
-    status: result.status,
-  };
-}
-
-function parseHookOutput(stdout: string): { hookEventName?: string; additionalContext?: string } | null {
-  if (!stdout.trim()) return null;
-  try {
-    const parsed = JSON.parse(stdout.trim());
-    return parsed.hookSpecificOutput || null;
-  } catch {
-    return null;
-  }
-}
 
 // ─── Test fixtures: temporary .gitnexus directory ───────────────────
 

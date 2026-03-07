@@ -13,6 +13,9 @@ import { walkRepositoryPaths, readFileContents } from './filesystem-walker.js';
 import { getLanguageFromFilename } from './utils.js';
 import { isLanguageAvailable } from '../tree-sitter/parser-loader.js';
 import { createWorkerPool, WorkerPool } from './workers/worker-pool.js';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const isDev = process.env.NODE_ENV === 'development';
 
@@ -149,10 +152,19 @@ export const runPipelineFromRepo = async (
     // Create worker pool once, reuse across chunks
     let workerPool: WorkerPool | undefined;
     try {
-      const workerUrl = new URL('./workers/parse-worker.js', import.meta.url);
+      let workerUrl = new URL('./workers/parse-worker.js', import.meta.url);
+      // When running under vitest, import.meta.url points to src/ where no .js exists.
+      // Fall back to the compiled dist/ worker so the pool can spawn real worker threads.
+      const thisDir = fileURLToPath(new URL('.', import.meta.url));
+      if (!fs.existsSync(fileURLToPath(workerUrl))) {
+        const distWorker = path.resolve(thisDir, '..', '..', '..', 'dist', 'core', 'ingestion', 'workers', 'parse-worker.js');
+        if (fs.existsSync(distWorker)) {
+          workerUrl = pathToFileURL(distWorker) as URL;
+        }
+      }
       workerPool = createWorkerPool(workerUrl);
     } catch (err) {
-      // Worker pool creation failed — sequential fallback
+      if (isDev) console.warn('Worker pool creation failed, using sequential fallback:', (err as Error).message);
     }
 
     let filesParsedSoFar = 0;
