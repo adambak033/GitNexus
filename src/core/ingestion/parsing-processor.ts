@@ -5,10 +5,12 @@ import { LANGUAGE_QUERIES } from './tree-sitter-queries.js';
 import { generateId } from '../../lib/utils.js';
 import { SymbolTable } from './symbol-table.js';
 import { ASTCache } from './ast-cache.js';
-import { findSiblingChild, getLanguageFromFilename, yieldToEventLoop } from './utils.js';
+import { getLanguageFromFilename, yieldToEventLoop, DEFINITION_CAPTURE_KEYS, getDefinitionNodeFromCaptures } from './utils.js';
+import { isNodeExported } from './export-detection.js';
 import { detectFrameworkFromAST } from './framework-detection.js';
 import { WorkerPool } from './workers/worker-pool.js';
 import type { ParseWorkerResult, ParseWorkerInput, ExtractedImport, ExtractedCall, ExtractedHeritage, ExtractedRoute } from './workers/parse-worker.js';
+import { getTreeSitterBufferSize, TREE_SITTER_MAX_BUFFER } from './constants.js';
 
 export type FileProgressCallback = (current: number, total: number, filePath: string) => void;
 
@@ -19,183 +21,9 @@ export interface WorkerExtractedData {
   routes: ExtractedRoute[];
 }
 
-const DEFINITION_CAPTURE_KEYS = [
-  'definition.function',
-  'definition.class',
-  'definition.interface',
-  'definition.method',
-  'definition.struct',
-  'definition.enum',
-  'definition.namespace',
-  'definition.module',
-  'definition.trait',
-  'definition.impl',
-  'definition.type',
-  'definition.const',
-  'definition.static',
-  'definition.typedef',
-  'definition.macro',
-  'definition.union',
-  'definition.property',
-  'definition.record',
-  'definition.delegate',
-  'definition.annotation',
-  'definition.constructor',
-  'definition.template',
-] as const;
-
-const getDefinitionNodeFromCaptures = (captureMap: Record<string, any>): any | null => {
-  for (const key of DEFINITION_CAPTURE_KEYS) {
-    if (captureMap[key]) return captureMap[key];
-  }
-  return null;
-};
-
-// ============================================================================
-// EXPORT DETECTION - Language-specific visibility detection
-// ============================================================================
-
-/**
- * Check if a symbol (function, class, etc.) is exported/public
- * Handles all 9 supported languages with explicit logic
- *
- * @param node - The AST node for the symbol name
- * @param name - The symbol name
- * @param language - The programming language
- * @returns true if the symbol is exported/public
- */
-export const isNodeExported = (node: any, name: string, language: string): boolean => {
-  let current = node;
-
-  switch (language) {
-    // JavaScript/TypeScript: Check for export keyword in ancestors
-    case 'javascript':
-    case 'typescript':
-      while (current) {
-        const type = current.type;
-        if (type === 'export_statement' ||
-            type === 'export_specifier' ||
-            type === 'lexical_declaration' && current.parent?.type === 'export_statement') {
-          return true;
-        }
-        // Also check if text starts with 'export '
-        if (current.text?.startsWith('export ')) {
-          return true;
-        }
-        current = current.parent;
-      }
-      return false;
-
-    // Python: Public if no leading underscore (convention)
-    case 'python':
-      return !name.startsWith('_');
-
-    // Java: Check for 'public' modifier
-    // In tree-sitter Java, modifiers are siblings of the name node, not parents
-    case 'java':
-      while (current) {
-        // Check if this node or any sibling is a 'modifiers' node containing 'public'
-        if (current.parent) {
-          const parent = current.parent;
-          // Check all children of the parent for modifiers
-          for (let i = 0; i < parent.childCount; i++) {
-            const child = parent.child(i);
-            if (child?.type === 'modifiers' && child.text?.includes('public')) {
-              return true;
-            }
-          }
-          // Also check if the parent's text starts with 'public' (fallback)
-          if (parent.type === 'method_declaration' || parent.type === 'constructor_declaration') {
-            if (parent.text?.trimStart().startsWith('public')) {
-              return true;
-            }
-          }
-        }
-        current = current.parent;
-      }
-      return false;
-
-    // C#: Check for 'public' modifier in ancestors
-    case 'csharp':
-      while (current) {
-        if (current.type === 'modifier' || current.type === 'modifiers') {
-          if (current.text?.includes('public')) return true;
-        }
-        current = current.parent;
-      }
-      return false;
-
-    // Go: Uppercase first letter = exported
-    case 'go':
-      if (name.length === 0) return false;
-      const first = name[0];
-      // Must be uppercase letter (not a number or symbol)
-      return first === first.toUpperCase() && first !== first.toLowerCase();
-
-    // Rust: Check for 'pub' visibility modifier
-    case 'rust':
-      while (current) {
-        if (current.type === 'visibility_modifier') {
-          if (current.text?.includes('pub')) return true;
-        }
-        current = current.parent;
-      }
-      return false;
-
-    // Kotlin: Default visibility is public (unlike Java)
-    // visibility_modifier is inside modifiers, a sibling of the name node within the declaration
-    case 'kotlin':
-      while (current) {
-        if (current.parent) {
-          const visMod = findSiblingChild(current.parent, 'modifiers', 'visibility_modifier');
-          if (visMod) {
-            const text = visMod.text;
-            if (text === 'private' || text === 'internal' || text === 'protected') return false;
-            if (text === 'public') return true;
-          }
-        }
-        current = current.parent;
-      }
-      // No visibility modifier = public (Kotlin default)
-      return true;
-
-    // C/C++: No native export concept at language level
-    // Entry points will be detected via name patterns (main, etc.)
-    case 'c':
-    case 'cpp':
-      return false;
-
-    // Swift: Check for 'public' or 'open' access modifiers
-    case 'swift':
-      while (current) {
-        if (current.type === 'modifiers' || current.type === 'visibility_modifier') {
-          const text = current.text || '';
-          if (text.includes('public') || text.includes('open')) return true;
-        }
-        current = current.parent;
-      }
-      return false;
-
-    // PHP: Check for visibility modifier or top-level scope
-    case 'php':
-      while (current) {
-        if (current.type === 'class_declaration' ||
-            current.type === 'interface_declaration' ||
-            current.type === 'trait_declaration' ||
-            current.type === 'enum_declaration') {
-          return true;
-        }
-        if (current.type === 'visibility_modifier') {
-          return current.text === 'public';
-        }
-        current = current.parent;
-      }
-      return true; // Top-level functions are globally accessible
-
-    default:
-      return false;
-  }
-};
+// isNodeExported imported from ./export-detection.js (shared module)
+// Re-export for backward compatibility with any external consumers
+export { isNodeExported } from './export-detection.js';
 
 // ============================================================================
 // Worker-based parallel parsing
@@ -286,8 +114,8 @@ const processParsingSequential = async (
 
     if (!language) continue;
 
-    // Skip very large files — they can crash tree-sitter or cause OOM
-    if (file.content.length > 512 * 1024) continue;
+    // Skip files larger than the max tree-sitter buffer (32 MB)
+    if (file.content.length > TREE_SITTER_MAX_BUFFER) continue;
 
     try {
       await loadLanguage(language, file.path);
@@ -297,7 +125,7 @@ const processParsingSequential = async (
 
     let tree;
     try {
-      tree = parser.parse(file.content, undefined, { bufferSize: 1024 * 256 });
+      tree = parser.parse(file.content, undefined, { bufferSize: getTreeSitterBufferSize(file.content.length) });
     } catch (parseError) {
       console.warn(`Skipping unparseable file: ${file.path}`);
       continue;
@@ -368,7 +196,7 @@ const processParsingSequential = async (
 
       const definitionNodeForRange = getDefinitionNodeFromCaptures(captureMap);
       const startLine = definitionNodeForRange ? definitionNodeForRange.startPosition.row : (nameNode ? nameNode.startPosition.row : 0);
-      const nodeId = generateId(nodeLabel, `${file.path}:${nodeName}:${startLine}`);
+      const nodeId = generateId(nodeLabel, `${file.path}:${nodeName}`);
 
       const definitionNode = getDefinitionNodeFromCaptures(captureMap);
       const frameworkHint = definitionNode
