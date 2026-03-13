@@ -11,6 +11,7 @@
  */
 
 import { detectFrameworkFromPath } from './framework-detection.js';
+import { SupportedLanguages } from '../../config/supported-languages.js';
 
 // ============================================================================
 // NAME PATTERNS - All 9 supported languages
@@ -38,31 +39,31 @@ const ENTRY_POINT_PATTERNS: Record<string, RegExp[]> = {
   ],
   
   // JavaScript/TypeScript
-  'javascript': [
+  [SupportedLanguages.JavaScript]: [
     /^use[A-Z]/,              // React hooks (useEffect, etc.)
   ],
-  'typescript': [
+  [SupportedLanguages.TypeScript]: [
     /^use[A-Z]/,              // React hooks
   ],
-  
+
   // Python
-  'python': [
+  [SupportedLanguages.Python]: [
     /^app$/,                  // Flask/FastAPI app
     /^(get|post|put|delete|patch)_/i,  // REST conventions
     /^api_/,                  // API functions
     /^view_/,                 // Django views
   ],
-  
+
   // Java
-  'java': [
+  [SupportedLanguages.Java]: [
     /^do[A-Z]/,               // doGet, doPost (Servlets)
     /^create[A-Z]/,           // Factory patterns
     /^build[A-Z]/,            // Builder patterns
     /Service$/,               // UserService
   ],
-  
+
   // C#
-  'csharp': [
+  [SupportedLanguages.CSharp]: [
     /^(Get|Post|Put|Delete|Patch)/,  // ASP.NET action methods
     /Action$/,                        // MVC actions
     /^On[A-Z]/,                      // Event handlers / Blazor lifecycle
@@ -78,7 +79,7 @@ const ENTRY_POINT_PATTERNS: Record<string, RegExp[]> = {
   ],
   
   // Go
-  'go': [
+  [SupportedLanguages.Go]: [
     /Handler$/,               // http.Handler pattern
     /^Serve/,                 // ServeHTTP
     /^New[A-Z]/,              // Constructor pattern (returns new instance)
@@ -86,7 +87,7 @@ const ENTRY_POINT_PATTERNS: Record<string, RegExp[]> = {
   ],
   
   // Rust
-  'rust': [
+  [SupportedLanguages.Rust]: [
     /^(get|post|put|delete)_handler$/i,
     /^handle_/,               // handle_request
     /^new$/,                  // Constructor pattern
@@ -95,7 +96,7 @@ const ENTRY_POINT_PATTERNS: Record<string, RegExp[]> = {
   ],
   
   // C - explicit main() boost plus common C entry point conventions
-  'c': [
+  [SupportedLanguages.C]: [
     /^main$/,                 // THE entry point
     /^init_/,                 // init_server, init_client
     /_init$/,                 // module_init, server_init
@@ -129,7 +130,7 @@ const ENTRY_POINT_PATTERNS: Record<string, RegExp[]> = {
   ],
 
   // C++ - same as C plus OOP/template patterns
-  'cpp': [
+  [SupportedLanguages.CPlusPlus]: [
     /^main$/,                 // THE entry point
     /^init_/,
     /_init$/,
@@ -151,7 +152,7 @@ const ENTRY_POINT_PATTERNS: Record<string, RegExp[]> = {
   ],
 
   // Swift / iOS
-  'swift': [
+  [SupportedLanguages.Swift]: [
     /^viewDidLoad$/,                  // UIKit lifecycle
     /^viewWillAppear$/,               // UIKit lifecycle
     /^viewDidAppear$/,                // UIKit lifecycle
@@ -171,7 +172,7 @@ const ENTRY_POINT_PATTERNS: Record<string, RegExp[]> = {
   ],
 
   // PHP / Laravel
-  'php': [
+  [SupportedLanguages.PHP]: [
     /Controller$/,            // UserController (class name convention)
     /^handle$/,               // Job::handle(), Listener::handle()
     /^execute$/,              // Command::execute()
@@ -254,7 +255,7 @@ export interface EntryPointScoreResult {
  */
 export function calculateEntryPointScore(
   name: string,
-  language: string,
+  language: SupportedLanguages,
   isExported: boolean,
   callerCount: number,
   calleeCount: number,

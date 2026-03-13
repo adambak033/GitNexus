@@ -1,12 +1,25 @@
 import { KnowledgeGraph } from '../graph/types.js';
 import { ASTCache } from './ast-cache.js';
-import { SymbolTable } from './symbol-table.js';
-import { ImportMap } from './import-processor.js';
+import type { SymbolDefinition, SymbolTable } from './symbol-table.js';
+import { ImportMap, PackageMap, NamedImportMap, isFileInPackageDir } from './import-processor.js';
+import { resolveSymbol, resolveSymbolInternal } from './symbol-resolver.js';
+import { walkBindingChain } from './named-binding-extraction.js';
 import Parser from 'tree-sitter';
 import { isLanguageAvailable, loadParser, loadLanguage } from '../tree-sitter/parser-loader.js';
 import { LANGUAGE_QUERIES } from './tree-sitter-queries.js';
 import { generateId } from '../../lib/utils.js';
-import { getLanguageFromFilename, isVerboseIngestionEnabled, yieldToEventLoop, FUNCTION_NODE_TYPES, extractFunctionName, isBuiltInOrNoise } from './utils.js';
+import {
+  getLanguageFromFilename,
+  isVerboseIngestionEnabled,
+  yieldToEventLoop,
+  FUNCTION_NODE_TYPES,
+  extractFunctionName,
+  isBuiltInOrNoise,
+  countCallArguments,
+  inferCallForm,
+  extractReceiverName,
+} from './utils.js';
+import { buildTypeEnv, lookupTypeEnv } from './type-env.js';
 import { getTreeSitterBufferSize } from './constants.js';
 import type { ExtractedCall, ExtractedRoute } from './workers/parse-worker.js';
 
@@ -44,7 +57,9 @@ export const processCalls = async (
   astCache: ASTCache,
   symbolTable: SymbolTable,
   importMap: ImportMap,
-  onProgress?: (current: number, total: number) => void
+  packageMap?: PackageMap,
+  onProgress?: (current: number, total: number) => void,
+  namedImportMap?: NamedImportMap,
 ) => {
   const parser = await loadParser();
   const logSkipped = isVerboseIngestionEnabled();
@@ -100,6 +115,10 @@ export const processCalls = async (
       continue;
     }
 
+    // Build per-file TypeEnv for receiver resolution
+    const lang = getLanguageFromFilename(file.path);
+    const typeEnv = lang ? buildTypeEnv(tree, lang) : new Map();
+
     // 3. Process each call match
     matches.forEach(match => {
       const captureMap: Record<string, any> = {};
@@ -116,18 +135,22 @@ export const processCalls = async (
       // Skip common built-ins and noise
       if (isBuiltInOrNoise(calledName)) return;
 
+      const callNode = captureMap['call'];
+      const callForm = inferCallForm(callNode, nameNode);
+      const receiverName = callForm === 'member' ? extractReceiverName(nameNode) : undefined;
+      const receiverTypeName = receiverName ? lookupTypeEnv(typeEnv, receiverName, callNode) : undefined;
+
       // 4. Resolve the target using priority strategy (returns confidence)
-      const resolved = resolveCallTarget(
+      const resolved = resolveCallTarget({
         calledName,
-        file.path,
-        symbolTable,
-        importMap
-      );
+        argCount: countCallArguments(callNode),
+        callForm,
+        receiverTypeName,
+      }, file.path, symbolTable, importMap, packageMap, namedImportMap);
 
       if (!resolved) return;
 
       // 5. Find the enclosing function (caller)
-      const callNode = captureMap['call'];
       const enclosingFuncId = findEnclosingFunction(callNode, file.path, symbolTable);
       
       // Use enclosing function as source, fallback to file for top-level calls
@@ -163,49 +186,167 @@ export const processCalls = async (
 interface ResolveResult {
   nodeId: string;
   confidence: number;  // 0-1: how sure are we?
-  reason: string;      // 'import-resolved' | 'same-file' | 'fuzzy-global'
+  reason: string;      // 'import-resolved' | 'same-file' | 'unique-global'
 }
 
-/**
- * Resolve a function call to its target node ID using priority strategy:
- * A. Check imported files first (highest confidence)
- * B. Check local file definitions
- * C. Fuzzy global search (lowest confidence)
- * 
- * Returns confidence score so agents know what to trust.
- */
-const resolveCallTarget = (
+type ResolutionTier = 'same-file' | 'import-scoped' | 'unique-global';
+
+interface TieredCandidates {
+  candidates: SymbolDefinition[];
+  tier: ResolutionTier;
+}
+
+const CALLABLE_SYMBOL_TYPES = new Set([
+  'Function',
+  'Method',
+  'Constructor',
+  'Macro',
+  'Delegate',
+]);
+
+const collectTieredCandidates = (
   calledName: string,
   currentFile: string,
   symbolTable: SymbolTable,
-  importMap: ImportMap
-): ResolveResult | null => {
-  // Strategy B first (cheapest — single map lookup): Check local file
-  const localNodeId = symbolTable.lookupExact(currentFile, calledName);
-  if (localNodeId) {
-    return { nodeId: localNodeId, confidence: 0.85, reason: 'same-file' };
-  }
-
-  // Strategy A: Check if any definition of calledName is in an imported file
-  // Reversed: instead of iterating all imports and checking each, get all definitions
-  // and check if any is imported. O(definitions) instead of O(imports).
+  importMap: ImportMap,
+  packageMap?: PackageMap,
+  namedImportMap?: NamedImportMap,
+): TieredCandidates | null => {
   const allDefs = symbolTable.lookupFuzzy(calledName);
-  if (allDefs.length > 0) {
-    const importedFiles = importMap.get(currentFile);
-    if (importedFiles) {
-      for (const def of allDefs) {
-        if (importedFiles.has(def.filePath)) {
-          return { nodeId: def.nodeId, confidence: 0.9, reason: 'import-resolved' };
-        }
-      }
-    }
 
-    // Strategy C: Fuzzy global (no import match found)
-    const confidence = allDefs.length === 1 ? 0.5 : 0.3;
-    return { nodeId: allDefs[0].nodeId, confidence, reason: 'fuzzy-global' };
+  // Tier 1: Same-file — highest priority, prevents imports from shadowing local defs
+  // (matches resolveSymbolInternal which checks lookupExactFull before named bindings)
+  const localDefs = allDefs.filter(def => def.filePath === currentFile);
+  if (localDefs.length > 0) {
+    return { candidates: localDefs, tier: 'same-file' };
   }
 
-  return null;
+  // Tier 2a-named: Check named bindings with re-export chain following.
+  // Aliased imports (import { User as U }) mean lookupFuzzy('U') returns
+  // empty but we can resolve via the exported name.
+  // Re-exports (export { User } from './base') are followed up to 5 hops.
+  if (namedImportMap) {
+    const chainResult = resolveNamedBindingChainForCandidates(
+      calledName, currentFile, symbolTable, namedImportMap, allDefs,
+    );
+    if (chainResult) return chainResult;
+  }
+
+  if (allDefs.length === 0) return null;
+
+  const importedFiles = importMap.get(currentFile);
+  if (importedFiles) {
+    const importedDefs = allDefs.filter(def => importedFiles.has(def.filePath));
+    if (importedDefs.length > 0) {
+      return { candidates: importedDefs, tier: 'import-scoped' };
+    }
+  }
+
+  const importedPackages = packageMap?.get(currentFile);
+  if (importedPackages) {
+    const packageDefs = allDefs.filter(def => {
+      for (const dirSuffix of importedPackages) {
+        if (isFileInPackageDir(def.filePath, dirSuffix)) return true;
+      }
+      return false;
+    });
+    if (packageDefs.length > 0) {
+      return { candidates: packageDefs, tier: 'import-scoped' };
+    }
+  }
+
+  // Tier 3: Global — pass all candidates through; filterCallableCandidates
+  // will narrow by kind/arity and resolveCallTarget only emits when exactly 1 remains.
+  return { candidates: allDefs, tier: 'unique-global' };
+};
+
+const CONSTRUCTOR_TARGET_TYPES = new Set(['Constructor', 'Class', 'Struct', 'Record']);
+
+const filterCallableCandidates = (
+  candidates: SymbolDefinition[],
+  argCount?: number,
+  callForm?: 'free' | 'member' | 'constructor',
+): SymbolDefinition[] => {
+  let kindFiltered: SymbolDefinition[];
+
+  if (callForm === 'constructor') {
+    // For constructor calls, prefer Constructor > Class/Struct/Record > callable fallback
+    const constructors = candidates.filter(c => c.type === 'Constructor');
+    if (constructors.length > 0) {
+      kindFiltered = constructors;
+    } else {
+      const types = candidates.filter(c => CONSTRUCTOR_TARGET_TYPES.has(c.type));
+      kindFiltered = types.length > 0 ? types : candidates.filter(c => CALLABLE_SYMBOL_TYPES.has(c.type));
+    }
+  } else {
+    kindFiltered = candidates.filter(c => CALLABLE_SYMBOL_TYPES.has(c.type));
+  }
+
+  if (kindFiltered.length === 0) return [];
+  if (argCount === undefined) return kindFiltered;
+
+  const hasParameterMetadata = kindFiltered.some(candidate => candidate.parameterCount !== undefined);
+  if (!hasParameterMetadata) return kindFiltered;
+
+  return kindFiltered.filter(candidate =>
+    candidate.parameterCount === undefined || candidate.parameterCount === argCount
+  );
+};
+
+const toResolveResult = (
+  definition: SymbolDefinition,
+  tier: ResolutionTier,
+): ResolveResult => {
+  if (tier === 'same-file') {
+    return { nodeId: definition.nodeId, confidence: 0.95, reason: 'same-file' };
+  }
+  if (tier === 'import-scoped') {
+    return { nodeId: definition.nodeId, confidence: 0.9, reason: 'import-resolved' };
+  }
+  return { nodeId: definition.nodeId, confidence: 0.5, reason: 'unique-global' };
+};
+
+/**
+ * Resolve a function call to its target node ID using priority strategy:
+ * A. Narrow candidates by scope tier (same-file, import-scoped, unique-global)
+ * B. Filter to callable symbol kinds (constructor-aware when callForm is set)
+ * C. Apply arity filtering when parameter metadata is available
+ * D. Apply receiver-type filtering for member calls with typed receivers
+ *
+ * If filtering still leaves multiple candidates, refuse to emit a CALLS edge.
+ */
+const resolveCallTarget = (
+  call: Pick<ExtractedCall, 'calledName' | 'argCount' | 'callForm' | 'receiverTypeName'>,
+  currentFile: string,
+  symbolTable: SymbolTable,
+  importMap: ImportMap,
+  packageMap?: PackageMap,
+  namedImportMap?: NamedImportMap,
+): ResolveResult | null => {
+  const tiered = collectTieredCandidates(call.calledName, currentFile, symbolTable, importMap, packageMap, namedImportMap);
+  if (!tiered) return null;
+
+  const filteredCandidates = filterCallableCandidates(tiered.candidates, call.argCount, call.callForm);
+
+  // D. Receiver-type filtering: for member calls with a known receiver type,
+  // filter candidates by ownerId matching the resolved type's nodeId
+  if (call.callForm === 'member' && call.receiverTypeName && filteredCandidates.length > 1) {
+    const typeDefs = symbolTable.lookupFuzzy(call.receiverTypeName);
+    if (typeDefs.length > 0) {
+      const typeNodeIds = new Set(typeDefs.map(d => d.nodeId));
+      const ownerFiltered = filteredCandidates.filter(c => c.ownerId && typeNodeIds.has(c.ownerId));
+      if (ownerFiltered.length === 1) {
+        return toResolveResult(ownerFiltered[0], tiered.tier);
+      }
+      // If receiver filtering narrows to 0, fall through to name-only resolution
+      // If still 2+, refuse (don't guess)
+      if (ownerFiltered.length > 1) return null;
+    }
+  }
+
+  if (filteredCandidates.length !== 1) return null;
+
+  return toResolveResult(filteredCandidates[0], tiered.tier);
 };
 
 /**
@@ -218,7 +359,9 @@ export const processCallsFromExtracted = async (
   extractedCalls: ExtractedCall[],
   symbolTable: SymbolTable,
   importMap: ImportMap,
-  onProgress?: (current: number, total: number) => void
+  packageMap?: PackageMap,
+  onProgress?: (current: number, total: number) => void,
+  namedImportMap?: NamedImportMap,
 ) => {
   // Group by file for progress reporting
   const byFile = new Map<string, ExtractedCall[]>();
@@ -243,10 +386,12 @@ export const processCallsFromExtracted = async (
 
     for (const call of calls) {
       const resolved = resolveCallTarget(
-        call.calledName,
+        call,
         call.filePath,
         symbolTable,
-        importMap
+        importMap,
+        packageMap,
+        namedImportMap,
       );
       if (!resolved) continue;
 
@@ -273,6 +418,7 @@ export const processRoutesFromExtracted = async (
   extractedRoutes: ExtractedRoute[],
   symbolTable: SymbolTable,
   importMap: ImportMap,
+  packageMap?: PackageMap,
   onProgress?: (current: number, total: number) => void
 ) => {
   for (let i = 0; i < extractedRoutes.length; i++) {
@@ -284,24 +430,16 @@ export const processRoutesFromExtracted = async (
 
     if (!route.controllerName || !route.methodName) continue;
 
-    // Resolve controller class in symbol table
-    const controllerDefs = symbolTable.lookupFuzzy(route.controllerName);
-    if (controllerDefs.length === 0) continue;
+    // Resolve controller class using shared resolver (Tier 1: same file,
+    // Tier 2: import-scoped, Tier 3: unique global).
+    const resolution = resolveSymbolInternal(route.controllerName, route.filePath, symbolTable, importMap, packageMap);
+    if (!resolution) continue;
 
-    // Prefer import-resolved match
-    const importedFiles = importMap.get(route.filePath);
-    let controllerDef = controllerDefs[0];
-    let confidence = controllerDefs.length === 1 ? 0.7 : 0.5;
-
-    if (importedFiles) {
-      for (const def of controllerDefs) {
-        if (importedFiles.has(def.filePath)) {
-          controllerDef = def;
-          confidence = 0.9;
-          break;
-        }
-      }
-    }
+    const controllerDef = resolution.definition;
+    // Derive confidence from the resolution tier
+    const confidence = resolution.tier === 'same-file' ? 0.95
+      : resolution.tier === 'import-scoped' ? 0.9
+      : 0.7;
 
     // Find the method on the controller
     const methodId = symbolTable.lookupExact(controllerDef.filePath, route.methodName);
@@ -334,4 +472,23 @@ export const processRoutesFromExtracted = async (
   }
 
   onProgress?.(extractedRoutes.length, extractedRoutes.length);
+};
+
+/**
+ * Follow re-export chains through NamedImportMap for call candidate collection.
+ * Delegates chain-walking to the shared walkBindingChain utility, then
+ * applies call-processor semantics: any number of matches accepted.
+ */
+const resolveNamedBindingChainForCandidates = (
+  calledName: string,
+  currentFile: string,
+  symbolTable: SymbolTable,
+  namedImportMap: NamedImportMap,
+  allDefs: SymbolDefinition[],
+): TieredCandidates | null => {
+  const defs = walkBindingChain(calledName, currentFile, symbolTable, namedImportMap, allDefs);
+  if (defs && defs.length > 0) {
+    return { candidates: defs, tier: 'import-scoped' };
+  }
+  return null;
 };

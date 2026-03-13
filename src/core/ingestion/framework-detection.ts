@@ -437,6 +437,8 @@ export const FRAMEWORK_AST_PATTERNS = {
   'combine': ['sink', 'assign', 'Publisher', 'Subscriber'],
 };
 
+import { SupportedLanguages } from '../../config/supported-languages.js';
+
 interface AstFrameworkPatternConfig {
   framework: string;
   entryPointMultiplier: number;
@@ -445,33 +447,33 @@ interface AstFrameworkPatternConfig {
 }
 
 const AST_FRAMEWORK_PATTERNS_BY_LANGUAGE: Record<string, AstFrameworkPatternConfig[]> = {
-  javascript: [
+  [SupportedLanguages.JavaScript]: [
     { framework: 'nestjs', entryPointMultiplier: 3.2, reason: 'nestjs-decorator', patterns: FRAMEWORK_AST_PATTERNS.nestjs },
   ],
-  typescript: [
+  [SupportedLanguages.TypeScript]: [
     { framework: 'nestjs', entryPointMultiplier: 3.2, reason: 'nestjs-decorator', patterns: FRAMEWORK_AST_PATTERNS.nestjs },
   ],
-  python: [
+  [SupportedLanguages.Python]: [
     { framework: 'fastapi', entryPointMultiplier: 3.0, reason: 'fastapi-decorator', patterns: FRAMEWORK_AST_PATTERNS.fastapi },
     { framework: 'flask', entryPointMultiplier: 2.8, reason: 'flask-decorator', patterns: FRAMEWORK_AST_PATTERNS.flask },
   ],
-  java: [
+  [SupportedLanguages.Java]: [
     { framework: 'spring', entryPointMultiplier: 3.2, reason: 'spring-annotation', patterns: FRAMEWORK_AST_PATTERNS.spring },
     { framework: 'jaxrs', entryPointMultiplier: 3.0, reason: 'jaxrs-annotation', patterns: FRAMEWORK_AST_PATTERNS.jaxrs },
   ],
-  kotlin: [
+  [SupportedLanguages.Kotlin]: [
     { framework: 'spring-kotlin', entryPointMultiplier: 3.2, reason: 'spring-kotlin-annotation', patterns: FRAMEWORK_AST_PATTERNS.spring },
     { framework: 'jaxrs', entryPointMultiplier: 3.0, reason: 'jaxrs-annotation', patterns: FRAMEWORK_AST_PATTERNS.jaxrs },
     { framework: 'ktor', entryPointMultiplier: 2.8, reason: 'ktor-routing', patterns: ['routing', 'embeddedServer', 'Application.module'] },
     { framework: 'android-kotlin', entryPointMultiplier: 2.5, reason: 'android-annotation', patterns: ['@AndroidEntryPoint', 'AppCompatActivity', 'Fragment('] },
   ],
-  csharp: [
+  [SupportedLanguages.CSharp]: [
     { framework: 'aspnet', entryPointMultiplier: 3.2, reason: 'aspnet-attribute', patterns: FRAMEWORK_AST_PATTERNS.aspnet },
     { framework: 'signalr', entryPointMultiplier: 2.8, reason: 'signalr-attribute', patterns: FRAMEWORK_AST_PATTERNS.signalr },
     { framework: 'blazor', entryPointMultiplier: 2.5, reason: 'blazor-attribute', patterns: FRAMEWORK_AST_PATTERNS.blazor },
     { framework: 'efcore', entryPointMultiplier: 2.0, reason: 'efcore-pattern', patterns: FRAMEWORK_AST_PATTERNS.efcore },
   ],
-  php: [
+  [SupportedLanguages.PHP]: [
     { framework: 'laravel', entryPointMultiplier: 3.0, reason: 'php-route-attribute', patterns: FRAMEWORK_AST_PATTERNS.laravel },
   ],
 };
@@ -491,7 +493,7 @@ const AST_PATTERNS_LOWERED: Record<string, Array<{ framework: string; entryPoint
  * Note: callers should slice definitionText to ~300 chars since annotations appear at the start.
  */
 export function detectFrameworkFromAST(
-  language: string,
+  language: SupportedLanguages,
   definitionText: string
 ): FrameworkHint | null {
   if (!language || !definitionText) return null;

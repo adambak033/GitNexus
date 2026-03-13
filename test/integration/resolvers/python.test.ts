@@ -1,0 +1,383 @@
+/**
+ * Python: relative imports + class inheritance + ambiguous module disambiguation
+ */
+import { describe, it, expect, beforeAll } from 'vitest';
+import path from 'path';
+import {
+  FIXTURES, getRelationships, getNodesByLabel, edgeSet,
+  runPipelineFromRepo, type PipelineResult,
+} from './helpers.js';
+
+// ---------------------------------------------------------------------------
+// Heritage: relative imports + class inheritance
+// ---------------------------------------------------------------------------
+
+describe('Python relative import & heritage resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'python-pkg'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects exactly 3 classes and 5 functions', () => {
+    expect(getNodesByLabel(result, 'Class')).toEqual(['AuthService', 'BaseModel', 'User']);
+    expect(getNodesByLabel(result, 'Function')).toEqual(['authenticate', 'get_name', 'process_model', 'save', 'validate']);
+  });
+
+  it('emits exactly 1 EXTENDS edge: User → BaseModel', () => {
+    const extends_ = getRelationships(result, 'EXTENDS');
+    expect(extends_.length).toBe(1);
+    expect(extends_[0].source).toBe('User');
+    expect(extends_[0].target).toBe('BaseModel');
+  });
+
+  it('resolves all 3 relative imports', () => {
+    const imports = getRelationships(result, 'IMPORTS');
+    expect(imports.length).toBe(3);
+    expect(edgeSet(imports)).toEqual([
+      'auth.py → user.py',
+      'helpers.py → base.py',
+      'user.py → base.py',
+    ]);
+  });
+
+  it('emits exactly 3 CALLS edges', () => {
+    const calls = getRelationships(result, 'CALLS');
+    expect(calls.length).toBe(3);
+    expect(edgeSet(calls)).toEqual([
+      'authenticate → validate',
+      'process_model → save',
+      'process_model → validate',
+    ]);
+  });
+
+  it('no OVERRIDES edges target Property nodes', () => {
+    const overrides = getRelationships(result, 'OVERRIDES');
+    for (const edge of overrides) {
+      const target = result.graph.getNode(edge.rel.targetId);
+      expect(target).toBeDefined();
+      expect(target!.label).not.toBe('Property');
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Ambiguous: Handler in two packages, relative import disambiguates
+// ---------------------------------------------------------------------------
+
+describe('Python ambiguous symbol resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'python-ambiguous'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects 2 Handler classes', () => {
+    const classes = getNodesByLabel(result, 'Class');
+    expect(classes.filter(n => n === 'Handler').length).toBe(2);
+    expect(classes).toContain('UserHandler');
+  });
+
+  it('resolves EXTENDS to models/handler.py (not other/handler.py)', () => {
+    const extends_ = getRelationships(result, 'EXTENDS');
+    expect(extends_.length).toBe(1);
+    expect(extends_[0].source).toBe('UserHandler');
+    expect(extends_[0].target).toBe('Handler');
+    expect(extends_[0].targetFilePath).toBe('models/handler.py');
+  });
+
+  it('import edge points to models/ not other/', () => {
+    const imports = getRelationships(result, 'IMPORTS');
+    expect(imports.length).toBe(1);
+    expect(imports[0].targetFilePath).toBe('models/handler.py');
+  });
+
+  it('all heritage edges point to real graph nodes', () => {
+    for (const edge of getRelationships(result, 'EXTENDS')) {
+      const target = result.graph.getNode(edge.rel.targetId);
+      expect(target).toBeDefined();
+    }
+  });
+});
+
+describe('Python call resolution with arity filtering', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'python-calls'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves run → write_audit to one.py via arity narrowing', () => {
+    const calls = getRelationships(result, 'CALLS');
+    expect(calls.length).toBe(1);
+    expect(calls[0].source).toBe('run');
+    expect(calls[0].target).toBe('write_audit');
+    expect(calls[0].targetFilePath).toBe('one.py');
+    expect(calls[0].rel.reason).toBe('import-resolved');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Member-call resolution: obj.method() resolves through pipeline
+// ---------------------------------------------------------------------------
+
+describe('Python member-call resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'python-member-calls'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves process_user → save as a member call on User', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c => c.target === 'save');
+    expect(saveCall).toBeDefined();
+    expect(saveCall!.source).toBe('process_user');
+    expect(saveCall!.targetFilePath).toBe('user.py');
+  });
+
+  it('detects User class and save function (Python methods are Function nodes)', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    // Python tree-sitter captures all function_definitions as Function, including methods
+    expect(getNodesByLabel(result, 'Function')).toContain('save');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Receiver-constrained resolution: typed variables disambiguate same-named methods
+// ---------------------------------------------------------------------------
+
+describe('Python receiver-constrained resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'python-receiver-resolution'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo classes, both with save functions', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Class')).toContain('Repo');
+    // Python tree-sitter captures all function_definitions as Function
+    const saveFns = getNodesByLabel(result, 'Function').filter(m => m === 'save');
+    expect(saveFns.length).toBe(2);
+  });
+
+  it('resolves user.save() to User.save and repo.save() to Repo.save via receiver typing', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCalls = calls.filter(c => c.target === 'save');
+    expect(saveCalls.length).toBe(2);
+
+    const userSave = saveCalls.find(c => c.targetFilePath === 'user.py');
+    const repoSave = saveCalls.find(c => c.targetFilePath === 'repo.py');
+
+    expect(userSave).toBeDefined();
+    expect(repoSave).toBeDefined();
+    expect(userSave!.source).toBe('process_entities');
+    expect(repoSave!.source).toBe('process_entities');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Named import disambiguation: two modules export same name, from-import resolves
+// ---------------------------------------------------------------------------
+
+describe('Python named import disambiguation', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'python-named-imports'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves process_input → format_data to format_upper.py via from-import', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const formatCall = calls.find(c => c.target === 'format_data');
+    expect(formatCall).toBeDefined();
+    expect(formatCall!.source).toBe('process_input');
+    expect(formatCall!.targetFilePath).toBe('format_upper.py');
+  });
+
+  it('emits IMPORTS edge to format_upper.py', () => {
+    const imports = getRelationships(result, 'IMPORTS');
+    const appImport = imports.find(e => e.source === 'app.py');
+    expect(appImport).toBeDefined();
+    expect(appImport!.targetFilePath).toBe('format_upper.py');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Variadic resolution: *args don't get filtered by arity
+// ---------------------------------------------------------------------------
+
+describe('Python variadic call resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'python-variadic-resolution'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves process_input → log_entry to logger.py despite 3 args vs *args', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const logCall = calls.find(c => c.target === 'log_entry');
+    expect(logCall).toBeDefined();
+    expect(logCall!.source).toBe('process_input');
+    expect(logCall!.targetFilePath).toBe('logger.py');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Alias import resolution: from x import User as U resolves U → User
+// ---------------------------------------------------------------------------
+
+describe('Python alias import resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'python-alias-imports'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo classes', () => {
+    expect(getNodesByLabel(result, 'Class')).toEqual(['Repo', 'User']);
+  });
+
+  it('resolves u.save() to models.py and r.persist() to models.py via alias', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c => c.target === 'save');
+    const persistCall = calls.find(c => c.target === 'persist');
+
+    expect(saveCall).toBeDefined();
+    expect(saveCall!.source).toBe('main');
+    expect(saveCall!.targetFilePath).toBe('models.py');
+
+    expect(persistCall).toBeDefined();
+    expect(persistCall!.source).toBe('main');
+    expect(persistCall!.targetFilePath).toBe('models.py');
+  });
+
+  it('emits exactly 1 IMPORTS edge: app.py → models.py', () => {
+    const imports = getRelationships(result, 'IMPORTS');
+    expect(imports.length).toBe(1);
+    expect(imports[0].sourceFilePath).toBe('app.py');
+    expect(imports[0].targetFilePath).toBe('models.py');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Re-export chain: from .base import X barrel pattern via __init__.py
+// ---------------------------------------------------------------------------
+
+describe('Python re-export chain resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'python-reexport-chain'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves user.save() through __init__.py barrel to models/base.py', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c => c.target === 'save');
+    expect(saveCall).toBeDefined();
+    expect(saveCall!.source).toBe('main');
+    expect(saveCall!.targetFilePath).toBe('models/base.py');
+  });
+
+  it('resolves repo.persist() through __init__.py barrel to models/base.py', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const persistCall = calls.find(c => c.target === 'persist');
+    expect(persistCall).toBeDefined();
+    expect(persistCall!.source).toBe('main');
+    expect(persistCall!.targetFilePath).toBe('models/base.py');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Local shadow: same-file definition takes priority over imported name
+// ---------------------------------------------------------------------------
+
+describe('Python local definition shadows import', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'python-local-shadow'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves save("test") to local save in app.py, not utils.py', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c => c.target === 'save' && c.source === 'main');
+    expect(saveCall).toBeDefined();
+    expect(saveCall!.targetFilePath).toBe('app.py');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Constructor-call resolution: User("alice") resolves to User class
+// ---------------------------------------------------------------------------
+
+describe('Python constructor-call resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'python-constructor-calls'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User class with __init__ and save methods', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Function')).toContain('__init__');
+    expect(getNodesByLabel(result, 'Function')).toContain('save');
+    expect(getNodesByLabel(result, 'Function')).toContain('process');
+  });
+
+  it('resolves import from app.py to models.py', () => {
+    const imports = getRelationships(result, 'IMPORTS');
+    const imp = imports.find(e => e.source === 'app.py' && e.targetFilePath === 'models.py');
+    expect(imp).toBeDefined();
+  });
+
+  it('emits HAS_METHOD from User class to __init__ and save', () => {
+    const hasMethod = getRelationships(result, 'HAS_METHOD');
+    const initEdge = hasMethod.find(e => e.source === 'User' && e.target === '__init__');
+    const saveEdge = hasMethod.find(e => e.source === 'User' && e.target === 'save');
+    expect(initEdge).toBeDefined();
+    expect(saveEdge).toBeDefined();
+  });
+
+  it('resolves user.save() as a method call to models.py', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c => c.target === 'save');
+    expect(saveCall).toBeDefined();
+    expect(saveCall!.source).toBe('process');
+    expect(saveCall!.targetFilePath).toBe('models.py');
+  });
+});

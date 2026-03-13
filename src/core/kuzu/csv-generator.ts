@@ -232,7 +232,8 @@ export const streamAllCSVsToDisk = async (
   const functionWriter = new BufferedCSVWriter(path.join(csvDir, 'function.csv'), codeElementHeader);
   const classWriter = new BufferedCSVWriter(path.join(csvDir, 'class.csv'), codeElementHeader);
   const interfaceWriter = new BufferedCSVWriter(path.join(csvDir, 'interface.csv'), codeElementHeader);
-  const methodWriter = new BufferedCSVWriter(path.join(csvDir, 'method.csv'), codeElementHeader);
+  const methodHeader = 'id,name,filePath,startLine,endLine,isExported,content,description,parameterCount,returnType';
+  const methodWriter = new BufferedCSVWriter(path.join(csvDir, 'method.csv'), methodHeader);
   const codeElemWriter = new BufferedCSVWriter(path.join(csvDir, 'codeelement.csv'), codeElementHeader);
   const communityWriter = new BufferedCSVWriter(path.join(csvDir, 'community.csv'), 'id,label,heuristicLabel,keywords,description,enrichedBy,cohesion,symbolCount');
   const processWriter = new BufferedCSVWriter(path.join(csvDir, 'process.csv'), 'id,label,heuristicLabel,processType,stepCount,communities,entryPointId,terminalId');
@@ -250,7 +251,6 @@ export const streamAllCSVsToDisk = async (
     'Function': functionWriter,
     'Class': classWriter,
     'Interface': interfaceWriter,
-    'Method': methodWriter,
     'CodeElement': codeElemWriter,
   };
 
@@ -308,8 +308,24 @@ export const streamAllCSVsToDisk = async (
         ].join(','));
         break;
       }
+      case 'Method': {
+        const content = await extractContent(node, contentCache);
+        await methodWriter.addRow([
+          escapeCSVField(node.id),
+          escapeCSVField(node.properties.name || ''),
+          escapeCSVField(node.properties.filePath || ''),
+          escapeCSVNumber(node.properties.startLine, -1),
+          escapeCSVNumber(node.properties.endLine, -1),
+          node.properties.isExported ? 'true' : 'false',
+          escapeCSVField(content),
+          escapeCSVField((node.properties as any).description || ''),
+          escapeCSVNumber(node.properties.parameterCount, 0),
+          escapeCSVField(node.properties.returnType || ''),
+        ].join(','));
+        break;
+      }
       default: {
-        // Code element nodes (Function, Class, Interface, Method, CodeElement)
+        // Code element nodes (Function, Class, Interface, CodeElement)
         const writer = codeWriterMap[node.label];
         if (writer) {
           const content = await extractContent(node, contentCache);

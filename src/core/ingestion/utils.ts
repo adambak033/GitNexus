@@ -1,4 +1,9 @@
+import type Parser from 'tree-sitter';
 import { SupportedLanguages } from '../../config/supported-languages.js';
+import { generateId } from '../../lib/utils.js';
+
+/** Tree-sitter AST node. Re-exported for use across ingestion modules. */
+export type SyntaxNode = Parser.SyntaxNode;
 
 /**
  * Ordered list of definition capture keys for tree-sitter query matches.
@@ -236,6 +241,84 @@ export const BUILT_IN_NAMES = new Set([
 /** Check if a name is a built-in function or common noise that should be filtered out */
 export const isBuiltInOrNoise = (name: string): boolean => BUILT_IN_NAMES.has(name);
 
+/** AST node types that represent a class-like container (for HAS_METHOD edge extraction) */
+export const CLASS_CONTAINER_TYPES = new Set([
+  'class_declaration', 'abstract_class_declaration',
+  'interface_declaration', 'struct_declaration', 'record_declaration',
+  'class_specifier', 'struct_specifier',
+  'impl_item', 'trait_item',
+  'class_definition',
+  'trait_declaration',
+  'protocol_declaration',
+]);
+
+export const CONTAINER_TYPE_TO_LABEL: Record<string, string> = {
+  class_declaration: 'Class',
+  abstract_class_declaration: 'Class',
+  interface_declaration: 'Interface',
+  struct_declaration: 'Struct',
+  struct_specifier: 'Struct',
+  class_specifier: 'Class',
+  class_definition: 'Class',
+  impl_item: 'Impl',
+  trait_item: 'Trait',
+  trait_declaration: 'Trait',
+  record_declaration: 'Record',
+  protocol_declaration: 'Interface',
+};
+
+/** Walk up AST to find enclosing class/struct/interface/impl, return its generateId or null.
+ *  For Go method_declaration nodes, extracts receiver type (e.g. `func (u *User) Save()` → User struct). */
+export const findEnclosingClassId = (node: any, filePath: string): string | null => {
+  let current = node.parent;
+  while (current) {
+    // Go: method_declaration has a receiver parameter with the struct type
+    if (current.type === 'method_declaration') {
+      const receiver = current.childForFieldName?.('receiver');
+      if (receiver) {
+        // receiver is a parameter_list: (u *User) or (u User)
+        const paramDecl = receiver.namedChildren?.find?.((c: any) => c.type === 'parameter_declaration');
+        if (paramDecl) {
+          const typeNode = paramDecl.childForFieldName?.('type');
+          if (typeNode) {
+            // Unwrap pointer_type (*User → User)
+            const inner = typeNode.type === 'pointer_type' ? typeNode.firstNamedChild : typeNode;
+            if (inner && (inner.type === 'type_identifier' || inner.type === 'identifier')) {
+              return generateId('Struct', `${filePath}:${inner.text}`);
+            }
+          }
+        }
+      }
+    }
+    if (CLASS_CONTAINER_TYPES.has(current.type)) {
+      // Rust impl_item: for `impl Trait for Struct {}`, pick the type after `for`
+      if (current.type === 'impl_item') {
+        const children = current.children ?? [];
+        const forIdx = children.findIndex((c: any) => c.text === 'for');
+        if (forIdx !== -1) {
+          const nameNode = children.slice(forIdx + 1).find((c: any) =>
+            c.type === 'type_identifier' || c.type === 'identifier'
+          );
+          if (nameNode) {
+            return generateId('Impl', `${filePath}:${nameNode.text}`);
+          }
+        }
+        // Fall through: plain `impl Struct {}` — use first type_identifier below
+      }
+      const nameNode = current.childForFieldName?.('name')
+        ?? current.children?.find((c: any) =>
+          c.type === 'type_identifier' || c.type === 'identifier' || c.type === 'name'
+        );
+      if (nameNode) {
+        const label = CONTAINER_TYPE_TO_LABEL[current.type] || 'Class';
+        return generateId(label, `${filePath}:${nameNode.text}`);
+      }
+    }
+    current = current.parent;
+  }
+  return null;
+};
+
 /**
  * Extract function name and label from a function_definition or similar AST node.
  * Handles C/C++ qualified_identifier (ClassName::MethodName) and other language patterns.
@@ -292,10 +375,10 @@ export const extractFunctionName = (node: any): { funcName: string | null; label
       }
     }
 
-    // Fallback for other languages
+    // Fallback for other languages (Kotlin uses simple_identifier, Swift uses simple_identifier)
     if (!funcName) {
       const nameNode = node.childForFieldName?.('name') ||
-                        node.children?.find((c: any) => c.type === 'identifier' || c.type === 'property_identifier');
+                        node.children?.find((c: any) => c.type === 'identifier' || c.type === 'property_identifier' || c.type === 'simple_identifier');
       funcName = nameNode?.text;
     }
   } else if (node.type === 'impl_item') {
@@ -390,9 +473,337 @@ export const getLanguageFromFilename = (filename: string): SupportedLanguages | 
   return null;
 };
 
+export interface MethodSignature {
+  parameterCount: number | undefined;
+  returnType: string | undefined;
+}
+
+const CALL_ARGUMENT_LIST_TYPES = new Set([
+  'arguments',
+  'argument_list',
+  'value_arguments',
+]);
+
+/**
+ * Extract parameter count and return type text from an AST method/function node.
+ * Works across languages by looking for common AST patterns.
+ */
+export const extractMethodSignature = (node: SyntaxNode | null | undefined): MethodSignature => {
+  let parameterCount: number | undefined = 0;
+  let returnType: string | undefined;
+  let isVariadic = false;
+
+  if (!node) return { parameterCount, returnType };
+
+  const paramListTypes = new Set([
+    'formal_parameters', 'parameters', 'parameter_list',
+    'function_parameters', 'method_parameters', 'function_value_parameters',
+  ]);
+
+  // Node types that indicate variadic/rest parameters
+  const VARIADIC_PARAM_TYPES = new Set([
+    'variadic_parameter_declaration',  // Go: ...string
+    'variadic_parameter',              // Rust: extern "C" fn(...)
+    'spread_parameter',                // Java: Object... args
+    'list_splat_pattern',              // Python: *args
+    'dictionary_splat_pattern',        // Python: **kwargs
+  ]);
+
+  const findParameterList = (current: SyntaxNode): SyntaxNode | null => {
+    for (const child of current.children) {
+      if (paramListTypes.has(child.type)) return child;
+    }
+    for (const child of current.children) {
+      const nested = findParameterList(child);
+      if (nested) return nested;
+    }
+    return null;
+  };
+
+  const parameterList = (
+    paramListTypes.has(node.type) ? node                // node itself IS the parameter list (e.g. C# primary constructors)
+      : node.childForFieldName?.('parameters')
+        ?? findParameterList(node)
+  );
+
+  if (parameterList && paramListTypes.has(parameterList.type)) {
+    for (const param of parameterList.namedChildren) {
+      if (param.type === 'comment') continue;
+      if (param.text === 'self' || param.text === '&self' || param.text === '&mut self' ||
+          param.type === 'self_parameter') {
+        continue;
+      }
+      // Check for variadic parameter types
+      if (VARIADIC_PARAM_TYPES.has(param.type)) {
+        isVariadic = true;
+        continue;
+      }
+      // TypeScript/JavaScript: rest parameter — required_parameter containing rest_pattern
+      if (param.type === 'required_parameter' || param.type === 'optional_parameter') {
+        for (const child of param.children) {
+          if (child.type === 'rest_pattern') {
+            isVariadic = true;
+            break;
+          }
+        }
+        if (isVariadic) continue;
+      }
+      // Kotlin: vararg modifier on a regular parameter
+      if (param.type === 'parameter' || param.type === 'formal_parameter') {
+        const prev = param.previousSibling;
+        if (prev?.type === 'parameter_modifiers' && prev.text.includes('vararg')) {
+          isVariadic = true;
+        }
+      }
+      parameterCount++;
+    }
+    // C/C++: bare `...` token in parameter list (not a named child — check all children)
+    if (!isVariadic) {
+      for (const child of parameterList.children) {
+        if (!child.isNamed && child.text === '...') {
+          isVariadic = true;
+          break;
+        }
+      }
+    }
+  }
+
+  // Return type extraction — language-specific field names
+  // Go: 'result' field is either a type_identifier or parameter_list (multi-return)
+  const goResult = node.childForFieldName?.('result');
+  if (goResult) {
+    returnType = goResult.type === 'parameter_list'
+      ? goResult.text   // multi-return: "(string, error)"
+      : goResult.text;  // single return: "int"
+  }
+
+  // Rust: 'return_type' field — the value IS the type node (e.g. primitive_type, type_identifier).
+  // Skip if the node is a type_annotation (TS/Python), which is handled by the generic loop below.
+  if (!returnType) {
+    const rustReturn = node.childForFieldName?.('return_type');
+    if (rustReturn && rustReturn.type !== 'type_annotation') {
+      returnType = rustReturn.text;
+    }
+  }
+
+  // C/C++: 'type' field on function_definition
+  if (!returnType) {
+    const cppType = node.childForFieldName?.('type');
+    if (cppType && cppType.text !== 'void') {
+      returnType = cppType.text;
+    }
+  }
+
+  // TS/Rust/Python/C#/Kotlin: type_annotation or return_type child
+  if (!returnType) {
+    for (const child of node.children) {
+      if (child.type === 'type_annotation' || child.type === 'return_type') {
+        const typeNode = child.children.find((c) => c.isNamed);
+        if (typeNode) returnType = typeNode.text;
+      }
+    }
+  }
+
+  if (isVariadic) parameterCount = undefined;
+
+  return { parameterCount, returnType };
+};
+
+/**
+ * Count direct arguments for a call expression across common tree-sitter grammars.
+ * Returns undefined when the argument container cannot be located cheaply.
+ */
+export const countCallArguments = (callNode: SyntaxNode | null | undefined): number | undefined => {
+  if (!callNode) return undefined;
+
+  // Direct field or direct child (most languages)
+  let argsNode: SyntaxNode | null | undefined = callNode.childForFieldName('arguments')
+    ?? callNode.children.find((child) => CALL_ARGUMENT_LIST_TYPES.has(child.type));
+
+  // Kotlin/Swift: call_expression → call_suffix → value_arguments
+  // Search one level deeper for languages that wrap arguments in a suffix node
+  if (!argsNode) {
+    for (const child of callNode.children) {
+      if (!child.isNamed) continue;
+      const nested = child.children.find((gc) => CALL_ARGUMENT_LIST_TYPES.has(gc.type));
+      if (nested) { argsNode = nested; break; }
+    }
+  }
+
+  if (!argsNode) return undefined;
+
+  let count = 0;
+  for (const child of argsNode.children) {
+    if (!child.isNamed) continue;
+    if (child.type === 'comment') continue;
+    count++;
+  }
+
+  return count;
+};
+
+// ── Call-form discrimination (Phase 1, Step D) ─────────────────────────
+
+/**
+ * AST node types that indicate a member-access wrapper around the callee name.
+ * When nameNode.parent.type is one of these, the call is a member call.
+ */
+const MEMBER_ACCESS_NODE_TYPES = new Set([
+  'member_expression',           // TS/JS: obj.method()
+  'attribute',                   // Python: obj.method()
+  'member_access_expression',    // C#: obj.Method()
+  'field_expression',            // Rust/C++: obj.method() / ptr->method()
+  'selector_expression',         // Go: obj.Method()
+  'navigation_suffix',           // Kotlin/Swift: obj.method() — nameNode sits inside navigation_suffix
+]);
+
+/**
+ * Call node types that are inherently constructor invocations.
+ * Only includes patterns that the tree-sitter queries already capture as @call.
+ */
+const CONSTRUCTOR_CALL_NODE_TYPES = new Set([
+  'constructor_invocation',              // Kotlin: Foo()
+  'new_expression',                      // TS/JS/C++: new Foo()
+  'object_creation_expression',          // Java/C#/PHP: new Foo()
+  'implicit_object_creation_expression', // C# 9: User u = new(...)
+  'composite_literal',                   // Go: User{...}
+  'struct_expression',                   // Rust: User { ... }
+]);
+
+/**
+ * AST node types for scoped/qualified calls (e.g., Foo::new() in Rust, Foo::bar() in C++).
+ */
+const SCOPED_CALL_NODE_TYPES = new Set([
+  'scoped_identifier',           // Rust: Foo::new()
+  'qualified_identifier',        // C++: ns::func()
+]);
+
+type CallForm = 'free' | 'member' | 'constructor';
+
+/**
+ * Infer whether a captured call site is a free call, member call, or constructor.
+ * Returns undefined if the form cannot be determined.
+ *
+ * Works by inspecting the AST structure between callNode (@call) and nameNode (@call.name).
+ * No tree-sitter query changes needed — the distinction is in the node types.
+ */
+export const inferCallForm = (
+  callNode: SyntaxNode,
+  nameNode: SyntaxNode,
+): CallForm | undefined => {
+  // 1. Constructor: callNode itself is a constructor invocation (Kotlin)
+  if (CONSTRUCTOR_CALL_NODE_TYPES.has(callNode.type)) {
+    return 'constructor';
+  }
+
+  // 2. Member call: nameNode's parent is a member-access wrapper
+  const nameParent = nameNode.parent;
+  if (nameParent && MEMBER_ACCESS_NODE_TYPES.has(nameParent.type)) {
+    return 'member';
+  }
+
+  // 3. PHP: the callNode itself distinguishes member vs free calls
+  if (callNode.type === 'member_call_expression' || callNode.type === 'nullsafe_member_call_expression') {
+    return 'member';
+  }
+  if (callNode.type === 'scoped_call_expression') {
+    return 'member'; // static call Foo::bar()
+  }
+
+  // 4. Java method_invocation: member if it has an 'object' field
+  if (callNode.type === 'method_invocation' && callNode.childForFieldName('object')) {
+    return 'member';
+  }
+
+  // 5. Scoped calls (Rust Foo::new(), C++ ns::func()): treat as free
+  //    The receiver is a type, not an instance — handled differently in Phase 3
+  if (nameParent && SCOPED_CALL_NODE_TYPES.has(nameParent.type)) {
+    return 'free';
+  }
+
+  // 6. Default: if nameNode is a direct child of callNode, it's a free call
+  if (nameNode.parent === callNode || nameParent?.parent === callNode) {
+    return 'free';
+  }
+
+  return undefined;
+};
+
+/**
+ * Extract the receiver identifier for member calls.
+ * Only captures simple identifiers — returns undefined for complex expressions
+ * like getUser().save() or arr[0].method().
+ */
+const SIMPLE_RECEIVER_TYPES = new Set([
+  'identifier',
+  'simple_identifier',
+  'variable_name',     // PHP $variable (tree-sitter-php)
+  'name',              // PHP name node
+  'this',              // TS/JS/Java/C# this.method()
+  'self',              // Rust/Python self.method()
+]);
+
+export const extractReceiverName = (
+  nameNode: SyntaxNode,
+): string | undefined => {
+  const parent = nameNode.parent;
+  if (!parent) return undefined;
+
+  // PHP: member_call_expression / nullsafe_member_call_expression — receiver is on the callNode
+  // Java: method_invocation — receiver is the 'object' field on callNode
+  // For these, parent of nameNode is the call itself, so check the call's object field
+  const callNode = parent.parent ?? parent;
+
+  let receiver: SyntaxNode | null = null;
+
+  // Try standard field names used across grammars
+  receiver = parent.childForFieldName('object')       // TS/JS member_expression, Python attribute, PHP, Java
+    ?? parent.childForFieldName('value')               // Rust field_expression
+    ?? parent.childForFieldName('operand')             // Go selector_expression
+    ?? parent.childForFieldName('expression')          // C# member_access_expression
+    ?? parent.childForFieldName('argument');            // C++ field_expression
+
+  // Java method_invocation: 'object' field is on the callNode, not on nameNode's parent
+  if (!receiver && callNode.type === 'method_invocation') {
+    receiver = callNode.childForFieldName('object');
+  }
+
+  // PHP: member_call_expression has 'object' on the call node
+  if (!receiver && (callNode.type === 'member_call_expression' || callNode.type === 'nullsafe_member_call_expression')) {
+    receiver = callNode.childForFieldName('object');
+  }
+
+  // Kotlin/Swift: navigation_expression target is the first child
+  if (!receiver && parent.type === 'navigation_suffix') {
+    const navExpr = parent.parent;
+    if (navExpr?.type === 'navigation_expression') {
+      // First named child is the target (receiver)
+      for (const child of navExpr.children) {
+        if (child.isNamed && child !== parent) {
+          receiver = child;
+          break;
+        }
+      }
+    }
+  }
+
+  if (!receiver) return undefined;
+
+  // Only capture simple identifiers — refuse complex expressions
+  if (SIMPLE_RECEIVER_TYPES.has(receiver.type)) {
+    return receiver.text;
+  }
+
+  return undefined;
+};
+
 export const isVerboseIngestionEnabled = (): boolean => {
   const raw = process.env.GITNEXUS_VERBOSE;
   if (!raw) return false;
   const value = raw.toLowerCase();
   return value === '1' || value === 'true' || value === 'yes';
 };
+
+
+
+

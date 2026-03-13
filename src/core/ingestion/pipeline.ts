@@ -1,9 +1,17 @@
 import { createKnowledgeGraph } from '../graph/graph.js';
 import { processStructure } from './structure-processor.js';
 import { processParsing } from './parsing-processor.js';
-import { processImports, processImportsFromExtracted, createImportMap, buildImportResolutionContext } from './import-processor.js';
+import {
+  processImports,
+  processImportsFromExtracted,
+  createImportMap,
+  createPackageMap,
+  createNamedImportMap,
+  buildImportResolutionContext
+} from './import-processor.js';
 import { processCalls, processCallsFromExtracted, processRoutesFromExtracted } from './call-processor.js';
 import { processHeritage, processHeritageFromExtracted } from './heritage-processor.js';
+import { computeMRO } from './mro-processor.js';
 import { processCommunities } from './community-processor.js';
 import { processProcesses } from './process-processor.js';
 import { createSymbolTable } from './symbol-table.js';
@@ -36,6 +44,8 @@ export const runPipelineFromRepo = async (
   const symbolTable = createSymbolTable();
   let astCache = createASTCache(AST_CACHE_CAP);
   const importMap = createImportMap();
+  const packageMap = createPackageMap();
+  const namedImportMap = createNamedImportMap();
 
   const cleanup = () => {
     astCache.clear();
@@ -213,21 +223,36 @@ export const runPipelineFromRepo = async (
 
         if (chunkWorkerData) {
           // Imports
-          await processImportsFromExtracted(graph, allPathObjects, chunkWorkerData.imports, importMap, undefined, repoPath, importCtx);
-          // Calls — resolve immediately, then free the array
-          if (chunkWorkerData.calls.length > 0) {
-            await processCallsFromExtracted(graph, chunkWorkerData.calls, symbolTable, importMap);
-          }
-          // Heritage — resolve immediately, then free
-          if (chunkWorkerData.heritage.length > 0) {
-            await processHeritageFromExtracted(graph, chunkWorkerData.heritage, symbolTable);
-          }
-          // Routes — resolve immediately (Laravel route→controller CALLS edges)
-          if (chunkWorkerData.routes && chunkWorkerData.routes.length > 0) {
-            await processRoutesFromExtracted(graph, chunkWorkerData.routes, symbolTable, importMap);
-          }
+          await processImportsFromExtracted(graph, allPathObjects, chunkWorkerData.imports, importMap, undefined, repoPath, importCtx, packageMap, namedImportMap);
+          // Calls + Heritage + Routes — resolve in parallel (no shared mutable state between them)
+          // This is safe because each writes disjoint relationship types into idempotent id-keyed Maps,
+          // and the single-threaded event loop prevents races between synchronous addRelationship calls.
+          await Promise.all([
+            processCallsFromExtracted(
+              graph, 
+              chunkWorkerData.calls, 
+              symbolTable, importMap, 
+              packageMap, 
+              undefined, 
+              namedImportMap
+            ),
+            processHeritageFromExtracted(
+              graph, 
+              chunkWorkerData.heritage, 
+              symbolTable, 
+              importMap, 
+              packageMap
+            ),
+            processRoutesFromExtracted(
+              graph, 
+              chunkWorkerData.routes ?? [], 
+              symbolTable, 
+              importMap, 
+              packageMap
+            ),
+          ]);
         } else {
-          await processImports(graph, chunkFiles, astCache, importMap, undefined, repoPath, allPaths);
+          await processImports(graph, chunkFiles, astCache, importMap, undefined, repoPath, allPaths, packageMap, namedImportMap);
           sequentialChunkPaths.push(chunkPaths);
         }
 
@@ -248,8 +273,8 @@ export const runPipelineFromRepo = async (
         .filter(p => chunkContents.has(p))
         .map(p => ({ path: p, content: chunkContents.get(p)! }));
       astCache = createASTCache(chunkFiles.length);
-      await processCalls(graph, chunkFiles, astCache, symbolTable, importMap);
-      await processHeritage(graph, chunkFiles, astCache, symbolTable);
+      await processCalls(graph, chunkFiles, astCache, symbolTable, importMap, packageMap, undefined, namedImportMap);
+      await processHeritage(graph, chunkFiles, astCache, symbolTable, importMap, packageMap);
       astCache.clear();
     }
 
@@ -260,12 +285,17 @@ export const runPipelineFromRepo = async (
     (importCtx as any).suffixIndex = null;
     (importCtx as any).normalizedFileList = null;
 
-    if (isDev) {
-      let importsCount = 0;
-      for (const r of graph.iterRelationships()) {
-        if (r.type === 'IMPORTS') importsCount++;
-      }
-      console.log(`📊 Pipeline: graph has ${importsCount} IMPORTS, ${graph.relationshipCount} total relationships`);
+    // ── Phase 4.5: Method Resolution Order ──────────────────────────────
+    onProgress({
+      phase: 'parsing',
+      percent: 81,
+      message: 'Computing method resolution order...',
+      stats: { filesProcessed: totalFiles, totalFiles, nodesCreated: graph.nodeCount },
+    });
+
+    const mroResult = computeMRO(graph);
+    if (isDev && mroResult.entries.length > 0) {
+      console.log(`🔀 MRO: ${mroResult.entries.length} classes analyzed, ${mroResult.ambiguityCount} ambiguities found, ${mroResult.overrideEdges} OVERRIDES edges`);
     }
 
     // ── Phase 5: Communities ───────────────────────────────────────────

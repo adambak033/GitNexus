@@ -26,7 +26,7 @@ export type NodeTableName = typeof NODE_TABLES[number];
 export const REL_TABLE_NAME = 'CodeRelation';
 
 // Valid relation types
-export const REL_TYPES = ['CONTAINS', 'DEFINES', 'IMPORTS', 'CALLS', 'EXTENDS', 'IMPLEMENTS', 'MEMBER_OF', 'STEP_IN_PROCESS'] as const;
+export const REL_TYPES = ['CONTAINS', 'DEFINES', 'IMPORTS', 'CALLS', 'EXTENDS', 'IMPLEMENTS', 'HAS_METHOD', 'OVERRIDES', 'MEMBER_OF', 'STEP_IN_PROCESS'] as const;
 export type RelType = typeof REL_TYPES[number];
 
 // ============================================================================
@@ -104,6 +104,8 @@ CREATE NODE TABLE Method (
   isExported BOOLEAN,
   content STRING,
   description STRING,
+  parameterCount INT32,
+  returnType STRING,
   PRIMARY KEY (id)
 )`;
 
@@ -260,6 +262,7 @@ CREATE REL TABLE ${REL_TABLE_NAME} (
   FROM Class TO \`Union\`,
   FROM Class TO \`Namespace\`,
   FROM Class TO \`Typedef\`,
+  FROM Class TO \`Property\`,
   FROM Method TO Function,
   FROM Method TO Method,
   FROM Method TO Class,
@@ -295,6 +298,7 @@ CREATE REL TABLE ${REL_TABLE_NAME} (
   FROM Interface TO \`TypeAlias\`,
   FROM Interface TO \`Struct\`,
   FROM Interface TO \`Constructor\`,
+  FROM Interface TO \`Property\`,
   FROM \`Struct\` TO Community,
   FROM \`Struct\` TO \`Trait\`,
   FROM \`Struct\` TO \`Struct\`,
@@ -303,6 +307,8 @@ CREATE REL TABLE ${REL_TABLE_NAME} (
   FROM \`Struct\` TO Function,
   FROM \`Struct\` TO Method,
   FROM \`Struct\` TO Interface,
+  FROM \`Struct\` TO \`Constructor\`,
+  FROM \`Struct\` TO \`Property\`,
   FROM \`Enum\` TO \`Enum\`,
   FROM \`Enum\` TO Community,
   FROM \`Enum\` TO Class,
@@ -316,7 +322,13 @@ CREATE REL TABLE ${REL_TABLE_NAME} (
   FROM \`Union\` TO Community,
   FROM \`Namespace\` TO Community,
   FROM \`Namespace\` TO \`Struct\`,
+  FROM \`Trait\` TO Method,
+  FROM \`Trait\` TO \`Constructor\`,
+  FROM \`Trait\` TO \`Property\`,
   FROM \`Trait\` TO Community,
+  FROM \`Impl\` TO Method,
+  FROM \`Impl\` TO \`Constructor\`,
+  FROM \`Impl\` TO \`Property\`,
   FROM \`Impl\` TO Community,
   FROM \`Impl\` TO \`Trait\`,
   FROM \`Impl\` TO \`Struct\`,
@@ -327,6 +339,9 @@ CREATE REL TABLE ${REL_TABLE_NAME} (
   FROM \`Const\` TO Community,
   FROM \`Static\` TO Community,
   FROM \`Property\` TO Community,
+  FROM \`Record\` TO Method,
+  FROM \`Record\` TO \`Constructor\`,
+  FROM \`Record\` TO \`Property\`,
   FROM \`Record\` TO Community,
   FROM \`Delegate\` TO Community,
   FROM \`Annotation\` TO Community,

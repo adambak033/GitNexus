@@ -119,6 +119,35 @@ describe('KuzuDB Schema', () => {
       expect(RELATION_SCHEMA).toContain('FROM Function TO Process');
       expect(RELATION_SCHEMA).toContain('FROM Method TO Process');
     });
+
+    it('has all FROM/TO pairs needed for HAS_METHOD edges', () => {
+      // HAS_METHOD sources: Class, Interface, Struct, Trait, Impl, Record
+      // HAS_METHOD targets: Method, Constructor, Property
+      const sources = ['Class', 'Interface'];
+      const backtickSources = ['Struct', 'Trait', 'Impl', 'Record'];
+      const targets = ['Method'];
+      const backtickTargets = ['Constructor', 'Property'];
+
+      // Non-backtick source → non-backtick target
+      for (const src of sources) {
+        for (const tgt of targets) {
+          expect(RELATION_SCHEMA).toContain(`FROM ${src} TO ${tgt}`);
+        }
+        for (const tgt of backtickTargets) {
+          expect(RELATION_SCHEMA).toContain(`FROM ${src} TO \`${tgt}\``);
+        }
+      }
+
+      // Backtick source → all targets
+      for (const src of backtickSources) {
+        for (const tgt of targets) {
+          expect(RELATION_SCHEMA).toContain(`FROM \`${src}\` TO ${tgt}`);
+        }
+        for (const tgt of backtickTargets) {
+          expect(RELATION_SCHEMA).toContain(`FROM \`${src}\` TO \`${tgt}\``);
+        }
+      }
+    });
   });
 
   describe('embedding schema', () => {

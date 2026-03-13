@@ -20,10 +20,24 @@ import { getTreeSitterBufferSize, TREE_SITTER_MAX_BUFFER } from '../constants.js
 const _require = createRequire(import.meta.url);
 let Swift: any = null;
 try { Swift = _require('tree-sitter-swift'); } catch {}
-import { findSiblingChild, getLanguageFromFilename, FUNCTION_NODE_TYPES, extractFunctionName, isBuiltInOrNoise, DEFINITION_CAPTURE_KEYS, getDefinitionNodeFromCaptures } from '../utils.js';
+import { 
+  getLanguageFromFilename,
+  FUNCTION_NODE_TYPES,
+  extractFunctionName,
+  isBuiltInOrNoise,
+  getDefinitionNodeFromCaptures,
+  findEnclosingClassId,
+  extractMethodSignature,
+  countCallArguments,
+  inferCallForm,
+  extractReceiverName
+} from '../utils.js';
+import { buildTypeEnv, lookupTypeEnv } from '../type-env.js';
 import { isNodeExported } from '../export-detection.js';
 import { detectFrameworkFromAST } from '../framework-detection.js';
 import { generateId } from '../../../lib/utils.js';
+import { extractNamedBindings } from '../named-binding-extraction.js';
+import { appendKotlinWildcard } from '../resolvers/index.js';
 
 // ============================================================================
 // Types for serializable results
@@ -37,11 +51,13 @@ interface ParsedNode {
     filePath: string;
     startLine: number;
     endLine: number;
-    language: string;
+    language: SupportedLanguages;
     isExported: boolean;
     astFrameworkMultiplier?: number;
     astFrameworkReason?: string;
     description?: string;
+    parameterCount?: number;
+    returnType?: string;
   };
 }
 
@@ -49,7 +65,7 @@ interface ParsedRelationship {
   id: string;
   sourceId: string;
   targetId: string;
-  type: 'DEFINES';
+  type: 'DEFINES' | 'HAS_METHOD';
   confidence: number;
   reason: string;
 }
@@ -59,12 +75,16 @@ interface ParsedSymbol {
   name: string;
   nodeId: string;
   type: string;
+  parameterCount?: number;
+  ownerId?: string;
 }
 
 export interface ExtractedImport {
   filePath: string;
   rawImportPath: string;
-  language: string;
+  language: SupportedLanguages;
+  /** Named bindings from the import (e.g., import {User as U} → [{local:'U', exported:'User'}]) */
+  namedBindings?: { local: string; exported: string }[];
 }
 
 export interface ExtractedCall {
@@ -72,6 +92,13 @@ export interface ExtractedCall {
   calledName: string;
   /** generateId of enclosing function, or generateId('File', filePath) for top-level */
   sourceId: string;
+  argCount?: number;
+  /** Discriminates free function calls from member/constructor calls */
+  callForm?: 'free' | 'member' | 'constructor';
+  /** Simple identifier of the receiver for member calls (e.g., 'user' in user.save()) */
+  receiverName?: string;
+  /** Resolved type name of the receiver (e.g., 'User' for user.save() when user: User) */
+  receiverTypeName?: string;
 }
 
 export interface ExtractedHeritage {
@@ -197,18 +224,6 @@ const getLabelFromCaptures = (captureMap: Record<string, any>): string | null =>
 
 // DEFINITION_CAPTURE_KEYS and getDefinitionNodeFromCaptures imported from ../utils.js
 
-/**
- * Append .* to a Kotlin import path if the AST has a wildcard_import sibling node.
- * Pure function — returns a new string without mutating the input.
- */
-const appendKotlinWildcard = (importPath: string, importNode: any): string => {
-  for (let i = 0; i < importNode.childCount; i++) {
-    if (importNode.child(i)?.type === 'wildcard_import') {
-      return importPath.endsWith('.*') ? importPath : `${importPath}.*`;
-    }
-  }
-  return importPath;
-};
 
 // ============================================================================
 // Process a batch of files
@@ -806,6 +821,9 @@ const processFileGroup = (
     result.fileCount++;
     onFileProcessed?.();
 
+    // Build per-file TypeEnv from explicit type annotations (for receiver resolution)
+    const typeEnv = buildTypeEnv(tree, language);
+
     let matches;
     try {
       matches = query.matches(tree.rootNode);
@@ -825,10 +843,12 @@ const processFileGroup = (
         const rawImportPath = language === SupportedLanguages.Kotlin
           ? appendKotlinWildcard(captureMap['import.source'].text.replace(/['"<>]/g, ''), captureMap['import'])
           : captureMap['import.source'].text.replace(/['"<>]/g, '');
+        const namedBindings = extractNamedBindings(captureMap['import'], language);
         result.imports.push({
           filePath: file.path,
           rawImportPath,
           language: language,
+          ...(namedBindings ? { namedBindings } : {}),
         });
         continue;
       }
@@ -842,7 +862,18 @@ const processFileGroup = (
             const callNode = captureMap['call'];
             const sourceId = findEnclosingFunctionId(callNode, file.path)
               || generateId('File', file.path);
-            result.calls.push({ filePath: file.path, calledName, sourceId });
+            const callForm = inferCallForm(callNode, callNameNode);
+            const receiverName = callForm === 'member' ? extractReceiverName(callNameNode) : undefined;
+            const receiverTypeName = receiverName ? lookupTypeEnv(typeEnv, receiverName, callNode) : undefined;
+            result.calls.push({
+              filePath: file.path,
+              calledName,
+              sourceId,
+              argCount: countCallArguments(callNode),
+              ...(callForm !== undefined ? { callForm } : {}),
+              ...(receiverName !== undefined ? { receiverName } : {}),
+              ...(receiverTypeName !== undefined ? { receiverTypeName } : {}),
+            });
           }
         }
         continue;
@@ -851,12 +882,21 @@ const processFileGroup = (
       // Extract heritage (extends/implements)
       if (captureMap['heritage.class']) {
         if (captureMap['heritage.extends']) {
-          result.heritage.push({
-            filePath: file.path,
-            className: captureMap['heritage.class'].text,
-            parentName: captureMap['heritage.extends'].text,
-            kind: 'extends',
-          });
+          // Go struct embedding: the query matches ALL field_declarations with
+          // type_identifier, but only anonymous fields (no name) are embedded.
+          // Named fields like `Breed string` also match — skip them.
+          const extendsNode = captureMap['heritage.extends'];
+          const fieldDecl = extendsNode.parent;
+          const isNamedField = fieldDecl?.type === 'field_declaration'
+            && fieldDecl.childForFieldName('name');
+          if (!isNamedField) {
+            result.heritage.push({
+              filePath: file.path,
+              className: captureMap['heritage.class'].text,
+              parentName: captureMap['heritage.extends'].text,
+              kind: 'extends',
+            });
+          }
         }
         if (captureMap['heritage.implements']) {
           result.heritage.push({
@@ -903,6 +943,14 @@ const processFileGroup = (
         ? detectFrameworkFromAST(language, (definitionNode.text || '').slice(0, 300))
         : null;
 
+      let parameterCount: number | undefined;
+      let returnType: string | undefined;
+      if (nodeLabel === 'Function' || nodeLabel === 'Method' || nodeLabel === 'Constructor') {
+        const sig = extractMethodSignature(definitionNode);
+        parameterCount = sig.parameterCount;
+        returnType = sig.returnType;
+      }
+
       result.nodes.push({
         id: nodeId,
         label: nodeLabel,
@@ -918,14 +966,23 @@ const processFileGroup = (
             astFrameworkReason: frameworkHint.reason,
           } : {}),
           ...(description !== undefined ? { description } : {}),
+          ...(parameterCount !== undefined ? { parameterCount } : {}),
+          ...(returnType !== undefined ? { returnType } : {}),
         },
       });
+
+      // Compute enclosing class for Method/Constructor/Property/Function — used for both ownerId and HAS_METHOD
+      // Function is included because Kotlin/Rust/Python capture class methods as Function nodes
+      const needsOwner = nodeLabel === 'Method' || nodeLabel === 'Constructor' || nodeLabel === 'Property' || nodeLabel === 'Function';
+      const enclosingClassId = needsOwner ? findEnclosingClassId(nameNode || definitionNode, file.path) : null;
 
       result.symbols.push({
         filePath: file.path,
         name: nodeName,
         nodeId,
         type: nodeLabel,
+        ...(parameterCount !== undefined ? { parameterCount } : {}),
+        ...(enclosingClassId ? { ownerId: enclosingClassId } : {}),
       });
 
       const fileId = generateId('File', file.path);
@@ -938,6 +995,18 @@ const processFileGroup = (
         confidence: 1.0,
         reason: '',
       });
+
+      // ── HAS_METHOD: link method/constructor/property to enclosing class ──
+      if (enclosingClassId) {
+        result.relationships.push({
+          id: generateId('HAS_METHOD', `${enclosingClassId}->${nodeId}`),
+          sourceId: enclosingClassId,
+          targetId: nodeId,
+          type: 'HAS_METHOD',
+          confidence: 1.0,
+          reason: '',
+        });
+      }
     }
 
     // Extract Laravel routes from route files via procedural AST walk

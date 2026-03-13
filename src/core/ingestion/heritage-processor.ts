@@ -1,27 +1,78 @@
 /**
  * Heritage Processor
- * 
+ *
  * Extracts class inheritance relationships:
- * - EXTENDS: Class extends another Class (TS, JS, Python)
- * - IMPLEMENTS: Class implements an Interface (TS only)
+ * - EXTENDS: Class extends another Class (TS, JS, Python, C#, C++)
+ * - IMPLEMENTS: Class implements an Interface (TS, C#, Java, Kotlin, PHP)
+ *
+ * Languages like C# use a single `base_list` for both class and interface parents.
+ * We resolve the correct edge type by checking the symbol table: if the parent is
+ * registered as an Interface, we emit IMPLEMENTS; otherwise EXTENDS. For unresolved
+ * external symbols, the fallback heuristic is language-gated:
+ *   - C# / Java: apply the `I[A-Z]` naming convention (e.g. IDisposable → IMPLEMENTS)
+ *   - Swift: default to IMPLEMENTS (protocol conformance is more common than class inheritance)
+ *   - All other languages: default to EXTENDS
  */
 
 import { KnowledgeGraph } from '../graph/types.js';
 import { ASTCache } from './ast-cache.js';
-import { SymbolTable } from './symbol-table.js';
+import { SymbolTable, SymbolDefinition } from './symbol-table.js';
 import Parser from 'tree-sitter';
 import { isLanguageAvailable, loadParser, loadLanguage } from '../tree-sitter/parser-loader.js';
 import { LANGUAGE_QUERIES } from './tree-sitter-queries.js';
 import { generateId } from '../../lib/utils.js';
 import { getLanguageFromFilename, isVerboseIngestionEnabled, yieldToEventLoop } from './utils.js';
+import { SupportedLanguages } from '../../config/supported-languages.js';
 import { getTreeSitterBufferSize } from './constants.js';
 import type { ExtractedHeritage } from './workers/parse-worker.js';
+import { resolveSymbol } from './symbol-resolver.js';
+import type { ImportMap, PackageMap } from './import-processor.js';
+
+/** C#/Java convention: interfaces start with I followed by an uppercase letter */
+const INTERFACE_NAME_RE = /^I[A-Z]/;
+
+/**
+ * Determine whether a heritage.extends capture is actually an IMPLEMENTS relationship.
+ * Uses the symbol table first (authoritative — Tier 1); falls back to a language-gated
+ * heuristic for external symbols not present in the graph:
+ *   - C# / Java: `I[A-Z]` naming convention
+ *   - Swift: default IMPLEMENTS (protocol conformance is the norm)
+ *   - All others: default EXTENDS
+ */
+const resolveExtendsType = (
+  parentName: string,
+  currentFilePath: string,
+  symbolTable: SymbolTable,
+  importMap: ImportMap,
+  language: SupportedLanguages,
+  packageMap?: PackageMap,
+): { type: 'EXTENDS' | 'IMPLEMENTS'; idPrefix: string } => {
+  const resolved = resolveSymbol(parentName, currentFilePath, symbolTable, importMap, packageMap);
+  if (resolved) {
+    const isInterface = resolved.type === 'Interface';
+    return isInterface
+      ? { type: 'IMPLEMENTS', idPrefix: 'Interface' }
+      : { type: 'EXTENDS', idPrefix: 'Class' };
+  }
+  // Unresolved symbol — fall back to language-specific heuristic
+  if (language === SupportedLanguages.CSharp || language === SupportedLanguages.Java) {
+    if (INTERFACE_NAME_RE.test(parentName)) {
+      return { type: 'IMPLEMENTS', idPrefix: 'Interface' };
+    }
+  } else if (language === SupportedLanguages.Swift) {
+    // Protocol conformance is far more common than class inheritance in Swift
+    return { type: 'IMPLEMENTS', idPrefix: 'Interface' };
+  }
+  return { type: 'EXTENDS', idPrefix: 'Class' };
+};
 
 export const processHeritage = async (
   graph: KnowledgeGraph,
   files: { path: string; content: string }[],
   astCache: ASTCache,
   symbolTable: SymbolTable,
+  importMap: ImportMap,
+  packageMap?: PackageMap,
   onProgress?: (current: number, total: number) => void
 ) => {
   const parser = await loadParser();
@@ -84,27 +135,34 @@ export const processHeritage = async (
         captureMap[c.name] = c.node;
       });
 
-      // EXTENDS: Class extends another Class
+      // EXTENDS or IMPLEMENTS: resolve via symbol table for languages where
+      // the tree-sitter query can't distinguish classes from interfaces (C#, Java)
       if (captureMap['heritage.class'] && captureMap['heritage.extends']) {
+        // Go struct embedding: skip named fields (only anonymous fields are embedded)
+        const extendsNode = captureMap['heritage.extends'];
+        const fieldDecl = extendsNode.parent;
+        if (fieldDecl?.type === 'field_declaration' && fieldDecl.childForFieldName('name')) {
+          return; // Named field, not struct embedding
+        }
+
         const className = captureMap['heritage.class'].text;
         const parentClassName = captureMap['heritage.extends'].text;
 
-        // Resolve both class IDs
+        const { type: relType, idPrefix } = resolveExtendsType(parentClassName, file.path, symbolTable, importMap, language, packageMap);
+
         const childId = symbolTable.lookupExact(file.path, className) ||
-                        symbolTable.lookupFuzzy(className)[0]?.nodeId ||
+                        resolveSymbol(className, file.path, symbolTable, importMap, packageMap)?.nodeId ||
                         generateId('Class', `${file.path}:${className}`);
-        
-        const parentId = symbolTable.lookupFuzzy(parentClassName)[0]?.nodeId ||
-                         generateId('Class', `${parentClassName}`);
+
+        const parentId = resolveSymbol(parentClassName, file.path, symbolTable, importMap, packageMap)?.nodeId ||
+                         generateId(idPrefix, `${parentClassName}`);
 
         if (childId && parentId && childId !== parentId) {
-          const relId = generateId('EXTENDS', `${childId}->${parentId}`);
-          
           graph.addRelationship({
-            id: relId,
+            id: generateId(relType, `${childId}->${parentId}`),
             sourceId: childId,
             targetId: parentId,
-            type: 'EXTENDS',
+            type: relType,
             confidence: 1.0,
             reason: '',
           });
@@ -118,10 +176,10 @@ export const processHeritage = async (
 
         // Resolve class and interface IDs
         const classId = symbolTable.lookupExact(file.path, className) ||
-                        symbolTable.lookupFuzzy(className)[0]?.nodeId ||
+                        resolveSymbol(className, file.path, symbolTable, importMap, packageMap)?.nodeId ||
                         generateId('Class', `${file.path}:${className}`);
-        
-        const interfaceId = symbolTable.lookupFuzzy(interfaceName)[0]?.nodeId ||
+
+        const interfaceId = resolveSymbol(interfaceName, file.path, symbolTable, importMap, packageMap)?.nodeId ||
                             generateId('Interface', `${interfaceName}`);
 
         if (classId && interfaceId) {
@@ -145,10 +203,10 @@ export const processHeritage = async (
 
         // Resolve struct and trait IDs
         const structId = symbolTable.lookupExact(file.path, structName) ||
-                         symbolTable.lookupFuzzy(structName)[0]?.nodeId ||
+                         resolveSymbol(structName, file.path, symbolTable, importMap, packageMap)?.nodeId ||
                          generateId('Struct', `${file.path}:${structName}`);
-        
-        const traitId = symbolTable.lookupFuzzy(traitName)[0]?.nodeId ||
+
+        const traitId = resolveSymbol(traitName, file.path, symbolTable, importMap, packageMap)?.nodeId ||
                         generateId('Trait', `${traitName}`);
 
         if (structId && traitId) {
@@ -186,6 +244,8 @@ export const processHeritageFromExtracted = async (
   graph: KnowledgeGraph,
   extractedHeritage: ExtractedHeritage[],
   symbolTable: SymbolTable,
+  importMap: ImportMap,
+  packageMap?: PackageMap,
   onProgress?: (current: number, total: number) => void
 ) => {
   const total = extractedHeritage.length;
@@ -199,29 +259,33 @@ export const processHeritageFromExtracted = async (
     const h = extractedHeritage[i];
 
     if (h.kind === 'extends') {
+      const fileLanguage = getLanguageFromFilename(h.filePath);
+      if (!fileLanguage) continue;
+      const { type: relType, idPrefix } = resolveExtendsType(h.parentName, h.filePath, symbolTable, importMap, fileLanguage, packageMap);
+
       const childId = symbolTable.lookupExact(h.filePath, h.className) ||
-                      symbolTable.lookupFuzzy(h.className)[0]?.nodeId ||
+                      resolveSymbol(h.className, h.filePath, symbolTable, importMap, packageMap)?.nodeId ||
                       generateId('Class', `${h.filePath}:${h.className}`);
 
-      const parentId = symbolTable.lookupFuzzy(h.parentName)[0]?.nodeId ||
-                       generateId('Class', `${h.parentName}`);
+      const parentId = resolveSymbol(h.parentName, h.filePath, symbolTable, importMap, packageMap)?.nodeId ||
+                       generateId(idPrefix, `${h.parentName}`);
 
       if (childId && parentId && childId !== parentId) {
         graph.addRelationship({
-          id: generateId('EXTENDS', `${childId}->${parentId}`),
+          id: generateId(relType, `${childId}->${parentId}`),
           sourceId: childId,
           targetId: parentId,
-          type: 'EXTENDS',
+          type: relType,
           confidence: 1.0,
           reason: '',
         });
       }
     } else if (h.kind === 'implements') {
       const classId = symbolTable.lookupExact(h.filePath, h.className) ||
-                      symbolTable.lookupFuzzy(h.className)[0]?.nodeId ||
+                      resolveSymbol(h.className, h.filePath, symbolTable, importMap, packageMap)?.nodeId ||
                       generateId('Class', `${h.filePath}:${h.className}`);
 
-      const interfaceId = symbolTable.lookupFuzzy(h.parentName)[0]?.nodeId ||
+      const interfaceId = resolveSymbol(h.parentName, h.filePath, symbolTable, importMap, packageMap)?.nodeId ||
                           generateId('Interface', `${h.parentName}`);
 
       if (classId && interfaceId) {
@@ -236,10 +300,10 @@ export const processHeritageFromExtracted = async (
       }
     } else if (h.kind === 'trait-impl') {
       const structId = symbolTable.lookupExact(h.filePath, h.className) ||
-                       symbolTable.lookupFuzzy(h.className)[0]?.nodeId ||
+                       resolveSymbol(h.className, h.filePath, symbolTable, importMap, packageMap)?.nodeId ||
                        generateId('Struct', `${h.filePath}:${h.className}`);
 
-      const traitId = symbolTable.lookupFuzzy(h.parentName)[0]?.nodeId ||
+      const traitId = resolveSymbol(h.parentName, h.filePath, symbolTable, importMap, packageMap)?.nodeId ||
                       generateId('Trait', `${h.parentName}`);
 
       if (structId && traitId) {

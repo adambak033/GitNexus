@@ -5,7 +5,7 @@ import { LANGUAGE_QUERIES } from './tree-sitter-queries.js';
 import { generateId } from '../../lib/utils.js';
 import { SymbolTable } from './symbol-table.js';
 import { ASTCache } from './ast-cache.js';
-import { getLanguageFromFilename, yieldToEventLoop, DEFINITION_CAPTURE_KEYS, getDefinitionNodeFromCaptures } from './utils.js';
+import { getLanguageFromFilename, yieldToEventLoop, DEFINITION_CAPTURE_KEYS, getDefinitionNodeFromCaptures, findEnclosingClassId, extractMethodSignature } from './utils.js';
 import { isNodeExported } from './export-detection.js';
 import { detectFrameworkFromAST } from './framework-detection.js';
 import { WorkerPool } from './workers/worker-pool.js';
@@ -75,7 +75,10 @@ const processParsingWithWorkers = async (
     }
 
     for (const sym of result.symbols) {
-      symbolTable.add(sym.filePath, sym.name, sym.nodeId, sym.type);
+      symbolTable.add(sym.filePath, sym.name, sym.nodeId, sym.type, {
+        parameterCount: sym.parameterCount,
+        ownerId: sym.ownerId,
+      });
     }
 
     allImports.push(...result.imports);
@@ -203,6 +206,11 @@ const processParsingSequential = async (
         ? detectFrameworkFromAST(language, (definitionNode.text || '').slice(0, 300))
         : null;
 
+      // Extract method signature for Method/Constructor nodes
+      const methodSig = (nodeLabel === 'Function' || nodeLabel === 'Method' || nodeLabel === 'Constructor')
+        ? extractMethodSignature(definitionNode)
+        : undefined;
+
       const node: GraphNode = {
         id: nodeId,
         label: nodeLabel as any,
@@ -217,12 +225,24 @@ const processParsingSequential = async (
             astFrameworkMultiplier: frameworkHint.entryPointMultiplier,
             astFrameworkReason: frameworkHint.reason,
           } : {}),
+          ...(methodSig ? {
+            parameterCount: methodSig.parameterCount,
+            returnType: methodSig.returnType,
+          } : {}),
         },
       };
 
       graph.addNode(node);
 
-      symbolTable.add(file.path, nodeName, nodeId, nodeLabel);
+      // Compute enclosing class for Method/Constructor/Property/Function — used for both ownerId and HAS_METHOD
+      // Function is included because Kotlin/Rust/Python capture class methods as Function nodes
+      const needsOwner = nodeLabel === 'Method' || nodeLabel === 'Constructor' || nodeLabel === 'Property' || nodeLabel === 'Function';
+      const enclosingClassId = needsOwner ? findEnclosingClassId(nameNode || definitionNodeForRange, file.path) : null;
+
+      symbolTable.add(file.path, nodeName, nodeId, nodeLabel, {
+        parameterCount: methodSig?.parameterCount,
+        ownerId: enclosingClassId ?? undefined,
+      });
 
       const fileId = generateId('File', file.path);
 
@@ -238,6 +258,18 @@ const processParsingSequential = async (
       };
 
       graph.addRelationship(relationship);
+
+      // ── HAS_METHOD: link method/constructor/property to enclosing class ──
+      if (enclosingClassId) {
+        graph.addRelationship({
+          id: generateId('HAS_METHOD', `${enclosingClassId}->${nodeId}`),
+          sourceId: enclosingClassId,
+          targetId: nodeId,
+          type: 'HAS_METHOD',
+          confidence: 1.0,
+          reason: '',
+        });
+      }
     });
   }
 };
