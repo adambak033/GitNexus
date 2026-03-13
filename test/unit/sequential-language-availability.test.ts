@@ -76,7 +76,7 @@ describe('sequential native parser availability', () => {
       createASTCache(),
       createSymbolTable(),
       createImportMap(),
-    )).resolves.toBeUndefined();
+    )).resolves.toEqual([]);
 
     expect(parserLoader.loadLanguage).not.toHaveBeenCalled();
   });

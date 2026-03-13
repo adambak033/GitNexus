@@ -742,8 +742,8 @@ describe('parsing', () => {
 
     it('falls back gracefully for unsupported language', async () => {
       // getLanguageFromFilename returns null for extensions with no grammar mapping.
-      const rubyLang = getLanguageFromFilename('script.rb');
-      expect(rubyLang).toBeNull();
+      const scalaLang = getLanguageFromFilename('Main.scala');
+      expect(scalaLang).toBeNull();
 
       const luaLang = getLanguageFromFilename('module.lua');
       expect(luaLang).toBeNull();

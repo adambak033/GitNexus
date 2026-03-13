@@ -222,6 +222,7 @@ const exportCheckers = {
   [SupportedLanguages.CPlusPlus]: cCppExportChecker,
   [SupportedLanguages.PHP]: phpExportChecker,
   [SupportedLanguages.Swift]: swiftExportChecker,
+  [SupportedLanguages.Ruby]: (_node, _name) => true,
 } satisfies Record<SupportedLanguages, ExportChecker>;
 
 // ============================================================================

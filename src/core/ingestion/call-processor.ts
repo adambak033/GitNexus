@@ -2,12 +2,13 @@ import { KnowledgeGraph } from '../graph/types.js';
 import { ASTCache } from './ast-cache.js';
 import type { SymbolDefinition, SymbolTable } from './symbol-table.js';
 import { ImportMap, PackageMap, NamedImportMap, isFileInPackageDir } from './import-processor.js';
-import { resolveSymbol, resolveSymbolInternal } from './symbol-resolver.js';
+import { resolveSymbolInternal } from './symbol-resolver.js';
 import { walkBindingChain } from './named-binding-extraction.js';
 import Parser from 'tree-sitter';
 import { isLanguageAvailable, loadParser, loadLanguage } from '../tree-sitter/parser-loader.js';
 import { LANGUAGE_QUERIES } from './tree-sitter-queries.js';
 import { generateId } from '../../lib/utils.js';
+import { SupportedLanguages } from '../../config/supported-languages.js';
 import {
   getLanguageFromFilename,
   isVerboseIngestionEnabled,
@@ -21,7 +22,8 @@ import {
 } from './utils.js';
 import { buildTypeEnv, lookupTypeEnv } from './type-env.js';
 import { getTreeSitterBufferSize } from './constants.js';
-import type { ExtractedCall, ExtractedRoute } from './workers/parse-worker.js';
+import type { ExtractedCall, ExtractedHeritage, ExtractedRoute } from './workers/parse-worker.js';
+import { routeRubyCall } from './ruby-call-routing.js';
 
 /**
  * Walk up the AST from a node to find the enclosing function/method.
@@ -60,8 +62,9 @@ export const processCalls = async (
   packageMap?: PackageMap,
   onProgress?: (current: number, total: number) => void,
   namedImportMap?: NamedImportMap,
-) => {
+): Promise<ExtractedHeritage[]> => {
   const parser = await loadParser();
+  const collectedHeritage: ExtractedHeritage[] = [];
   const logSkipped = isVerboseIngestionEnabled();
   const skippedByLang = logSkipped ? new Map<string, number>() : null;
 
@@ -132,6 +135,56 @@ export const processCalls = async (
 
       const calledName = nameNode.text;
 
+      // Ruby: route special calls to heritage or properties (imports handled by import-processor)
+      if (language === SupportedLanguages.Ruby) {
+        const callNode = captureMap['call'];
+        const routed = routeRubyCall(calledName, callNode);
+
+        switch (routed.kind) {
+          case 'skip':
+          case 'import': // handled by import-processor
+            return;
+
+          case 'heritage':
+            for (const item of routed.items) {
+              collectedHeritage.push({
+                filePath: file.path,
+                className: item.enclosingClass,
+                parentName: item.mixinName,
+                kind: 'trait-impl',
+              });
+            }
+            return;
+
+          case 'properties': {
+            const fileId = generateId('File', file.path);
+            for (const item of routed.items) {
+              const nodeId = generateId('Property', `${file.path}:${item.propName}`);
+              graph.addNode({
+                id: nodeId,
+                label: 'Property' as any, // TODO: add 'Property' to graph node label union
+                properties: {
+                  name: item.propName, filePath: file.path,
+                  startLine: item.startLine, endLine: item.endLine,
+                  language: SupportedLanguages.Ruby, isExported: true,
+                  description: item.accessorType,
+                },
+              });
+              symbolTable.add(file.path, item.propName, nodeId, 'Property');
+              const relId = generateId('DEFINES', `${fileId}->${nodeId}`);
+              graph.addRelationship({
+                id: relId, sourceId: fileId, targetId: nodeId,
+                type: 'DEFINES', confidence: 1.0, reason: '',
+              });
+            }
+            return;
+          }
+
+          case 'call':
+            break; // fall through to normal call processing below
+        }
+      }
+
       // Skip common built-ins and noise
       if (isBuiltInOrNoise(calledName)) return;
 
@@ -152,10 +205,10 @@ export const processCalls = async (
 
       // 5. Find the enclosing function (caller)
       const enclosingFuncId = findEnclosingFunction(callNode, file.path, symbolTable);
-      
+
       // Use enclosing function as source, fallback to file for top-level calls
       const sourceId = enclosingFuncId || generateId('File', file.path);
-      
+
       const relId = generateId('CALLS', `${sourceId}:${calledName}->${resolved.nodeId}`);
 
       graph.addRelationship({
@@ -178,6 +231,8 @@ export const processCalls = async (
       );
     }
   }
+
+  return collectedHeritage;
 };
 
 /**

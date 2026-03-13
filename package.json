@@ -72,11 +72,13 @@
     "tree-sitter-kotlin": "^0.3.8",
     "tree-sitter-php": "^0.23.12",
     "tree-sitter-python": "^0.21.0",
+    "tree-sitter-ruby": "^0.23.1",
     "tree-sitter-rust": "^0.21.0",
     "tree-sitter-typescript": "^0.21.0",
     "uuid": "^13.0.0"
   },
   "optionalDependencies": {
+    "tree-sitter-kotlin": "^0.3.8",
     "tree-sitter-swift": "^0.6.0"
   },
   "devDependencies": {

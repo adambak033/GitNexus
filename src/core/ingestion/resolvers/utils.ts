@@ -26,6 +26,8 @@ export const EXTENSIONS = [
   '.php', '.phtml',
   // Swift
   '.swift',
+  // Ruby
+  '.rb',
 ];
 
 /**

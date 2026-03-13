@@ -157,7 +157,7 @@ GitNexus supports indexing multiple repositories. Each `gitnexus analyze` regist
 
 ## Supported Languages
 
-TypeScript, JavaScript, Python, Java, C, C++, C#, Go, Rust, PHP, Kotlin, Swift
+TypeScript, JavaScript, Python, Java, C, C++, C#, Go, Rust, PHP, Kotlin, Swift, Ruby
 
 ### Language Feature Matrix
 
@@ -173,6 +173,7 @@ TypeScript, JavaScript, Python, Java, C, C++, C#, Go, Rust, PHP, Kotlin, Swift
 | Rust | ✓ | ✓ | ✓ | ✓ | — | ✓ | ✓ | ✓ |
 | PHP | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — |
 | Swift | — | ✓ | ✓ | — | ✓ | ✓ | ✓ | ✓ |
+| Ruby | ✓ | ✓ | ✓ | — | — | ✓ | ✓ | ✓ |
 | C | — | ✓ | ✓ | — | — | ✓ | ✓ | ✓ |
 | C++ | — | ✓ | ✓ | — | — | ✓ | ✓ | ✓ |
 

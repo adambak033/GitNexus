@@ -273,8 +273,11 @@ export const runPipelineFromRepo = async (
         .filter(p => chunkContents.has(p))
         .map(p => ({ path: p, content: chunkContents.get(p)! }));
       astCache = createASTCache(chunkFiles.length);
-      await processCalls(graph, chunkFiles, astCache, symbolTable, importMap, packageMap, undefined, namedImportMap);
+      const rubyHeritage = await processCalls(graph, chunkFiles, astCache, symbolTable, importMap, packageMap, undefined, namedImportMap);
       await processHeritage(graph, chunkFiles, astCache, symbolTable, importMap, packageMap);
+      if (rubyHeritage.length > 0) {
+        await processHeritageFromExtracted(graph, rubyHeritage, symbolTable, importMap, packageMap);
+      }
       astCache.clear();
     }
 

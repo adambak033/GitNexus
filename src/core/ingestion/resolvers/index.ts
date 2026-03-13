@@ -19,5 +19,7 @@ export type { ComposerConfig } from './php.js';
 
 export { resolveRustImport, tryRustModulePath } from './rust.js';
 
+export { resolveRubyImport } from './ruby.js';
+
 export { resolveImportPath, RESOLVE_CACHE_CAP } from './standard.js';
 export type { TsconfigPaths } from './standard.js';

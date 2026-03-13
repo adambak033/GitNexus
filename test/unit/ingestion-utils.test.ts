@@ -93,6 +93,23 @@ describe('getLanguageFromFilename', () => {
     });
   });
 
+  describe('Ruby', () => {
+    it.each(['.rb', '.rake', '.gemspec'])(
+      'detects %s files',
+      (ext) => {
+        expect(getLanguageFromFilename(`file${ext}`)).toBe(SupportedLanguages.Ruby);
+      }
+    );
+
+    it('detects extensionless Rakefile', () => {
+      expect(getLanguageFromFilename('Rakefile')).toBe(SupportedLanguages.Ruby);
+    });
+
+    it('detects extensionless Gemfile', () => {
+      expect(getLanguageFromFilename('Gemfile')).toBe(SupportedLanguages.Ruby);
+    });
+  });
+
   describe('Kotlin', () => {
     it.each(['.kt', '.kts'])(
       'detects %s files',
@@ -103,7 +120,7 @@ describe('getLanguageFromFilename', () => {
   });
 
   describe('unsupported', () => {
-    it.each(['.rb', '.scala', '.r', '.lua', '.zig', '.txt', '.md', '.json', '.yaml'])(
+    it.each(['.scala', '.r', '.lua', '.zig', '.txt', '.md', '.json', '.yaml'])(
       'returns null for %s files',
       (ext) => {
         expect(getLanguageFromFilename(`file${ext}`)).toBeNull();

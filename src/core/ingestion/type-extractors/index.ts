@@ -29,6 +29,11 @@ export const typeConfigs = {
   [SupportedLanguages.C]: cCppConfig,
   [SupportedLanguages.CPlusPlus]: cCppConfig,
   [SupportedLanguages.PHP]: phpConfig,
+  [SupportedLanguages.Ruby]: {
+    declarationNodeTypes: new Set<string>(),
+    extractDeclaration: () => {},
+    extractParameter: () => {},
+  },
 } satisfies Record<SupportedLanguages, LanguageTypeConfig>;
 
 export type { LanguageTypeConfig, TypeBindingExtractor, ParameterExtractor } from './types.js';

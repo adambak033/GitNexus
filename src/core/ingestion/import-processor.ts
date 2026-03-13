@@ -31,6 +31,7 @@ import {
   resolvePhpImport,
   resolveRustImport,
 } from './resolvers/index.js';
+import { routeRubyCall } from './ruby-call-routing.js';
 import type {
   SuffixIndex,
   TsconfigPaths,
@@ -443,6 +444,24 @@ export const processImports = async (
         const result = resolveLanguageImport(file.path, rawImportPath, language, configs, ctx);
         const bindings = namedImportMap ? extractNamedBindings(captureMap['import'], language) : undefined;
         applyImportResult(result, file.path, importMap, packageMap, addImportEdge, addImportGraphEdge, bindings, namedImportMap);
+      }
+
+      // ---- Ruby: require/require_relative come through @call, not @import ----
+      if (language === SupportedLanguages.Ruby && captureMap['call']) {
+        const callNameNode = captureMap['call.name'];
+        if (callNameNode) {
+          const routed = routeRubyCall(callNameNode.text, captureMap['call']);
+          if (routed.kind === 'import') {
+            totalImportsFound++;
+            const resolvedPath = resolveImportPath(
+              file.path, routed.importPath, allFilePaths, allFileList,
+              normalizedFileList, resolveCache, language, configs.tsconfigPaths, index,
+            );
+            if (resolvedPath) {
+              addImportEdge(file.path, resolvedPath);
+            }
+          }
+        }
       }
     });
 

@@ -11,6 +11,7 @@ import Go from 'tree-sitter-go';
 import Rust from 'tree-sitter-rust';
 import Kotlin from 'tree-sitter-kotlin';
 import PHP from 'tree-sitter-php';
+import Ruby from 'tree-sitter-ruby';
 import { createRequire } from 'node:module';
 import { SupportedLanguages } from '../../../config/supported-languages.js';
 import { LANGUAGE_QUERIES } from '../tree-sitter-queries.js';
@@ -38,6 +39,7 @@ import { detectFrameworkFromAST } from '../framework-detection.js';
 import { generateId } from '../../../lib/utils.js';
 import { extractNamedBindings } from '../named-binding-extraction.js';
 import { appendKotlinWildcard } from '../resolvers/index.js';
+import { routeRubyCall } from '../ruby-call-routing.js';
 
 // ============================================================================
 // Types for serializable results
@@ -155,6 +157,7 @@ const languageMap: Record<string, any> = {
   [SupportedLanguages.Rust]: Rust,
   [SupportedLanguages.Kotlin]: Kotlin,
   [SupportedLanguages.PHP]: PHP.php_only,
+  [SupportedLanguages.Ruby]: Ruby,
   ...(Swift ? { [SupportedLanguages.Swift]: Swift } : {}),
 };
 
@@ -858,6 +861,91 @@ const processFileGroup = (
         const callNameNode = captureMap['call.name'];
         if (callNameNode) {
           const calledName = callNameNode.text;
+
+          // Ruby: route special calls to imports, heritage, or properties
+          if (language === SupportedLanguages.Ruby) {
+            const callNode = captureMap['call'];
+            const routed = routeRubyCall(calledName, callNode);
+
+            switch (routed.kind) {
+              case 'skip':
+                continue;
+
+              case 'import':
+                result.imports.push({
+                  filePath: file.path,
+                  rawImportPath: routed.importPath,
+                  language,
+                });
+                continue;
+
+              case 'heritage':
+                for (const item of routed.items) {
+                  result.heritage.push({
+                    filePath: file.path,
+                    className: item.enclosingClass,
+                    parentName: item.mixinName,
+                    kind: 'trait-impl',
+                  });
+                }
+                continue;
+
+              case 'properties':
+                for (const item of routed.items) {
+                  const nodeId = generateId('Property', `${file.path}:${item.propName}`);
+                  result.nodes.push({
+                    id: nodeId,
+                    label: 'Property',
+                    properties: {
+                      name: item.propName,
+                      filePath: file.path,
+                      startLine: item.startLine,
+                      endLine: item.endLine,
+                      language,
+                      isExported: true,
+                      description: item.accessorType,
+                    },
+                  });
+                  result.symbols.push({
+                    filePath: file.path,
+                    name: item.propName,
+                    nodeId,
+                    type: 'Property',
+                  });
+                  const fileId = generateId('File', file.path);
+                  const relId = generateId('DEFINES', `${fileId}->${nodeId}`);
+                  result.relationships.push({
+                    id: relId,
+                    sourceId: fileId,
+                    targetId: nodeId,
+                    type: 'DEFINES',
+                    confidence: 1.0,
+                    reason: '',
+                  });
+                }
+                continue;
+
+              case 'call':
+                if (!isBuiltInOrNoise(calledName)) {
+                  const sourceId = findEnclosingFunctionId(callNode, file.path)
+                    || generateId('File', file.path);
+                  const callForm = inferCallForm(callNode, callNameNode);
+                  const receiverName = callForm === 'member' ? extractReceiverName(callNameNode) : undefined;
+                  const receiverTypeName = receiverName ? lookupTypeEnv(typeEnv, receiverName, callNode) : undefined;
+                  result.calls.push({
+                    filePath: file.path,
+                    calledName,
+                    sourceId,
+                    argCount: countCallArguments(callNode),
+                    ...(callForm !== undefined ? { callForm } : {}),
+                    ...(receiverName !== undefined ? { receiverName } : {}),
+                    ...(receiverTypeName !== undefined ? { receiverTypeName } : {}),
+                  });
+                }
+                continue;
+            }
+          }
+
           if (!isBuiltInOrNoise(calledName)) {
             const callNode = captureMap['call'];
             const sourceId = findEnclosingFunctionId(callNode, file.path)

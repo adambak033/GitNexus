@@ -236,6 +236,21 @@ export const BUILT_IN_NAMES = new Set([
   'lock', 'read', 'write', 'try_lock',
   'spawn', 'join', 'sleep',
   'Some', 'None', 'Ok', 'Err',
+  // Ruby built-ins and Kernel methods
+  'puts', 'p', 'pp', 'raise', 'fail',
+  'require', 'require_relative', 'load', 'autoload',
+  'include', 'extend', 'prepend',
+  'attr_accessor', 'attr_reader', 'attr_writer',
+  'public', 'private', 'protected', 'module_function',
+  'lambda', 'proc', 'block_given?',
+  'nil?', 'is_a?', 'kind_of?', 'instance_of?', 'respond_to?',
+  'freeze', 'frozen?', 'dup', 'tap', 'yield_self',
+  // Ruby enumerables
+  'each', 'select', 'reject', 'detect', 'collect',
+  'inject', 'flat_map', 'each_with_object', 'each_with_index',
+  'any?', 'all?', 'none?', 'count', 'first', 'last',
+  'sort_by', 'min_by', 'max_by',
+  'group_by', 'partition', 'compact', 'flatten', 'uniq',
 ]);
 
 /** Check if a name is a built-in function or common noise that should be filtered out */
@@ -417,6 +432,9 @@ export const extractFunctionName = (node: any): { funcName: string | null; label
  */
 export const yieldToEventLoop = (): Promise<void> => new Promise(resolve => setImmediate(resolve));
 
+/** Ruby extensionless filenames recognised as Ruby source */
+const RUBY_EXTENSIONLESS_FILES = new Set(['Rakefile', 'Gemfile', 'Guardfile', 'Vagrantfile', 'Brewfile']);
+
 /**
  * Find a child of `childType` within a sibling node of `siblingType`.
  * Used for Kotlin AST traversal where visibility_modifier lives inside a modifiers sibling.
@@ -469,6 +487,16 @@ export const getLanguageFromFilename = (filename: string): SupportedLanguages | 
       filename.endsWith('.php5') || filename.endsWith('.php8')) {
     return SupportedLanguages.PHP;
   }
+  // Ruby (extensions)
+  if (filename.endsWith('.rb') || filename.endsWith('.rake') || filename.endsWith('.gemspec')) {
+    return SupportedLanguages.Ruby;
+  }
+  // Ruby (extensionless files)
+  const basename = filename.split('/').pop() || filename;
+  if (RUBY_EXTENSIONLESS_FILES.has(basename)) {
+    return SupportedLanguages.Ruby;
+  }
+  // Swift (extensions)
   if (filename.endsWith('.swift')) return SupportedLanguages.Swift;
   return null;
 };
