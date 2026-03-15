@@ -526,3 +526,42 @@ describe('Java generic parent super resolution', () => {
     expect(repoSave).toBeUndefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Return type inference: var user = svc.getUser("alice"); user.save()
+// Java's CONSTRUCTOR_BINDING_SCANNER handles `var` declarations with
+// method_invocation values, enabling end-to-end return type inference.
+// ---------------------------------------------------------------------------
+
+describe('Java return type inference via explicit method return type', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'java-return-type-inference'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and UserService classes', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Class')).toContain('UserService');
+  });
+
+  it('detects save and getUser methods', () => {
+    const methods = getNodesByLabel(result, 'Method');
+    expect(methods).toContain('save');
+    expect(methods).toContain('getUser');
+  });
+
+  it('resolves user.save() to User#save via return type of getUser(): User', () => {
+    // Java's CONSTRUCTOR_BINDING_SCANNER binds `var user = svc.getUser()` to the
+    // return type of getUser (User), so the subsequent user.save() call resolves
+    // to User#save rather than an unresolved target.
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'processUser' && c.targetFilePath.includes('models')
+    );
+    expect(saveCall).toBeDefined();
+  });
+});

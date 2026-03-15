@@ -37,6 +37,7 @@ import { buildTypeEnv } from '../type-env.js';
 import type { ConstructorBinding } from '../type-env.js';
 import { isNodeExported } from '../export-detection.js';
 import { detectFrameworkFromAST } from '../framework-detection.js';
+import { typeConfigs } from '../type-extractors/index.js';
 import { generateId } from '../../../lib/utils.js';
 import { extractNamedBindings } from '../named-binding-extraction.js';
 import { appendKotlinWildcard } from '../resolvers/index.js';
@@ -79,6 +80,7 @@ interface ParsedSymbol {
   nodeId: string;
   type: string;
   parameterCount?: number;
+  returnType?: string;
   ownerId?: string;
 }
 
@@ -1045,6 +1047,14 @@ const processFileGroup = (
         const sig = extractMethodSignature(definitionNode);
         parameterCount = sig.parameterCount;
         returnType = sig.returnType;
+
+        // Language-specific return type fallback (e.g. Ruby YARD @return [Type])
+        if (!returnType && definitionNode) {
+          const tc = typeConfigs[language as keyof typeof typeConfigs];
+          if (tc?.extractReturnType) {
+            returnType = tc.extractReturnType(definitionNode);
+          }
+        }
       }
 
       result.nodes.push({
@@ -1078,6 +1088,7 @@ const processFileGroup = (
         nodeId,
         type: nodeLabel,
         ...(parameterCount !== undefined ? { parameterCount } : {}),
+        ...(returnType !== undefined ? { returnType } : {}),
         ...(enclosingClassId ? { ownerId: enclosingClassId } : {}),
       });
 

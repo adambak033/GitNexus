@@ -20,6 +20,7 @@ import {
   findEnclosingClassId,
 } from './utils.js';
 import { buildTypeEnv } from './type-env.js';
+import type { ConstructorBinding } from './type-env.js';
 import { getTreeSitterBufferSize } from './constants.js';
 import type { ExtractedCall, ExtractedHeritage, ExtractedRoute, FileConstructorBindings } from './workers/parse-worker.js';
 import { callRouters } from './call-routing.js';
@@ -52,6 +53,65 @@ const findEnclosingFunction = (
   }
 
   return null;
+};
+
+/**
+ * Verify constructor bindings against SymbolTable and infer receiver types.
+ * Shared between sequential (processCalls) and worker (processCallsFromExtracted) paths.
+ */
+const verifyConstructorBindings = (
+  bindings: readonly ConstructorBinding[],
+  filePath: string,
+  ctx: ResolutionContext,
+  graph?: KnowledgeGraph,
+): Map<string, string> => {
+  const verified = new Map<string, string>();
+
+  for (const { scope, varName, calleeName, receiverClassName } of bindings) {
+    const tiered = ctx.resolve(calleeName, filePath);
+    const isClass = tiered?.candidates.some(def => def.type === 'Class') ?? false;
+
+    if (isClass) {
+      verified.set(receiverKey(extractFuncNameFromScope(scope), varName), calleeName);
+    } else {
+      let callableDefs = tiered?.candidates.filter(d =>
+        d.type === 'Function' || d.type === 'Method'
+      );
+
+      // When receiver class is known (e.g. $this->method() in PHP), narrow
+      // candidates to methods owned by that class to avoid false disambiguation failures.
+      if (callableDefs && callableDefs.length > 1 && receiverClassName) {
+        if (graph) {
+          // Worker path: use graph.getNode (fast, already in-memory)
+          const narrowed = callableDefs.filter(d => {
+            if (!d.ownerId) return false;
+            const owner = graph.getNode(d.ownerId);
+            return owner?.properties.name === receiverClassName;
+          });
+          if (narrowed.length > 0) callableDefs = narrowed;
+        } else {
+          // Sequential path: use ctx.resolve (no graph available)
+          const classResolved = ctx.resolve(receiverClassName, filePath);
+          if (classResolved && classResolved.candidates.length > 0) {
+            const classNodeIds = new Set(classResolved.candidates.map(c => c.nodeId));
+            const narrowed = callableDefs.filter(d =>
+              d.ownerId && classNodeIds.has(d.ownerId)
+            );
+            if (narrowed.length > 0) callableDefs = narrowed;
+          }
+        }
+      }
+
+      if (callableDefs && callableDefs.length === 1 && callableDefs[0].returnType) {
+        const typeName = extractReturnTypeName(callableDefs[0].returnType);
+        if (typeName) {
+          verified.set(receiverKey(extractFuncNameFromScope(scope), varName), typeName);
+        }
+      }
+    }
+  }
+
+  return verified;
 };
 
 export const processCalls = async (
@@ -109,6 +169,10 @@ export const processCalls = async (
     const lang = getLanguageFromFilename(file.path);
     const typeEnv = lang ? buildTypeEnv(tree, lang, ctx.symbols) : null;
     const callRouter = callRouters[language];
+
+    const verifiedReceivers = typeEnv && typeEnv.constructorBindings.length > 0
+      ? verifyConstructorBindings(typeEnv.constructorBindings, file.path, ctx)
+      : new Map<string, string>();
 
     ctx.enableCache(file.path);
 
@@ -184,7 +248,14 @@ export const processCalls = async (
       const callNode = captureMap['call'];
       const callForm = inferCallForm(callNode, nameNode);
       const receiverName = callForm === 'member' ? extractReceiverName(nameNode) : undefined;
-      const receiverTypeName = receiverName && typeEnv ? typeEnv.lookup(receiverName, callNode) : undefined;
+      let receiverTypeName = receiverName && typeEnv ? typeEnv.lookup(receiverName, callNode) : undefined;
+      // Fall back to verified constructor bindings for return type inference
+      if (!receiverTypeName && receiverName && verifiedReceivers.size > 0) {
+        const enclosingFunc = findEnclosingFunction(callNode, file.path, ctx);
+        const funcName = enclosingFunc ? extractFuncNameFromSourceId(enclosingFunc) : '';
+        receiverTypeName = verifiedReceivers.get(receiverKey(funcName, receiverName))
+          ?? verifiedReceivers.get(receiverKey('', receiverName));
+      }
 
       const resolved = resolveCallTarget({
         calledName,
@@ -343,6 +414,135 @@ const resolveCallTarget = (
   return toResolveResult(filteredCandidates[0], tiered.tier);
 };
 
+// ── Return type text helpers ─────────────────────────────────────────────
+// extractSimpleTypeName works on AST nodes; this operates on raw return-type
+// text already stored in SymbolDefinition (e.g. "User", "Promise<User>",
+// "User | null", "*User").  Extracts the base user-defined type name.
+
+/** Primitive / built-in types that should NOT produce a receiver binding. */
+const PRIMITIVE_TYPES = new Set([
+  'string', 'number', 'boolean', 'void', 'int', 'float', 'double', 'long',
+  'short', 'byte', 'char', 'bool', 'str', 'i8', 'i16', 'i32', 'i64',
+  'u8', 'u16', 'u32', 'u64', 'f32', 'f64', 'usize', 'isize',
+  'undefined', 'null', 'None', 'nil',
+]);
+
+/**
+ * Extract a simple type name from raw return-type text.
+ * Handles common patterns:
+ *   "User"                → "User"
+ *   "Promise<User>"       → "User"   (unwrap wrapper generics)
+ *   "Option<User>"        → "User"
+ *   "Result<User, Error>" → "User"   (first type arg)
+ *   "User | null"         → "User"   (strip nullable union)
+ *   "User?"               → "User"   (strip nullable suffix)
+ *   "*User"               → "User"   (Go pointer)
+ *   "&User"               → "User"   (Rust reference)
+ * Returns undefined for complex types or primitives.
+ */
+const WRAPPER_GENERICS = new Set([
+  'Promise', 'Observable', 'Future', 'CompletableFuture', 'Task', 'ValueTask',  // async wrappers
+  'Option', 'Some', 'Optional', 'Maybe',                                         // nullable wrappers
+  'Result', 'Either',                                                             // result wrappers
+  // Rust smart pointers (Deref to inner type)
+  'Rc', 'Arc', 'Weak',                                                          // pointer types
+  'MutexGuard', 'RwLockReadGuard', 'RwLockWriteGuard',                          // guard types
+  'Ref', 'RefMut',                                                               // RefCell guards
+  'Cow',                                                                         // copy-on-write
+  // Containers (List, Array, Vec, Set, etc.) are intentionally excluded —
+  // methods are called on the container, not the element type.
+  // Non-wrapper generics return the base type (e.g., List) via the else branch.
+]);
+
+/**
+ * Extracts the first type argument from a comma-separated generic argument string,
+ * respecting nested angle brackets. For example:
+ *   "Result<User, Error>"  → "Result<User, Error>"  (no top-level comma)
+ *   "User, Error"          → "User"
+ *   "Map<K, V>, string"    → "Map<K, V>"
+ */
+function extractFirstGenericArg(args: string): string {
+  let depth = 0;
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '<') depth++;
+    else if (args[i] === '>') depth--;
+    else if (args[i] === ',' && depth === 0) return args.slice(0, i).trim();
+  }
+  return args.trim();
+}
+
+/**
+ * Extract the first non-lifetime type argument from a generic argument string.
+ * Skips Rust lifetime parameters (e.g., `'a`, `'_`) to find the actual type.
+ *   "'_, User"       → "User"
+ *   "'a, User"       → "User"
+ *   "User, Error"    → "User"  (no lifetime — delegates to extractFirstGenericArg)
+ */
+function extractFirstTypeArg(args: string): string {
+  let remaining = args;
+  while (remaining) {
+    const first = extractFirstGenericArg(remaining);
+    if (!first.startsWith("'")) return first;
+    // Skip past this lifetime arg + the comma separator
+    const commaIdx = remaining.indexOf(',', first.length);
+    if (commaIdx < 0) return first; // only lifetimes — fall through
+    remaining = remaining.slice(commaIdx + 1).trim();
+  }
+  return args.trim();
+}
+
+export const extractReturnTypeName = (raw: string): string | undefined => {
+  let text = raw.trim();
+  if (!text) return undefined;
+
+  // Strip pointer/reference prefixes: *User, &User, &mut User
+  text = text.replace(/^[&*]+\s*(mut\s+)?/, '');
+
+  // Strip nullable suffix: User?
+  text = text.replace(/\?$/, '');
+
+  // Handle union types: "User | null" → "User"
+  if (text.includes('|')) {
+    const parts = text.split('|').map(p => p.trim()).filter(p =>
+      p !== 'null' && p !== 'undefined' && p !== 'void' && p !== 'None' && p !== 'nil'
+    );
+    if (parts.length === 1) text = parts[0];
+    else return undefined; // genuine union — too complex
+  }
+
+  // Handle generics: Promise<User> → unwrap if wrapper, else take base
+  const genericMatch = text.match(/^(\w+)\s*<(.+)>$/);
+  if (genericMatch) {
+    const [, base, args] = genericMatch;
+    if (WRAPPER_GENERICS.has(base)) {
+      // Take the first non-lifetime type argument, using bracket-balanced splitting
+      // so that nested generics like Result<User, Error> are not split at the inner
+      // comma. Lifetime parameters (Rust 'a, '_) are skipped.
+      const firstArg = extractFirstTypeArg(args);
+      return extractReturnTypeName(firstArg);
+    }
+    // Non-wrapper generic: return the base type (e.g., Map<K,V> → Map)
+    return PRIMITIVE_TYPES.has(base.toLowerCase()) ? undefined : base;
+  }
+
+  // Bare wrapper type without generic argument (e.g. Task, Promise, Option)
+  // should not produce a binding — these are meaningless without a type parameter
+  if (WRAPPER_GENERICS.has(text)) return undefined;
+
+  // Handle qualified names: models.User → User, Models::User → User, \App\Models\User → User
+  if (text.includes('::') || text.includes('.') || text.includes('\\')) {
+    text = text.split(/::|[.\\]/).pop()!;
+  }
+
+  // Final check: skip primitives
+  if (PRIMITIVE_TYPES.has(text) || PRIMITIVE_TYPES.has(text.toLowerCase())) return undefined;
+
+  // Must start with uppercase (class/type convention) or be a valid identifier
+  if (!/^[A-Z_]\w*$/.test(text)) return undefined;
+
+  return text;
+};
+
 // ── Scope key helpers ────────────────────────────────────────────────────
 // Scope keys use the format "funcName@startIndex" (produced by type-env.ts).
 // Source IDs use "Label:filepath:funcName" (produced by parse-worker.ts).
@@ -380,13 +580,9 @@ export const processCallsFromExtracted = async (
   const fileReceiverTypes = new Map<string, Map<string, string>>();
   if (constructorBindings) {
     for (const { filePath, bindings } of constructorBindings) {
-      for (const { scope, varName, calleeName } of bindings) {
-        const tiered = ctx.resolve(calleeName, filePath);
-        const isClass = tiered?.candidates.some(def => def.type === 'Class') ?? false;
-        if (isClass) {
-          if (!fileReceiverTypes.has(filePath)) fileReceiverTypes.set(filePath, new Map());
-          fileReceiverTypes.get(filePath)!.set(receiverKey(extractFuncNameFromScope(scope), varName), calleeName);
-        }
+      const verified = verifyConstructorBindings(bindings, filePath, ctx, graph);
+      if (verified.size > 0) {
+        fileReceiverTypes.set(filePath, verified);
       }
     }
   }

@@ -1,5 +1,5 @@
 import type { SyntaxNode } from '../utils.js';
-import type { LanguageTypeConfig, ParameterExtractor, TypeBindingExtractor, InitializerExtractor, ClassNameLookup } from './types.js';
+import type { LanguageTypeConfig, ParameterExtractor, TypeBindingExtractor, InitializerExtractor, ClassNameLookup, ConstructorBindingScanner } from './types.js';
 import { extractSimpleTypeName, extractVarName } from './shared.js';
 
 const DECLARATION_NODE_TYPES: ReadonlySet<string> = new Set([
@@ -75,9 +75,37 @@ const extractInitializer: InitializerExtractor = (node: SyntaxNode, env: Map<str
   }
 };
 
+/** Python: user = User("alice") — scan assignment/walrus for constructor-like calls.
+ *  Returns {varName, calleeName} without checking classNames (caller validates). */
+const scanConstructorBinding: ConstructorBindingScanner = (node) => {
+  let left: SyntaxNode | null;
+  let right: SyntaxNode | null;
+
+  if (node.type === 'named_expression') {
+    left = node.childForFieldName('name');
+    right = node.childForFieldName('value');
+  } else if (node.type === 'assignment') {
+    left = node.childForFieldName('left');
+    right = node.childForFieldName('right');
+    if (node.childForFieldName('type')) return undefined;
+  } else {
+    return undefined;
+  }
+
+  if (!left || !right) return undefined;
+  if (left.type !== 'identifier') return undefined;
+  if (right.type !== 'call') return undefined;
+  const func = right.childForFieldName('function');
+  if (!func) return undefined;
+  const calleeName = extractSimpleTypeName(func);
+  if (!calleeName) return undefined;
+  return { varName: left.text, calleeName };
+};
+
 export const typeConfig: LanguageTypeConfig = {
   declarationNodeTypes: DECLARATION_NODE_TYPES,
   extractDeclaration,
   extractParameter,
   extractInitializer,
+  scanConstructorBinding,
 };

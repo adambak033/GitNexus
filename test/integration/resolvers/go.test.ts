@@ -541,3 +541,120 @@ describe('Go type assertion type inference', () => {
     expect(greetCall!.source).toBe('process');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Return type inference: user := GetUser("alice"); user.Save()
+// Go now has a CONSTRUCTOR_BINDING_SCANNER for short_var_declaration, so
+// return type inference works end-to-end for `user := GetUser()`.
+// ---------------------------------------------------------------------------
+
+describe('Go return type inference via explicit function return type', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'go-return-type-inference'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects GetUser, GetRepo, and competing Save methods', () => {
+    const allSymbols = [...getNodesByLabel(result, 'Function'), ...getNodesByLabel(result, 'Method')];
+    expect(allSymbols).toContain('GetUser');
+    expect(allSymbols).toContain('GetRepo');
+    const saveMethods = allSymbols.filter(s => s === 'Save');
+    expect(saveMethods.length).toBe(2);
+  });
+
+  it('resolves user.Save() to models/user.go via return type of GetUser()', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'Save' && c.source === 'processUser' && c.targetFilePath.includes('user.go')
+    );
+    expect(saveCall).toBeDefined();
+  });
+
+  it('user.Save() does NOT resolve to models/repo.go (negative disambiguation)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const wrongSave = calls.find(c =>
+      c.target === 'Save' && c.source === 'processUser' && c.targetFilePath.includes('repo.go')
+    );
+    expect(wrongSave).toBeUndefined();
+  });
+
+  it('resolves repo.Save() to models/repo.go via return type of GetRepo()', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'Save' && c.source === 'processRepo' && c.targetFilePath.includes('repo.go')
+    );
+    expect(saveCall).toBeDefined();
+  });
+
+  it('repo.Save() does NOT resolve to models/user.go (negative disambiguation)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const wrongSave = calls.find(c =>
+      c.target === 'Save' && c.source === 'processRepo' && c.targetFilePath.includes('user.go')
+    );
+    expect(wrongSave).toBeUndefined();
+  });
+
+  it('resolves user.Save() via cross-package factory call models.NewUser()', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'Save' && c.source === 'processUserCrossPackage' && c.targetFilePath.includes('user.go')
+    );
+    expect(saveCall).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Go multi-return factory inference: user, err := NewUser("alice"); user.Save()
+// ---------------------------------------------------------------------------
+
+describe('Go multi-return factory type inference', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'go-multi-return-inference'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo structs with competing Save methods', () => {
+    const saveMethods = getNodesByLabel(result, 'Method').filter(m => m === 'Save');
+    expect(saveMethods.length).toBe(2);
+  });
+
+  it('resolves user.Save() to models/user.go via multi-return inference (user, err := NewUser())', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'Save' && c.source === 'processUser' && c.targetFilePath.includes('user.go')
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('user.Save() does NOT resolve to models/repo.go', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const wrongSave = calls.find(c =>
+      c.target === 'Save' && c.source === 'processUser' && c.targetFilePath.includes('repo.go')
+    );
+    expect(wrongSave).toBeUndefined();
+  });
+
+  it('resolves repo.Save() to models/repo.go via blank discard (repo, _ := NewRepo())', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoSave = calls.find(c =>
+      c.target === 'Save' && c.source === 'processRepo' && c.targetFilePath.includes('repo.go')
+    );
+    expect(repoSave).toBeDefined();
+  });
+
+  it('repo.Save() does NOT resolve to models/user.go', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const wrongSave = calls.find(c =>
+      c.target === 'Save' && c.source === 'processRepo' && c.targetFilePath.includes('user.go')
+    );
+    expect(wrongSave).toBeUndefined();
+  });
+});

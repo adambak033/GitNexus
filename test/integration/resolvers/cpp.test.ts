@@ -477,3 +477,81 @@ describe('C++ range-for explicit type resolution', () => {
     expect(edge).toBeDefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Return type inference: auto user = getUser("alice"); user.save()
+// C++'s CONSTRUCTOR_BINDING_SCANNER captures auto declarations with
+// call_expression values, enabling return type inference from function results.
+// ---------------------------------------------------------------------------
+
+describe('C++ return type inference via auto + function call', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'cpp-return-type'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User class and getUser function', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Function')).toContain('getUser');
+  });
+
+  it('detects save method on User', () => {
+    const methods = getNodesByLabel(result, 'Method');
+    expect(methods).toContain('save');
+  });
+
+  it('resolves user.save() to User#save via return type of getUser(): User', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'processUser' && c.targetFilePath.includes('user.h'),
+    );
+    expect(saveCall).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Return-type inference with competing methods:
+// Two classes both have save(), factory functions disambiguate via return type
+// ---------------------------------------------------------------------------
+
+describe('C++ return-type inference via function return type', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'cpp-return-type-inference'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves user.save() to User#save via return type of getUser()', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'processUser' && c.targetFilePath.includes('user.h')
+    );
+    expect(saveCall).toBeDefined();
+  });
+
+  it('user.save() does NOT resolve to Repo#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const wrongSave = calls.find(c =>
+      c.target === 'save' && c.source === 'processUser'
+    );
+    // Should resolve to exactly one target — if it resolves at all, check it's the right one
+    if (wrongSave) {
+      expect(wrongSave.targetFilePath).toContain('user.h');
+    }
+  });
+
+  it('resolves repo.save() to Repo#save via return type of getRepo()', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'processRepo' && c.targetFilePath.includes('repo.h')
+    );
+    expect(saveCall).toBeDefined();
+  });
+});

@@ -1,6 +1,6 @@
 import type { SyntaxNode } from '../utils.js';
-import type { LanguageTypeConfig, ParameterExtractor, TypeBindingExtractor } from './types.js';
-import { extractSimpleTypeName, extractVarName, findChildByType } from './shared.js';
+import type { ConstructorBindingScanner, LanguageTypeConfig, ParameterExtractor, TypeBindingExtractor } from './types.js';
+import { extractSimpleTypeName, extractVarName, findChildByType, unwrapAwait } from './shared.js';
 
 const DECLARATION_NODE_TYPES: ReadonlySet<string> = new Set([
   'local_declaration_statement',
@@ -103,8 +103,49 @@ const extractParameter: ParameterExtractor = (node: SyntaxNode, env: Map<string,
   if (varName && typeName) env.set(varName, typeName);
 };
 
+/** C#: var x = SomeFactory(...) → bind x to SomeFactory (constructor-like call) */
+const scanConstructorBinding: ConstructorBindingScanner = (node) => {
+  if (node.type !== 'variable_declaration') return undefined;
+  // Find type and declarator children by iterating (C# grammar doesn't expose 'type' as a named field)
+  let typeNode: SyntaxNode | null = null;
+  let declarator: SyntaxNode | null = null;
+  for (let i = 0; i < node.namedChildCount; i++) {
+    const child = node.namedChild(i);
+    if (!child) continue;
+    if (child.type === 'variable_declarator') { if (!declarator) declarator = child; }
+    else if (!typeNode) { typeNode = child; }
+  }
+  // Only handle implicit_type (var) — explicit types handled by extractDeclaration
+  if (!typeNode || typeNode.type !== 'implicit_type') return undefined;
+  if (!declarator) return undefined;
+  const nameNode = declarator.childForFieldName('name') ?? declarator.firstNamedChild;
+  if (!nameNode || nameNode.type !== 'identifier') return undefined;
+  // Find the initializer value: either inside equals_value_clause or as a direct child
+  // (tree-sitter-c-sharp puts invocation_expression directly inside variable_declarator)
+  let value: SyntaxNode | null = null;
+  for (let i = 0; i < declarator.namedChildCount; i++) {
+    const child = declarator.namedChild(i);
+    if (!child) continue;
+    if (child.type === 'equals_value_clause') { value = child.firstNamedChild; break; }
+    if (child.type === 'invocation_expression' || child.type === 'object_creation_expression' || child.type === 'await_expression') { value = child; break; }
+  }
+  if (!value) return undefined;
+  // Unwrap await: `var user = await svc.GetUserAsync()` → await_expression wraps invocation_expression
+  value = unwrapAwait(value);
+  if (!value) return undefined;
+  // Skip object_creation_expression (new User()) — handled by extractInitializer
+  if (value.type === 'object_creation_expression') return undefined;
+  if (value.type !== 'invocation_expression') return undefined;
+  const func = value.firstNamedChild;
+  if (!func) return undefined;
+  const calleeName = extractSimpleTypeName(func);
+  if (!calleeName) return undefined;
+  return { varName: nameNode.text, calleeName };
+};
+
 export const typeConfig: LanguageTypeConfig = {
   declarationNodeTypes: DECLARATION_NODE_TYPES,
   extractDeclaration,
   extractParameter,
+  scanConstructorBinding,
 };

@@ -558,3 +558,164 @@ describe('C# is pattern matching resolution', () => {
     expect(catExtends!.target).toBe('Animal');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Return type inference: var user = svc.GetUser("alice"); user.Save()
+// C#'s CONSTRUCTOR_BINDING_SCANNER handles `var` declarations with
+// invocation_expression values, enabling end-to-end return type inference.
+// ---------------------------------------------------------------------------
+
+describe('C# return type inference via var + invocation', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'csharp-return-type'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User, UserService, and Repo classes', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Class')).toContain('UserService');
+    expect(getNodesByLabel(result, 'Class')).toContain('Repo');
+  });
+
+  it('detects Save on both User and Repo, plus GetUser', () => {
+    const methods = getNodesByLabel(result, 'Method');
+    expect(methods).toContain('Save');
+    expect(methods).toContain('GetUser');
+    // Repo.Save is also detected, proving the disambiguation test is meaningful
+    expect(methods.filter((m: string) => m === 'Save').length).toBe(2);
+  });
+
+  it('resolves user.Save() to User#Save (not Repo#Save) via return type of GetUser(): User', () => {
+    // scanConstructorBinding binds `var user = svc.GetUser()` → calleeName "GetUser".
+    // processCallsFromExtracted verifies GetUser's returnType is "User" via
+    // PackageMap resolution of `using ReturnType.Models;`, then receiver filtering
+    // resolves user.Save() to User#Save (not Repo#Save).
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'Save' && c.source === 'Run' && c.targetFilePath.includes('User.cs'),
+    );
+    expect(saveCall).toBeDefined();
+    // Must NOT resolve to Repo.Save — that would mean disambiguation failed
+    const repoSave = calls.find(c =>
+      c.target === 'Save' && c.source === 'Run' && c.targetFilePath.includes('Repo.cs'),
+    );
+    expect(repoSave).toBeUndefined();
+  });
+});
+
+describe('C# null-conditional call resolution (user?.Save())', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'csharp-null-conditional'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo classes with competing Save methods', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Class')).toContain('Repo');
+    const saveMethods = getNodesByLabel(result, 'Method').filter((m: string) => m === 'Save');
+    expect(saveMethods.length).toBe(2);
+  });
+
+  it('captures null-conditional user?.Save() call', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCalls = calls.filter(c => c.target === 'Save' && c.source === 'Process');
+    expect(saveCalls.length).toBeGreaterThan(0);
+  });
+
+  it('resolves user?.Save() to User#Save via receiver typing', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'Save' && c.source === 'Process' && c.targetFilePath.includes('User.cs'),
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('resolves repo?.Save() to Repo#Save via receiver typing', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoSave = calls.find(c =>
+      c.target === 'Save' && c.source === 'Process' && c.targetFilePath.includes('Repo.cs'),
+    );
+    expect(repoSave).toBeDefined();
+  });
+
+  it('does NOT cross-contaminate (exactly 1 Save per receiver file)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCalls = calls.filter(c => c.target === 'Save' && c.source === 'Process');
+    const userTargeted = saveCalls.filter(c => c.targetFilePath.includes('User.cs'));
+    const repoTargeted = saveCalls.filter(c => c.targetFilePath.includes('Repo.cs'));
+    expect(userTargeted.length).toBe(1);
+    expect(repoTargeted.length).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// C# async/await constructor binding resolution
+// Verifies that `var user = await svc.GetUserAsync()` correctly unwraps the
+// await_expression to find the invocation_expression underneath, producing a
+// constructor binding that enables receiver-based disambiguation of user.Save().
+// ---------------------------------------------------------------------------
+
+describe('C# async await constructor binding resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'csharp-async-binding'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User, UserService, and OrderService classes', () => {
+    const classes = getNodesByLabel(result, 'Class');
+    expect(classes).toContain('User');
+    expect(classes).toContain('UserService');
+    expect(classes).toContain('OrderService');
+  });
+
+  it('detects competing Save methods on User and Order', () => {
+    const methods = getNodesByLabel(result, 'Method');
+    expect(methods).toContain('Save');
+    expect(methods).toContain('GetUserAsync');
+    expect(methods).toContain('GetOrderAsync');
+  });
+
+  it('resolves user.Save() after await to User#Save via return type inference', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'Save' && c.source === 'ProcessUser' && c.targetFilePath.includes('User.cs'),
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('user.Save() does NOT resolve to Order#Save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const wrongSave = calls.find(c =>
+      c.target === 'Save' && c.source === 'ProcessUser' && c.targetFilePath.includes('Order.cs'),
+    );
+    expect(wrongSave).toBeUndefined();
+  });
+
+  it('resolves order.Save() after await to Order#Save via return type inference', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const orderSave = calls.find(c =>
+      c.target === 'Save' && c.source === 'ProcessOrder' && c.targetFilePath.includes('Order.cs'),
+    );
+    expect(orderSave).toBeDefined();
+  });
+
+  it('order.Save() does NOT resolve to User#Save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const wrongSave = calls.find(c =>
+      c.target === 'Save' && c.source === 'ProcessOrder' && c.targetFilePath.includes('User.cs'),
+    );
+    expect(wrongSave).toBeUndefined();
+  });
+});

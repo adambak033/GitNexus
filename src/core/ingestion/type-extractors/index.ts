@@ -15,6 +15,7 @@ import { typeConfig as pythonConfig } from './python.js';
 import { typeConfig as swiftConfig } from './swift.js';
 import { typeConfig as cCppConfig } from './c-cpp.js';
 import { typeConfig as phpConfig } from './php.js';
+import { typeConfig as rubyConfig } from './ruby.js';
 
 export const typeConfigs = {
   [SupportedLanguages.JavaScript]: typescriptConfig,
@@ -29,12 +30,15 @@ export const typeConfigs = {
   [SupportedLanguages.C]: cCppConfig,
   [SupportedLanguages.CPlusPlus]: cCppConfig,
   [SupportedLanguages.PHP]: phpConfig,
-  [SupportedLanguages.Ruby]: {
-    declarationNodeTypes: new Set<string>(),
-    extractDeclaration: () => {},
-    extractParameter: () => {},
-  } as LanguageTypeConfig,
+  [SupportedLanguages.Ruby]: rubyConfig,
 } satisfies Record<SupportedLanguages, LanguageTypeConfig>;
 
-export type { LanguageTypeConfig, TypeBindingExtractor, ParameterExtractor } from './types.js';
-export { TYPED_PARAMETER_TYPES, extractSimpleTypeName, extractVarName, findChildByType } from './shared.js';
+export type { LanguageTypeConfig, TypeBindingExtractor, ParameterExtractor, ConstructorBindingScanner } from './types.js';
+export { 
+  TYPED_PARAMETER_TYPES,
+  extractSimpleTypeName,
+  extractGenericTypeArgs,
+  extractVarName,
+  findChildByType,
+  extractRubyConstructorAssignment
+} from './shared.js';

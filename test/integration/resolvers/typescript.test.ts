@@ -852,3 +852,187 @@ describe('TypeScript nullable receiver resolution (optional chaining)', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Return type inference: const user = getUser('alice'); user.save()
+// The TS/JS CONSTRUCTOR_BINDING_SCANNER captures variable_declarator nodes
+// with plain call_expression values, enabling end-to-end return type inference.
+// ---------------------------------------------------------------------------
+
+describe('TypeScript return type inference via explicit function return type', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'ts-return-type-inference'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User class with save and getName methods', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    const methods = getNodesByLabel(result, 'Method');
+    expect(methods).toContain('save');
+    expect(methods).toContain('getName');
+  });
+
+  it('detects getUser and fetchUserAsync functions', () => {
+    const functions = getNodesByLabel(result, 'Function');
+    expect(functions).toContain('getUser');
+    expect(functions).toContain('fetchUserAsync');
+  });
+
+  it('resolves user.save() to User#save via return type of getUser(): User', () => {
+    // TS has explicit return types in the source, so extractMethodSignature captures
+    // the return type. The TS extractInitializer handles `const user = getUser()`
+    // via the variable_declarator path, enabling save() to resolve to User#save.
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'processUser' && c.targetFilePath.includes('models')
+    );
+    expect(saveCall).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// JavaScript return type inference via JSDoc @returns annotation
+// ---------------------------------------------------------------------------
+
+describe('JavaScript return type inference via JSDoc @returns annotation', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'js-jsdoc-return-type'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo classes with save methods', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Class')).toContain('Repo');
+  });
+
+  it('resolves user.save() to User#save via JSDoc @returns {User}', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'processUser' && c.targetFilePath.includes('user.js'),
+    );
+    expect(saveCall).toBeDefined();
+    // Negative: must NOT resolve to Repo#save
+    const wrongCall = calls.find(c =>
+      c.target === 'save' && c.source === 'processUser' && c.targetFilePath.includes('repo.js'),
+    );
+    expect(wrongCall).toBeUndefined();
+  });
+
+  it('resolves repo.save() to Repo#save via JSDoc @returns {Repo}', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'processRepo' && c.targetFilePath.includes('repo.js'),
+    );
+    expect(saveCall).toBeDefined();
+    // Negative: must NOT resolve to User#save
+    const wrongCall = calls.find(c =>
+      c.target === 'save' && c.source === 'processRepo' && c.targetFilePath.includes('user.js'),
+    );
+    expect(wrongCall).toBeUndefined();
+  });
+
+  it('resolves user.save() via JSDoc @param {User} in handleUser()', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'handleUser' && c.targetFilePath.includes('user.js'),
+    );
+    expect(saveCall).toBeDefined();
+    // Negative: must NOT resolve to Repo#save
+    const wrongCall = calls.find(c =>
+      c.target === 'save' && c.source === 'handleUser' && c.targetFilePath.includes('repo.js'),
+    );
+    expect(wrongCall).toBeUndefined();
+  });
+
+  it('resolves repo.save() via JSDoc @param {Repo} in handleRepo()', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'handleRepo' && c.targetFilePath.includes('repo.js'),
+    );
+    expect(saveCall).toBeDefined();
+    // Negative: must NOT resolve to User#save
+    const wrongCall = calls.find(c =>
+      c.target === 'save' && c.source === 'handleRepo' && c.targetFilePath.includes('user.js'),
+    );
+    expect(wrongCall).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// JavaScript async return type inference via JSDoc @returns {Promise<User>}
+// Verifies that wrapper generics (Promise) are unwrapped to the inner type.
+// ---------------------------------------------------------------------------
+
+describe('JavaScript async return type inference via JSDoc @returns {Promise<User>}', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'js-jsdoc-async-return-type'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo classes with save methods', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Class')).toContain('Repo');
+  });
+
+  it('resolves user.save() to User#save via @returns {Promise<User>} unwrapping', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'processUser' && c.targetFilePath.includes('user.js'),
+    );
+    expect(saveCall).toBeDefined();
+    // Negative: must NOT resolve to Repo#save
+    const wrongCall = calls.find(c =>
+      c.target === 'save' && c.source === 'processUser' && c.targetFilePath.includes('repo.js'),
+    );
+    expect(wrongCall).toBeUndefined();
+  });
+
+  it('resolves repo.save() to Repo#save via @returns {Promise<Repo>} unwrapping', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'processRepo' && c.targetFilePath.includes('repo.js'),
+    );
+    expect(saveCall).toBeDefined();
+    // Negative: must NOT resolve to User#save
+    const wrongCall = calls.find(c =>
+      c.target === 'save' && c.source === 'processRepo' && c.targetFilePath.includes('user.js'),
+    );
+    expect(wrongCall).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// JavaScript qualified return type: @returns {Promise<models.User>}
+// Verifies that dot-qualified names inside generics are not corrupted.
+// ---------------------------------------------------------------------------
+
+describe('JavaScript qualified return type via JSDoc @returns {Promise<models.User>}', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'js-jsdoc-qualified-return-type'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves user.save() to User#save despite qualified return type', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'processUser' && c.targetFilePath.includes('user.js'),
+    );
+    expect(saveCall).toBeDefined();
+  });
+});
+

@@ -270,19 +270,13 @@ const createClassNameLookup = (
 };
 
 /**
- * Build a scoped TypeEnv from a tree-sitter AST for a given language.
- * Single-pass: collects class/struct names AND type bindings in one walk.
- * Class names are accumulated incrementally — this is safe because no
- * language allows constructing a class before its definition.
+ * Build a TypeEnvironment from a tree-sitter AST for a given language.
+ * Single-pass: collects class/struct names, type bindings, AND constructor
+ * bindings that couldn't be resolved locally — all in one AST walk.
  *
  * When a symbolTable is provided (call-processor path), class names from across
  * the project are available for constructor inference in languages like Kotlin
  * where constructors are syntactically identical to function calls.
- */
-/**
- * Build a TypeEnvironment from a tree-sitter AST for a given language.
- * Single-pass: collects class/struct names, type bindings, AND constructor
- * bindings that couldn't be resolved locally — all in one AST walk.
  */
 export const buildTypeEnv = (
   tree: { rootNode: SyntaxNode },
@@ -293,7 +287,6 @@ export const buildTypeEnv = (
   const localClassNames = new Set<string>();
   const classNames = createClassNameLookup(localClassNames, symbolTable);
   const config = typeConfigs[language];
-  const scanner = CONSTRUCTOR_BINDING_SCANNERS[language];
   const bindings: ConstructorBinding[] = [];
 
   /**
@@ -347,8 +340,8 @@ export const buildTypeEnv = (
 
     // Scan for constructor bindings that couldn't be resolved locally.
     // Only collect if TypeEnv didn't already resolve this binding.
-    if (scanner) {
-      const result = scanner(node);
+    if (config.scanConstructorBinding) {
+      const result = config.scanConstructorBinding(node);
       if (result && !scopeEnv.has(result.varName)) {
         bindings.push({ scope, ...result });
       }
@@ -381,149 +374,8 @@ export interface ConstructorBinding {
   varName: string;
   /** Name of the callee (potential class constructor) */
   calleeName: string;
+  /** Enclosing class name when callee is a method on a known receiver (e.g. $this) */
+  receiverClassName?: string;
 }
 
-/** C/C++: auto x = User() where function is an identifier (not type_identifier) */
-const extractCppConstructorBinding = (node: SyntaxNode): { varName: string; calleeName: string } | undefined => {
-  if (node.type !== 'declaration') return undefined;
-  const typeNode = node.childForFieldName('type');
-  if (!typeNode) return undefined;
-  const typeText = typeNode.text;
-  if (typeText !== 'auto' && typeText !== 'decltype(auto)' && typeNode.type !== 'placeholder_type_specifier') return undefined;
-  const declarator = node.childForFieldName('declarator');
-  if (!declarator || declarator.type !== 'init_declarator') return undefined;
-  const value = declarator.childForFieldName('value');
-  if (!value || value.type !== 'call_expression') return undefined;
-  const func = value.childForFieldName('function');
-  // Match plain identifiers (type_identifier is already resolved by extractInitializer)
-  // and qualified/scoped identifiers for namespaced calls like ns::HttpClient()
-  if (!func) return undefined;
-  if (func.type === 'qualified_identifier' || func.type === 'scoped_identifier') {
-    // ns::HttpClient → extract "HttpClient" (last segment)
-    const last = func.lastNamedChild;
-    if (!last) return undefined;
-    const nameNode = declarator.childForFieldName('declarator');
-    if (!nameNode) return undefined;
-    const finalName = nameNode.type === 'pointer_declarator' || nameNode.type === 'reference_declarator'
-      ? nameNode.firstNamedChild : nameNode;
-    if (!finalName) return undefined;
-    return { varName: finalName.text, calleeName: last.text };
-  }
-  if (func.type !== 'identifier') return undefined;
-  const nameNode = declarator.childForFieldName('declarator');
-  if (!nameNode) return undefined;
-  const finalName = nameNode.type === 'pointer_declarator' || nameNode.type === 'reference_declarator'
-    ? nameNode.firstNamedChild : nameNode;
-  if (!finalName) return undefined;
-  const varName = finalName.text;
-  if (!varName) return undefined;
-  return { varName, calleeName: func.text };
-};
-
-/** Ruby: user = User.new — assignment with call where method is 'new' and receiver is a constant */
-const extractRubyConstructorBinding = (node: SyntaxNode): { varName: string; calleeName: string } | undefined => {
-  if (node.type !== 'assignment') return undefined;
-  const left = node.childForFieldName('left');
-  const right = node.childForFieldName('right');
-  if (!left || !right) return undefined;
-  // Support both local variables (identifier) and constants (USER = User.new)
-  if (left.type !== 'identifier' && left.type !== 'constant') return undefined;
-  if (right.type !== 'call') return undefined;
-  const method = right.childForFieldName('method');
-  if (!method || method.text !== 'new') return undefined;
-  const receiver = right.childForFieldName('receiver');
-  if (!receiver || receiver.type !== 'constant') return undefined;
-  return { varName: left.text, calleeName: receiver.text };
-};
-
-/** Language-specific constructor-binding scanners. */
-const CONSTRUCTOR_BINDING_SCANNERS: Partial<Record<SupportedLanguages, (node: SyntaxNode) => { varName: string; calleeName: string } | undefined>> = {
-  // Kotlin: val x = User(...) — property_declaration with call_expression
-  [SupportedLanguages.Kotlin]: (node) => {
-    if (node.type !== 'property_declaration') return undefined;
-    const varDecl = node.namedChildren.find(c => c.type === 'variable_declaration');
-    if (!varDecl) return undefined;
-    if (varDecl.namedChildren.some(c => c.type === 'user_type')) return undefined;
-    const callExpr = node.namedChildren.find(c => c.type === 'call_expression');
-    if (!callExpr) return undefined;
-    const callee = callExpr.firstNamedChild;
-    if (!callee || callee.type !== 'simple_identifier') return undefined;
-    const nameNode = varDecl.namedChildren.find(c => c.type === 'simple_identifier');
-    if (!nameNode) return undefined;
-    return { varName: nameNode.text, calleeName: callee.text };
-  },
-
-  // Python: user = User("alice") — assignment with call
-  // Also handles walrus operator: (user := User("alice"))
-  [SupportedLanguages.Python]: (node) => {
-    let left: SyntaxNode | null;
-    let right: SyntaxNode | null;
-
-    if (node.type === 'named_expression') {
-      // Walrus operator: (user := User("alice"))
-      left = node.childForFieldName('name');
-      right = node.childForFieldName('value');
-    } else if (node.type === 'assignment') {
-      left = node.childForFieldName('left');
-      right = node.childForFieldName('right');
-      // Skip annotated assignments — extractDeclaration handles those
-      if (node.childForFieldName('type')) return undefined;
-    } else {
-      return undefined;
-    }
-
-    if (!left || !right) return undefined;
-    if (left.type !== 'identifier') return undefined;
-    if (right.type !== 'call') return undefined;
-    const func = right.childForFieldName('function');
-    if (!func) return undefined;
-    // Support both direct calls (User()) and qualified calls (models.User())
-    const calleeName = extractSimpleTypeName(func);
-    if (!calleeName) return undefined;
-    return { varName: left.text, calleeName };
-  },
-
-  // Swift: let user = User(name: "alice") — property_declaration with call_expression
-  [SupportedLanguages.Swift]: (node) => {
-    if (node.type !== 'property_declaration') return undefined;
-    // Skip if has type annotation
-    if (node.childForFieldName('type')) return undefined;
-    for (let i = 0; i < node.namedChildCount; i++) {
-      if (node.namedChild(i)?.type === 'type_annotation') return undefined;
-    }
-    const pattern = node.childForFieldName('pattern');
-    if (!pattern) return undefined;
-    const varName = pattern.text;
-    if (!varName) return undefined;
-    // Find call_expression child
-    let callExpr: SyntaxNode | null = null;
-    for (let i = 0; i < node.namedChildCount; i++) {
-      const child = node.namedChild(i);
-      if (child?.type === 'call_expression') { callExpr = child; break; }
-    }
-    if (!callExpr) return undefined;
-    const callee = callExpr.firstNamedChild;
-    if (!callee) return undefined;
-    // Direct call: User(name: "alice") — simple_identifier callee
-    if (callee.type === 'simple_identifier') {
-      return { varName, calleeName: callee.text };
-    }
-    // Explicit init: User.init(name: "alice") — navigation_expression with .init suffix
-    if (callee.type === 'navigation_expression') {
-      const receiver = callee.firstNamedChild;
-      const suffix = callee.lastNamedChild;
-      if (receiver?.type === 'simple_identifier' && suffix?.text === 'init') {
-        return { varName, calleeName: receiver.text };
-      }
-    }
-    return undefined;
-  },
-
-  // C++: auto x = User() where User is parsed as identifier (cross-file)
-  // Note: C is excluded — C has no constructors and `auto` is a storage-class specifier, not type inference.
-  [SupportedLanguages.CPlusPlus]: extractCppConstructorBinding,
-
-  // Ruby: user = User.new — assignment with call where method is 'new' and receiver is a constant
-  [SupportedLanguages.Ruby]: extractRubyConstructorBinding,
-};
 

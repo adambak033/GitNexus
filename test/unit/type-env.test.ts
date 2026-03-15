@@ -518,6 +518,116 @@ class UserService {
       const { env } = buildTypeEnv(tree, 'php');
       expect(flatGet(env, '$name')).toBe('string');
     });
+
+    it('extracts PHPDoc @param with standard order: @param Type $name', () => {
+      const tree = parse(`<?php
+/**
+ * @param UserRepo $repo the repository
+ * @param string $name the user name
+ */
+function create($repo, $name) {
+  $repo->save();
+}
+      `, PHP.php);
+      const { env } = buildTypeEnv(tree, 'php');
+      expect(flatGet(env, '$repo')).toBe('UserRepo');
+      expect(flatGet(env, '$name')).toBe('string');
+    });
+
+    it('extracts PHPDoc @param with alternate order: @param $name Type', () => {
+      const tree = parse(`<?php
+/**
+ * @param $repo UserRepo the repository
+ * @param $name string the user name
+ */
+function process($repo, $name) {
+  $repo->save();
+}
+      `, PHP.php);
+      const { env } = buildTypeEnv(tree, 'php');
+      expect(flatGet(env, '$repo')).toBe('UserRepo');
+      expect(flatGet(env, '$name')).toBe('string');
+    });
+  });
+
+  describe('Ruby YARD annotations', () => {
+    it('extracts @param type bindings from YARD comments', () => {
+      const tree = parse(`
+class UserService
+  # @param repo [UserRepo] the repository
+  # @param name [String] the user's name
+  def create(repo, name)
+    repo.save
+  end
+end
+`, Ruby);
+      const { env } = buildTypeEnv(tree, 'ruby');
+      expect(flatGet(env, 'repo')).toBe('UserRepo');
+      expect(flatGet(env, 'name')).toBe('String');
+    });
+
+    it('handles qualified YARD types (Models::User → User)', () => {
+      const tree = parse(`
+# @param user [Models::User] the user
+def process(user)
+end
+`, Ruby);
+      const { env } = buildTypeEnv(tree, 'ruby');
+      expect(flatGet(env, 'user')).toBe('User');
+    });
+
+    it('handles nullable YARD types (String, nil → String)', () => {
+      const tree = parse(`
+# @param name [String, nil] optional name
+def greet(name)
+end
+`, Ruby);
+      const { env } = buildTypeEnv(tree, 'ruby');
+      expect(flatGet(env, 'name')).toBe('String');
+    });
+
+    it('skips ambiguous union YARD types (String, Integer → undefined)', () => {
+      const tree = parse(`
+# @param value [String, Integer] mixed type
+def process(value)
+end
+`, Ruby);
+      const { env } = buildTypeEnv(tree, 'ruby');
+      expect(flatGet(env, 'value')).toBeUndefined();
+    });
+
+    it('extracts no types when no YARD comments present', () => {
+      const tree = parse(`
+def create(repo, name)
+  repo.save
+end
+`, Ruby);
+      const { env } = buildTypeEnv(tree, 'ruby');
+      expect(flatSize(env)).toBe(0);
+    });
+
+    it('extracts types from singleton method YARD comments', () => {
+      const tree = parse(`
+class UserService
+  # @param name [String] the user's name
+  def self.find(name)
+    name
+  end
+end
+`, Ruby);
+      const { env } = buildTypeEnv(tree, 'ruby');
+      expect(flatGet(env, 'name')).toBe('String');
+    });
+
+    it('handles generic YARD types (Array<User> → Array)', () => {
+      const tree = parse(`
+# @param users [Array<User>] list of users
+def process(users)
+end
+`, Ruby);
+      const { env } = buildTypeEnv(tree, 'ruby');
+      expect(flatGet(env, 'users')).toBe('Array');
+    });
   });
 
   describe('super/base/parent resolution', () => {
@@ -797,12 +907,11 @@ class RepoService {
         expect(flatGet(env, 'user')).toBe('BaseUser');
       });
 
-      it('does not infer from namespaced constructor (known limitation)', () => {
-        // extractSimpleTypeName only handles simple identifiers, not member expressions
+      it('infers from namespaced constructor: new ns.Service()', () => {
+        // extractSimpleTypeName handles member_expression via property_identifier
         const tree = parse('const svc = new ns.Service();', TypeScript.typescript);
         const { env } = buildTypeEnv(tree, 'typescript');
-        // member_expression as constructor → extractSimpleTypeName returns undefined
-        expect(flatGet(env, 'svc')).toBeUndefined();
+        expect(flatGet(env, 'svc')).toBe('Service');
       });
 
       it('infers type from new expression with as cast', () => {
@@ -897,6 +1006,30 @@ class RepoService {
         `, Rust);
         const { env } = buildTypeEnv(tree, 'rust');
         expect(flatGet(env, 'config')).toBe('Config');
+      });
+
+      it('does NOT emit scanner binding for Type::default() (handled by extractInitializer)', () => {
+        const tree = parse(`
+          fn main() {
+            let config = Config::default();
+          }
+        `, Rust);
+        const { constructorBindings } = buildTypeEnv(tree, 'rust');
+        // ::default() should be excluded from scanConstructorBinding just like ::new()
+        // extractInitializer already resolves it, so a scanner binding would be redundant
+        const defaultBinding = constructorBindings.find(b => b.calleeName === 'default');
+        expect(defaultBinding).toBeUndefined();
+      });
+
+      it('does NOT emit scanner binding for Type::new() (handled by extractInitializer)', () => {
+        const tree = parse(`
+          fn main() {
+            let user = User::new();
+          }
+        `, Rust);
+        const { constructorBindings } = buildTypeEnv(tree, 'rust');
+        const newBinding = constructorBindings.find(b => b.calleeName === 'new');
+        expect(newBinding).toBeUndefined();
       });
 
       it('prefers explicit annotation over constructor inference', () => {
@@ -1634,6 +1767,26 @@ REPO = Repo.new
       expect(constructorBindings[0].calleeName).toBe('Repo');
     });
 
+    it('returns constructor bindings for Ruby namespaced constructor (service = Models::UserService.new)', () => {
+      const tree = parse(`
+service = Models::UserService.new
+`, Ruby);
+      const { constructorBindings } = buildTypeEnv(tree, 'ruby');
+      expect(constructorBindings.length).toBe(1);
+      expect(constructorBindings[0].varName).toBe('service');
+      expect(constructorBindings[0].calleeName).toBe('UserService');
+    });
+
+    it('returns constructor bindings for deeply namespaced Ruby constructor (svc = App::Models::Service.new)', () => {
+      const tree = parse(`
+svc = App::Models::Service.new
+`, Ruby);
+      const { constructorBindings } = buildTypeEnv(tree, 'ruby');
+      expect(constructorBindings.length).toBe(1);
+      expect(constructorBindings[0].varName).toBe('svc');
+      expect(constructorBindings[0].calleeName).toBe('Service');
+    });
+
     it('includes scope key in constructor bindings', () => {
       const tree = parse(`
         fun process() {
@@ -1643,6 +1796,113 @@ REPO = Repo.new
       const { constructorBindings } = buildTypeEnv(tree, 'kotlin');
       expect(constructorBindings.length).toBe(1);
       expect(constructorBindings[0].scope).toMatch(/^process@\d+$/);
+    });
+
+    it('returns constructor bindings for TypeScript const user = getUser()', () => {
+      const tree = parse('const user = getUser();', TypeScript.typescript);
+      const { env, constructorBindings } = buildTypeEnv(tree, 'typescript');
+      expect(flatGet(env, 'user')).toBeUndefined();
+      expect(constructorBindings.length).toBe(1);
+      expect(constructorBindings[0].varName).toBe('user');
+      expect(constructorBindings[0].calleeName).toBe('getUser');
+    });
+
+    it('does NOT emit constructor binding when TypeScript var has explicit type annotation', () => {
+      const tree = parse('const user: User = getUser();', TypeScript.typescript);
+      const { env, constructorBindings } = buildTypeEnv(tree, 'typescript');
+      expect(flatGet(env, 'user')).toBe('User');
+      expect(constructorBindings.find(b => b.varName === 'user')).toBeUndefined();
+    });
+
+    it('skips destructuring patterns (array_pattern) for TypeScript', () => {
+      const tree = parse('const [a, b] = getPair();', TypeScript.typescript);
+      const { constructorBindings } = buildTypeEnv(tree, 'typescript');
+      expect(constructorBindings).toEqual([]);
+    });
+
+    it('skips destructuring patterns (object_pattern) for TypeScript', () => {
+      const tree = parse('const { name, age } = getUser();', TypeScript.typescript);
+      const { constructorBindings } = buildTypeEnv(tree, 'typescript');
+      expect(constructorBindings).toEqual([]);
+    });
+
+    it('unwraps await in TypeScript: const user = await fetchUser()', () => {
+      const tree = parse('async function f() { const user = await fetchUser(); }', TypeScript.typescript);
+      const { constructorBindings } = buildTypeEnv(tree, 'typescript');
+      expect(constructorBindings.length).toBe(1);
+      expect(constructorBindings[0].varName).toBe('user');
+      expect(constructorBindings[0].calleeName).toBe('fetchUser');
+    });
+
+    it('handles qualified callee in TypeScript: const user = repo.getUser()', () => {
+      const tree = parse('const user = repo.getUser();', TypeScript.typescript);
+      const { constructorBindings } = buildTypeEnv(tree, 'typescript');
+      expect(constructorBindings.length).toBe(1);
+      expect(constructorBindings[0].varName).toBe('user');
+      expect(constructorBindings[0].calleeName).toBe('getUser');
+    });
+
+    it('does not emit binding for TypeScript new expression (handled by extractInitializer)', () => {
+      const tree = parse('const user = new User();', TypeScript.typescript);
+      const { env, constructorBindings } = buildTypeEnv(tree, 'typescript');
+      expect(flatGet(env, 'user')).toBe('User');
+      expect(constructorBindings.find(b => b.varName === 'user')).toBeUndefined();
+    });
+
+    it('returns constructor binding for C# var user = svc.GetUser()', () => {
+      const tree = parse(`
+        class App {
+          void Run() {
+            var svc = new UserService();
+            var user = svc.GetUser("alice");
+          }
+        }
+      `, CSharp);
+      const { constructorBindings } = buildTypeEnv(tree, 'csharp');
+      const binding = constructorBindings.find(b => b.varName === 'user');
+      expect(binding).toBeDefined();
+      expect(binding!.calleeName).toBe('GetUser');
+    });
+
+    it('unwraps .await in Rust: let user = get_user().await', () => {
+      const tree = parse(`
+        async fn process() {
+          let user = get_user().await;
+        }
+      `, Rust);
+      const { constructorBindings } = buildTypeEnv(tree, 'rust');
+      expect(constructorBindings.length).toBe(1);
+      expect(constructorBindings[0].varName).toBe('user');
+      expect(constructorBindings[0].calleeName).toBe('get_user');
+    });
+
+    it('unwraps await in C#: var user = await svc.GetUserAsync()', () => {
+      const tree = parse(`
+        class App {
+          async void Run() {
+            var svc = new UserService();
+            var user = await svc.GetUserAsync("alice");
+          }
+        }
+      `, CSharp);
+      const { constructorBindings } = buildTypeEnv(tree, 'csharp');
+      const binding = constructorBindings.find(b => b.varName === 'user');
+      expect(binding).toBeDefined();
+      expect(binding!.calleeName).toBe('GetUserAsync');
+    });
+
+    it('returns constructor binding for C# var user = GetUser() (standalone call)', () => {
+      const tree = parse(`
+        class App {
+          void Run() {
+            var user = GetUser("alice");
+          }
+        }
+      `, CSharp);
+      const { constructorBindings } = buildTypeEnv(tree, 'csharp');
+      const binding = constructorBindings.find(b => b.varName === 'user');
+      expect(binding).toBeDefined();
+      expect(binding!.calleeName).toBe('GetUser');
     });
   });
 });

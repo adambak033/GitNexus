@@ -230,6 +230,20 @@ describe('extractMethodSignature', () => {
       const sig = extractMethodSignature(methodNode);
       expect(sig.parameterCount).toBe(0);
     });
+
+    it('extracts return type from C# method', () => {
+      parser.setLanguage(CSharp);
+      const code = `class Svc {
+  public User GetUser(string name) { return null; }
+}`;
+      const tree = parser.parse(code);
+      const classNode = tree.rootNode.child(0)!;
+      const classBody = classNode.childForFieldName('body')!;
+      const methodNode = classBody.namedChild(0)!;
+
+      const sig = extractMethodSignature(methodNode);
+      expect(sig.returnType).toBe('User');
+    });
   });
 
   describe('Go', () => {
@@ -254,7 +268,7 @@ func parse(s string) (string, error) { return s, nil }`;
 
       const sig = extractMethodSignature(funcNode);
       expect(sig.parameterCount).toBe(1);
-      expect(sig.returnType).toBe('(string, error)');
+      expect(sig.returnType).toBe('string');
     });
 
     it('handles no return type', () => {

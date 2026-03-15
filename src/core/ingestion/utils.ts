@@ -618,9 +618,19 @@ export const extractMethodSignature = (node: SyntaxNode | null | undefined): Met
   // Go: 'result' field is either a type_identifier or parameter_list (multi-return)
   const goResult = node.childForFieldName?.('result');
   if (goResult) {
-    returnType = goResult.type === 'parameter_list'
-      ? goResult.text   // multi-return: "(string, error)"
-      : goResult.text;  // single return: "int"
+    if (goResult.type === 'parameter_list') {
+      // Multi-return: extract first parameter's type only (e.g. (*User, error) → *User)
+      const firstParam = goResult.firstNamedChild;
+      if (firstParam?.type === 'parameter_declaration') {
+        const typeNode = firstParam.childForFieldName('type');
+        if (typeNode) returnType = typeNode.text;
+      } else if (firstParam) {
+        // Unnamed return types: (string, error) — first child is a bare type node
+        returnType = firstParam.text;
+      }
+    } else {
+      returnType = goResult.text;
+    }
   }
 
   // Rust: 'return_type' field — the value IS the type node (e.g. primitive_type, type_identifier).
@@ -637,6 +647,14 @@ export const extractMethodSignature = (node: SyntaxNode | null | undefined): Met
     const cppType = node.childForFieldName?.('type');
     if (cppType && cppType.text !== 'void') {
       returnType = cppType.text;
+    }
+  }
+
+  // C#: 'returns' field on method_declaration
+  if (!returnType) {
+    const csReturn = node.childForFieldName?.('returns');
+    if (csReturn && csReturn.text !== 'void') {
+      returnType = csReturn.text;
     }
   }
 
@@ -701,6 +719,7 @@ const MEMBER_ACCESS_NODE_TYPES = new Set([
   'field_expression',            // Rust/C++: obj.method() / ptr->method()
   'selector_expression',         // Go: obj.Method()
   'navigation_suffix',           // Kotlin/Swift: obj.method() — nameNode sits inside navigation_suffix
+  'member_binding_expression',   // C#: user?.Method() — null-conditional access
 ]);
 
 /**
@@ -796,6 +815,7 @@ const SIMPLE_RECEIVER_TYPES = new Set([
   'super_expression',  // Kotlin wraps super in super_expression
   'base',              // C# base.Method()
   'parent',            // PHP parent::method()
+  'constant',          // Ruby CONSTANT.method() (uppercase identifiers)
 ]);
 
 export const extractReceiverName = (
@@ -841,6 +861,14 @@ export const extractReceiverName = (
     // relative_scope wraps 'parent'/'self'/'static' — unwrap to get the keyword
     if (receiver?.type === 'relative_scope') {
       receiver = receiver.firstChild;
+    }
+  }
+
+  // C# null-conditional: user?.Save() → conditional_access_expression wraps member_binding_expression
+  if (!receiver && parent.type === 'member_binding_expression') {
+    const condAccess = parent.parent;
+    if (condAccess?.type === 'conditional_access_expression') {
+      receiver = condAccess.firstNamedChild;
     }
   }
 

@@ -1,6 +1,6 @@
 import type { SyntaxNode } from '../utils.js';
-import type { LanguageTypeConfig, ParameterExtractor, TypeBindingExtractor, InitializerExtractor, ClassNameLookup } from './types.js';
-import { extractSimpleTypeName, extractVarName } from './shared.js';
+import type { LanguageTypeConfig, ParameterExtractor, TypeBindingExtractor, InitializerExtractor, ClassNameLookup, ConstructorBindingScanner } from './types.js';
+import { extractSimpleTypeName, extractVarName, hasTypeAnnotation, unwrapAwait } from './shared.js';
 
 const DECLARATION_NODE_TYPES: ReadonlySet<string> = new Set([
   'let_declaration',
@@ -152,9 +152,39 @@ const extractParameter: ParameterExtractor = (node: SyntaxNode, env: Map<string,
   if (varName && typeName) env.set(varName, typeName);
 };
 
+/** Rust: let user = get_user("alice") — let_declaration with call_expression value, no type annotation.
+ * Skips `let user: User = ...` (explicit type annotation — handled by extractDeclaration).
+ * Skips `let user = User::new()` (scoped_identifier callee named "new" — handled by extractInitializer).
+ * Unwraps `let mut user = get_user()` by looking inside mut_pattern for the inner identifier.
+ */
+const scanConstructorBinding: ConstructorBindingScanner = (node) => {
+  if (node.type !== 'let_declaration') return undefined;
+  if (hasTypeAnnotation(node)) return undefined;
+  let patternNode = node.childForFieldName('pattern');
+  if (!patternNode) return undefined;
+  if (patternNode.type === 'mut_pattern') {
+    patternNode = patternNode.firstNamedChild;
+    if (!patternNode) return undefined;
+  }
+  if (patternNode.type !== 'identifier') return undefined;
+  // Unwrap `.await`: `let user = get_user().await` → await_expression wraps call_expression
+  const value = unwrapAwait(node.childForFieldName('value'));
+  if (!value || value.type !== 'call_expression') return undefined;
+  const func = value.childForFieldName('function');
+  if (!func) return undefined;
+  if (func.type === 'scoped_identifier') {
+    const methodName = func.lastNamedChild;
+    if (methodName?.text === 'new' || methodName?.text === 'default') return undefined;
+  }
+  const calleeName = extractSimpleTypeName(func);
+  if (!calleeName) return undefined;
+  return { varName: patternNode.text, calleeName };
+};
+
 export const typeConfig: LanguageTypeConfig = {
   declarationNodeTypes: DECLARATION_NODE_TYPES,
   extractDeclaration,
   extractInitializer,
   extractParameter,
+  scanConstructorBinding,
 };

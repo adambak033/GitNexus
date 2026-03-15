@@ -1,5 +1,5 @@
 import type { SyntaxNode } from '../utils.js';
-import type { LanguageTypeConfig, ParameterExtractor, TypeBindingExtractor, InitializerExtractor, ClassNameLookup } from './types.js';
+import type { LanguageTypeConfig, ParameterExtractor, TypeBindingExtractor, InitializerExtractor, ClassNameLookup, ConstructorBindingScanner } from './types.js';
 import { extractSimpleTypeName, extractVarName } from './shared.js';
 
 const DECLARATION_NODE_TYPES: ReadonlySet<string> = new Set([
@@ -126,9 +126,44 @@ const extractParameter: ParameterExtractor = (node: SyntaxNode, env: Map<string,
   if (varName && typeName) env.set(varName, typeName);
 };
 
+/** C/C++: auto x = User() where function is an identifier (not type_identifier) */
+const scanConstructorBinding: ConstructorBindingScanner = (node) => {
+  if (node.type !== 'declaration') return undefined;
+  const typeNode = node.childForFieldName('type');
+  if (!typeNode) return undefined;
+  const typeText = typeNode.text;
+  if (typeText !== 'auto' && typeText !== 'decltype(auto)' && typeNode.type !== 'placeholder_type_specifier') return undefined;
+  const declarator = node.childForFieldName('declarator');
+  if (!declarator || declarator.type !== 'init_declarator') return undefined;
+  const value = declarator.childForFieldName('value');
+  if (!value || value.type !== 'call_expression') return undefined;
+  const func = value.childForFieldName('function');
+  if (!func) return undefined;
+  if (func.type === 'qualified_identifier' || func.type === 'scoped_identifier') {
+    const last = func.lastNamedChild;
+    if (!last) return undefined;
+    const nameNode = declarator.childForFieldName('declarator');
+    if (!nameNode) return undefined;
+    const finalName = nameNode.type === 'pointer_declarator' || nameNode.type === 'reference_declarator'
+      ? nameNode.firstNamedChild : nameNode;
+    if (!finalName) return undefined;
+    return { varName: finalName.text, calleeName: last.text };
+  }
+  if (func.type !== 'identifier') return undefined;
+  const nameNode = declarator.childForFieldName('declarator');
+  if (!nameNode) return undefined;
+  const finalName = nameNode.type === 'pointer_declarator' || nameNode.type === 'reference_declarator'
+    ? nameNode.firstNamedChild : nameNode;
+  if (!finalName) return undefined;
+  const varName = finalName.text;
+  if (!varName) return undefined;
+  return { varName, calleeName: func.text };
+};
+
 export const typeConfig: LanguageTypeConfig = {
   declarationNodeTypes: DECLARATION_NODE_TYPES,
   extractDeclaration,
   extractParameter,
   extractInitializer,
+  scanConstructorBinding,
 };

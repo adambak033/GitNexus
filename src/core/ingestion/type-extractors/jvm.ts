@@ -1,5 +1,5 @@
 import type { SyntaxNode } from '../utils.js';
-import type { LanguageTypeConfig, ParameterExtractor, TypeBindingExtractor, InitializerExtractor, ClassNameLookup } from './types.js';
+import type { LanguageTypeConfig, ParameterExtractor, TypeBindingExtractor, InitializerExtractor, ClassNameLookup, ConstructorBindingScanner } from './types.js';
 import { extractSimpleTypeName, extractVarName, findChildByType } from './shared.js';
 
 // ── Java ──────────────────────────────────────────────────────────────────
@@ -67,11 +67,30 @@ const extractJavaParameter: ParameterExtractor = (node: SyntaxNode, env: Map<str
   if (varName && typeName) env.set(varName, typeName);
 };
 
+/** Java: var x = SomeFactory.create() — constructor binding for `var` with method_invocation */
+const scanJavaConstructorBinding: ConstructorBindingScanner = (node) => {
+  if (node.type !== 'local_variable_declaration') return undefined;
+  const typeNode = node.childForFieldName('type');
+  if (!typeNode) return undefined;
+  if (typeNode.text !== 'var') return undefined;
+  const declarator = node.namedChildren.find((c: SyntaxNode) => c.type === 'variable_declarator');
+  if (!declarator) return undefined;
+  const nameNode = declarator.childForFieldName('name');
+  const value = declarator.childForFieldName('value');
+  if (!nameNode || !value) return undefined;
+  if (value.type === 'object_creation_expression') return undefined;
+  if (value.type !== 'method_invocation') return undefined;
+  const methodName = value.childForFieldName('name');
+  if (!methodName) return undefined;
+  return { varName: nameNode.text, calleeName: methodName.text };
+};
+
 export const javaTypeConfig: LanguageTypeConfig = {
   declarationNodeTypes: JAVA_DECLARATION_NODE_TYPES,
   extractDeclaration: extractJavaDeclaration,
   extractParameter: extractJavaParameter,
   extractInitializer: extractJavaInitializer,
+  scanConstructorBinding: scanJavaConstructorBinding,
 };
 
 // ── Kotlin ────────────────────────────────────────────────────────────────
@@ -166,9 +185,40 @@ const extractKotlinInitializer: InitializerExtractor = (node: SyntaxNode, env: M
   if (varName) env.set(varName, calleeName);
 };
 
+/** Kotlin: val x = User(...) — constructor binding for property_declaration with call_expression */
+const scanKotlinConstructorBinding: ConstructorBindingScanner = (node) => {
+  if (node.type !== 'property_declaration') return undefined;
+  const varDecl = node.namedChildren.find(c => c.type === 'variable_declaration');
+  if (!varDecl) return undefined;
+  if (varDecl.namedChildren.some(c => c.type === 'user_type')) return undefined;
+  const callExpr = node.namedChildren.find(c => c.type === 'call_expression');
+  if (!callExpr) return undefined;
+  const callee = callExpr.firstNamedChild;
+  if (!callee) return undefined;
+
+  let calleeName: string | undefined;
+  if (callee.type === 'simple_identifier') {
+    calleeName = callee.text;
+  } else if (callee.type === 'navigation_expression') {
+    // Extract method name from qualified call: service.getUser() → getUser
+    const suffix = callee.lastNamedChild;
+    if (suffix?.type === 'navigation_suffix') {
+      const methodName = suffix.lastNamedChild;
+      if (methodName?.type === 'simple_identifier') {
+        calleeName = methodName.text;
+      }
+    }
+  }
+  if (!calleeName) return undefined;
+  const nameNode = varDecl.namedChildren.find(c => c.type === 'simple_identifier');
+  if (!nameNode) return undefined;
+  return { varName: nameNode.text, calleeName };
+};
+
 export const kotlinTypeConfig: LanguageTypeConfig = {
   declarationNodeTypes: KOTLIN_DECLARATION_NODE_TYPES,
   extractDeclaration: extractKotlinDeclaration,
   extractParameter: extractKotlinParameter,
   extractInitializer: extractKotlinInitializer,
+  scanConstructorBinding: scanKotlinConstructorBinding,
 };

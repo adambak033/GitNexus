@@ -3,6 +3,8 @@ export interface SymbolDefinition {
   filePath: string;
   type: string; // 'Function', 'Class', etc.
   parameterCount?: number;
+  /** Raw return type text extracted from AST (e.g. 'User', 'Promise<User>') */
+  returnType?: string;
   /** Links Method/Constructor to owning Class/Struct/Trait nodeId */
   ownerId?: string;
 }
@@ -16,7 +18,7 @@ export interface SymbolTable {
     name: string,
     nodeId: string,
     type: string,
-    metadata?: { parameterCount?: number; ownerId?: string }
+    metadata?: { parameterCount?: number; returnType?: string; ownerId?: string }
   ) => void;
   
   /**
@@ -62,13 +64,14 @@ export const createSymbolTable = (): SymbolTable => {
     name: string,
     nodeId: string,
     type: string,
-    metadata?: { parameterCount?: number; ownerId?: string }
+    metadata?: { parameterCount?: number; returnType?: string; ownerId?: string }
   ) => {
     const def: SymbolDefinition = {
       nodeId,
       filePath,
       type,
       ...(metadata?.parameterCount !== undefined ? { parameterCount: metadata.parameterCount } : {}),
+      ...(metadata?.returnType !== undefined ? { returnType: metadata.returnType } : {}),
       ...(metadata?.ownerId !== undefined ? { ownerId: metadata.ownerId } : {}),
     };
 
