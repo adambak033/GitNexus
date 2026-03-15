@@ -17,18 +17,44 @@ if (!process.env.ORT_LOG_LEVEL) {
 import { pipeline, env, type FeatureExtractionPipeline } from '@huggingface/transformers';
 import { existsSync } from 'fs';
 import { execFileSync } from 'child_process';
-import { join } from 'path';
+import { join, dirname } from 'path';
+import { createRequire } from 'module';
 import { DEFAULT_EMBEDDING_CONFIG, type EmbeddingConfig, type ModelProgress } from './types.js';
+
+/**
+ * Check whether the onnxruntime-node package ships the CUDA execution provider.
+ * Versions before 1.24.0 are CPU-only and do not include libonnxruntime_providers_cuda.so.
+ * Attempting CUDA on those versions causes an uncatchable native crash.
+ */
+function hasOrtCudaProvider(): boolean {
+  try {
+    const require = createRequire(import.meta.url);
+    const ortPath = dirname(require.resolve('onnxruntime-node/package.json'));
+    // Check both napi-v6 (>=1.24) and napi-v3 (<=1.21) layouts
+    return existsSync(join(ortPath, 'bin', 'napi-v6', 'linux', 'x64', 'libonnxruntime_providers_cuda.so')) ||
+           existsSync(join(ortPath, 'bin', 'napi-v3', 'linux', 'x64', 'libonnxruntime_providers_cuda.so'));
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Check whether CUDA libraries are actually available on this system.
  * ONNX Runtime's native layer crashes (uncatchable) if we attempt CUDA
  * without the required shared libraries, so we probe first.
  *
- * Checks the dynamic linker cache (ldconfig) which covers all architectures
- * and install paths, then falls back to CUDA_PATH / LD_LIBRARY_PATH env vars.
+ * Checks both:
+ * 1. That system CUDA libraries (libcublasLt) are present
+ * 2. That onnxruntime-node ships the CUDA execution provider binary
+ *
+ * Both conditions must be true — system CUDA libs alone are not enough
+ * if onnxruntime-node is a CPU-only build (versions < 1.24.0).
  */
 function isCudaAvailable(): boolean {
+  // First, verify onnxruntime-node has the CUDA provider binary.
+  // Without this, requesting CUDA causes an uncatchable native crash.
+  if (!hasOrtCudaProvider()) return false;
+
   // Primary: query the dynamic linker cache — covers all architectures,
   // distro layouts, and custom install paths registered with ldconfig
   try {
