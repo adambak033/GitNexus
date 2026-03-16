@@ -117,6 +117,10 @@ export const analyzeCommand = async (
     return;
   }
 
+  if (process.env.GITNEXUS_NO_GITIGNORE) {
+    console.log('  GITNEXUS_NO_GITIGNORE is set — skipping .gitignore (still reading .gitnexusignore)\n');
+  }
+
   // Single progress bar for entire pipeline
   const bar = new cliProgress.SingleBar({
     format: '  {bar} {percentage}% | {phase}',
