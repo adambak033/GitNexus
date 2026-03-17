@@ -216,7 +216,7 @@ export const processCalls = async (
               const nodeId = generateId('Property', `${file.path}:${item.propName}`);
               graph.addNode({
                 id: nodeId,
-                label: 'Property' as any, // TODO: add 'Property' to graph node label union
+                label: 'Property',
                 properties: {
                   name: item.propName, filePath: file.path,
                   startLine: item.startLine, endLine: item.endLine,
@@ -575,8 +575,12 @@ function extractFirstTypeArg(args: string): string {
   return args.trim();
 }
 
+const MAX_RETURN_TYPE_INPUT_LENGTH = 2048;
+const MAX_RETURN_TYPE_LENGTH = 512;
+
 export const extractReturnTypeName = (raw: string, depth = 0): string | undefined => {
   if (depth > 10) return undefined;
+  if (raw.length > MAX_RETURN_TYPE_INPUT_LENGTH) return undefined;
   let text = raw.trim();
   if (!text) return undefined;
 
@@ -624,6 +628,9 @@ export const extractReturnTypeName = (raw: string, depth = 0): string | undefine
 
   // Must start with uppercase (class/type convention) or be a valid identifier
   if (!/^[A-Z_]\w*$/.test(text)) return undefined;
+
+  // If the final extracted type name is too long, reject it
+  if (text.length > MAX_RETURN_TYPE_LENGTH) return undefined;
 
   return text;
 };
@@ -732,7 +739,6 @@ export const processCallsFromExtracted = async (
     if (!list) { list = []; byFile.set(call.filePath, list); }
     list.push(call);
   }
-
   const totalFiles = byFile.size;
   let filesProcessed = 0;
 

@@ -151,3 +151,53 @@ describe('JavaScript super resolution', () => {
     expect(repoSave).toBeUndefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Chained method calls: svc.getUser().save()
+// Tests that JavaScript chain call resolution correctly infers the intermediate
+// receiver type from getUser()'s JSDoc @returns {User} and resolves save().
+// ---------------------------------------------------------------------------
+
+describe('JavaScript chained method call resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'javascript-chain-call'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo classes, and UserService', () => {
+    const classes = getNodesByLabel(result, 'Class');
+    expect(classes).toContain('User');
+    expect(classes).toContain('Repo');
+    expect(classes).toContain('UserService');
+  });
+
+  it('detects getUser and save methods', () => {
+    const methods = getNodesByLabel(result, 'Method');
+    expect(methods).toContain('getUser');
+    expect(methods).toContain('save');
+  });
+
+  it('resolves svc.getUser().save() to User#save via chain resolution', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'save' &&
+      c.source === 'processUser' &&
+      c.targetFilePath?.includes('user.js'),
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('does NOT resolve svc.getUser().save() to Repo#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoSave = calls.find(c =>
+      c.target === 'save' &&
+      c.source === 'processUser' &&
+      c.targetFilePath?.includes('repo.js'),
+    );
+    expect(repoSave).toBeUndefined();
+  });
+});

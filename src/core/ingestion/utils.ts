@@ -35,7 +35,7 @@ export const DEFINITION_CAPTURE_KEYS = [
 ] as const;
 
 /** Extract the definition node from a tree-sitter query capture map. */
-export const getDefinitionNodeFromCaptures = (captureMap: Record<string, any>): any | null => {
+export const getDefinitionNodeFromCaptures = (captureMap: Record<string, any>): SyntaxNode | null => {
   for (const key of DEFINITION_CAPTURE_KEYS) {
     if (captureMap[key]) return captureMap[key];
   }
@@ -351,7 +351,7 @@ export const findEnclosingClassId = (node: any, filePath: string): string | null
  * Extract function name and label from a function_definition or similar AST node.
  * Handles C/C++ qualified_identifier (ClassName::MethodName) and other language patterns.
  */
-export const extractFunctionName = (node: any): { funcName: string | null; label: string } => {
+export const extractFunctionName = (node: SyntaxNode): { funcName: string | null; label: string } => {
   let funcName: string | null = null;
   let label = 'Function';
 
@@ -366,21 +366,40 @@ export const extractFunctionName = (node: any): { funcName: string | null; label
   if (FUNCTION_DECLARATION_TYPES.has(node.type)) {
     // C/C++: function_definition -> [pointer_declarator ->] function_declarator -> qualified_identifier/identifier
     // Unwrap pointer_declarator / reference_declarator wrappers to reach function_declarator
-    let declarator = node.childForFieldName?.('declarator') ||
-                        node.children?.find((c: any) => c.type === 'function_declarator');
+    let declarator = node.childForFieldName?.('declarator');
+    if (!declarator) {
+      for (let i = 0; i < node.childCount; i++) {
+        const c = node.child(i);
+        if (c?.type === 'function_declarator') { declarator = c; break; }
+      }
+    }
     while (declarator && (declarator.type === 'pointer_declarator' || declarator.type === 'reference_declarator')) {
-      declarator = declarator.childForFieldName?.('declarator') ||
-                   declarator.children?.find((c: any) =>
-                     c.type === 'function_declarator' || c.type === 'pointer_declarator' || c.type === 'reference_declarator');
+      let nextDeclarator = declarator.childForFieldName?.('declarator');
+      if (!nextDeclarator) {
+        for (let i = 0; i < declarator.childCount; i++) {
+          const c = declarator.child(i);
+          if (c?.type === 'function_declarator' || c?.type === 'pointer_declarator' || c?.type === 'reference_declarator') { nextDeclarator = c; break; }
+        }
+      }
+      declarator = nextDeclarator;
     }
     if (declarator) {
-      const innerDeclarator = declarator.childForFieldName?.('declarator') ||
-                               declarator.children?.find((c: any) =>
-                                 c.type === 'qualified_identifier' || c.type === 'identifier' || c.type === 'parenthesized_declarator');
+      let innerDeclarator = declarator.childForFieldName?.('declarator');
+      if (!innerDeclarator) {
+        for (let i = 0; i < declarator.childCount; i++) {
+          const c = declarator.child(i);
+          if (c?.type === 'qualified_identifier' || c?.type === 'identifier' || c?.type === 'parenthesized_declarator') { innerDeclarator = c; break; }
+        }
+      }
 
       if (innerDeclarator?.type === 'qualified_identifier') {
-        const nameNode = innerDeclarator.childForFieldName?.('name') ||
-                          innerDeclarator.children?.find((c: any) => c.type === 'identifier');
+        let nameNode = innerDeclarator.childForFieldName?.('name');
+        if (!nameNode) {
+          for (let i = 0; i < innerDeclarator.childCount; i++) {
+            const c = innerDeclarator.child(i);
+            if (c?.type === 'identifier') { nameNode = c; break; }
+          }
+        }
         if (nameNode?.text) {
           funcName = nameNode.text;
           label = 'Method';
@@ -388,11 +407,19 @@ export const extractFunctionName = (node: any): { funcName: string | null; label
       } else if (innerDeclarator?.type === 'identifier') {
         funcName = innerDeclarator.text;
       } else if (innerDeclarator?.type === 'parenthesized_declarator') {
-        const nestedId = innerDeclarator.children?.find((c: any) =>
-          c.type === 'qualified_identifier' || c.type === 'identifier');
+        let nestedId: SyntaxNode | null = null;
+        for (let i = 0; i < innerDeclarator.childCount; i++) {
+          const c = innerDeclarator.child(i);
+          if (c?.type === 'qualified_identifier' || c?.type === 'identifier') { nestedId = c; break; }
+        }
         if (nestedId?.type === 'qualified_identifier') {
-          const nameNode = nestedId.childForFieldName?.('name') ||
-                            nestedId.children?.find((c: any) => c.type === 'identifier');
+          let nameNode = nestedId.childForFieldName?.('name');
+          if (!nameNode) {
+            for (let i = 0; i < nestedId.childCount; i++) {
+              const c = nestedId.child(i);
+              if (c?.type === 'identifier') { nameNode = c; break; }
+            }
+          }
           if (nameNode?.text) {
             funcName = nameNode.text;
             label = 'Method';
@@ -405,38 +432,72 @@ export const extractFunctionName = (node: any): { funcName: string | null; label
 
     // Fallback for other languages (Kotlin uses simple_identifier, Swift uses simple_identifier)
     if (!funcName) {
-      const nameNode = node.childForFieldName?.('name') ||
-                        node.children?.find((c: any) => c.type === 'identifier' || c.type === 'property_identifier' || c.type === 'simple_identifier');
+      let nameNode = node.childForFieldName?.('name');
+      if (!nameNode) {
+        for (let i = 0; i < node.childCount; i++) {
+          const c = node.child(i);
+          if (c?.type === 'identifier' || c?.type === 'property_identifier' || c?.type === 'simple_identifier') { nameNode = c; break; }
+        }
+      }
       funcName = nameNode?.text;
     }
   } else if (node.type === 'impl_item') {
-    const funcItem = node.children?.find((c: any) => c.type === 'function_item');
+    let funcItem: SyntaxNode | null = null;
+    for (let i = 0; i < node.childCount; i++) {
+      const c = node.child(i);
+      if (c?.type === 'function_item') { funcItem = c; break; }
+    }
     if (funcItem) {
-      const nameNode = funcItem.childForFieldName?.('name') ||
-                        funcItem.children?.find((c: any) => c.type === 'identifier');
+      let nameNode = funcItem.childForFieldName?.('name');
+      if (!nameNode) {
+        for (let i = 0; i < funcItem.childCount; i++) {
+          const c = funcItem.child(i);
+          if (c?.type === 'identifier') { nameNode = c; break; }
+        }
+      }
       funcName = nameNode?.text;
       label = 'Method';
     }
   } else if (node.type === 'method_definition') {
-    const nameNode = node.childForFieldName?.('name') ||
-                      node.children?.find((c: any) => c.type === 'property_identifier');
+    let nameNode = node.childForFieldName?.('name');
+    if (!nameNode) {
+      for (let i = 0; i < node.childCount; i++) {
+        const c = node.child(i);
+        if (c?.type === 'property_identifier') { nameNode = c; break; }
+      }
+    }
     funcName = nameNode?.text;
     label = 'Method';
   } else if (node.type === 'method_declaration' || node.type === 'constructor_declaration') {
-    const nameNode = node.childForFieldName?.('name') ||
-                      node.children?.find((c: any) => c.type === 'identifier');
+    let nameNode = node.childForFieldName?.('name');
+    if (!nameNode) {
+      for (let i = 0; i < node.childCount; i++) {
+        const c = node.child(i);
+        if (c?.type === 'identifier') { nameNode = c; break; }
+      }
+    }
     funcName = nameNode?.text;
     label = 'Method';
   } else if (node.type === 'arrow_function' || node.type === 'function_expression') {
     const parent = node.parent;
     if (parent?.type === 'variable_declarator') {
-      const nameNode = parent.childForFieldName?.('name') ||
-                        parent.children?.find((c: any) => c.type === 'identifier');
+      let nameNode = parent.childForFieldName?.('name');
+      if (!nameNode) {
+        for (let i = 0; i < parent.childCount; i++) {
+          const c = parent.child(i);
+          if (c?.type === 'identifier') { nameNode = c; break; }
+        }
+      }
       funcName = nameNode?.text;
     }
   } else if (node.type === 'method' || node.type === 'singleton_method') {
-    const nameNode = node.childForFieldName?.('name') ||
-                      node.children?.find((c: any) => c.type === 'identifier');
+    let nameNode = node.childForFieldName?.('name');
+    if (!nameNode) {
+      for (let i = 0; i < node.childCount; i++) {
+        const c = node.child(i);
+        if (c?.type === 'identifier') { nameNode = c; break; }
+      }
+    }
     funcName = nameNode?.text;
     label = 'Method';
   }

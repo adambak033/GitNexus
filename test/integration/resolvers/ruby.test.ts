@@ -811,3 +811,38 @@ describe('Ruby chained method call resolution (Phase 5 review fix)', () => {
     expect(repoSave).toBeUndefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Ruby for-in loop: for user in users — YARD @param resolution
+// ---------------------------------------------------------------------------
+
+describe('Ruby for-in loop resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'ruby-for-in-loop'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User class with save method', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+  });
+
+  it('resolves user.save in for-in to User#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'save' && c.source === 'process_users' && c.targetFilePath?.includes('user'),
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('does NOT resolve user.save to Repo#save (negative)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const wrongSave = calls.find(c =>
+      c.target === 'save' && c.source === 'process_users' && c.targetFilePath?.includes('repo'),
+    );
+    expect(wrongSave).toBeUndefined();
+  });
+});

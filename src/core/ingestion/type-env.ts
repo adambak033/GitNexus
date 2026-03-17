@@ -3,7 +3,7 @@ import { FUNCTION_NODE_TYPES, extractFunctionName, CLASS_CONTAINER_TYPES } from 
 import { SupportedLanguages } from '../../config/supported-languages.js';
 import { typeConfigs, TYPED_PARAMETER_TYPES } from './type-extractors/index.js';
 import type { ClassNameLookup } from './type-extractors/types.js';
-import { extractSimpleTypeName, stripNullable } from './type-extractors/shared.js';
+import { extractSimpleTypeName, extractVarName, stripNullable } from './type-extractors/shared.js';
 import type { SymbolTable } from './symbol-table.js';
 
 /**
@@ -48,11 +48,57 @@ export interface TypeEnvironment {
   readonly env: TypeEnv;
 }
 
+/**
+ * Position-indexed pattern binding: active only within a specific AST range.
+ * Used for smart-cast narrowing in mutually exclusive branches (e.g., Kotlin when arms).
+ */
+interface PatternOverride {
+  rangeStart: number;
+  rangeEnd: number;
+  typeName: string;
+}
+
+/** scope → varName → overrides (checked in order, first range match wins) */
+type PatternOverrides = Map<string, Map<string, PatternOverride[]>>;
+
+/** AST node types that represent mutually exclusive branch containers for pattern bindings. */
+const PATTERN_BRANCH_TYPES = new Set([
+  'when_entry',          // Kotlin when
+  'switch_block_label',  // Java switch (enhanced)
+]);
+
+/** Walk up the AST from a pattern node to find the enclosing branch container. */
+const findPatternBranchScope = (node: SyntaxNode): SyntaxNode | undefined => {
+  let current = node.parent;
+  while (current) {
+    if (PATTERN_BRANCH_TYPES.has(current.type)) return current;
+    if (FUNCTION_NODE_TYPES.has(current.type)) return undefined;
+    current = current.parent;
+  }
+  return undefined;
+};
+
+/** Bare nullable keywords that fastStripNullable must reject. */
+const FAST_NULLABLE_KEYWORDS = new Set(['null', 'undefined', 'void', 'None', 'nil']);
+
+/**
+ * Fast-path nullable check: 90%+ of type names are simple identifiers (e.g. "User")
+ * that don't need the full stripNullable parse. Only call stripNullable when the
+ * string contains nullable markers ('|' for union types, '?' for nullable suffix).
+ */
+const fastStripNullable = (typeName: string): string | undefined => {
+  if (FAST_NULLABLE_KEYWORDS.has(typeName)) return undefined;
+  return (typeName.indexOf('|') === -1 && typeName.indexOf('?') === -1)
+    ? typeName
+    : stripNullable(typeName);
+};
+
 /** Implementation of the lookup logic — shared between TypeEnvironment and the legacy export. */
 const lookupInEnv = (
   env: TypeEnv,
   varName: string,
   callNode: SyntaxNode,
+  patternOverrides?: PatternOverrides,
 ): string | undefined => {
   // Self/this receiver: resolve to enclosing class name via AST walk
   if (varName === 'self' || varName === 'this' || varName === '$this') {
@@ -68,19 +114,33 @@ const lookupInEnv = (
   // Determine the enclosing function scope for the call
   const scopeKey = findEnclosingScopeKey(callNode);
 
+  // Check position-indexed pattern overrides first (e.g., Kotlin when/is smart casts).
+  // These take priority over flat scopeEnv because they represent per-branch narrowing.
+  if (scopeKey && patternOverrides) {
+    const varOverrides = patternOverrides.get(scopeKey)?.get(varName);
+    if (varOverrides) {
+      const pos = callNode.startIndex;
+      for (const override of varOverrides) {
+        if (pos >= override.rangeStart && pos <= override.rangeEnd) {
+          return fastStripNullable(override.typeName);
+        }
+      }
+    }
+  }
+
   // Try function-local scope first
   if (scopeKey) {
     const scopeEnv = env.get(scopeKey);
     if (scopeEnv) {
       const result = scopeEnv.get(varName);
-      if (result) return stripNullable(result);
+      if (result) return fastStripNullable(result);
     }
   }
 
   // Fall back to file-level scope
   const fileEnv = env.get(FILE_SCOPE);
   const raw = fileEnv?.get(varName);
-  return raw ? stripNullable(raw) : undefined;
+  return raw ? fastStripNullable(raw) : undefined;
 };
 
 
@@ -283,20 +343,52 @@ const createClassNameLookup = (
  * the project are available for constructor inference in languages like Kotlin
  * where constructors are syntactically identical to function calls.
  */
+/**
+ * Node types whose subtrees can NEVER contain type-relevant descendants
+ * (declarations, parameters, for-loops, class definitions, pattern bindings).
+ * Conservative leaf-only set — verified safe across all 12 supported language grammars.
+ * IMPORTANT: Do NOT add expression containers (arguments, binary_expression, etc.) —
+ * they can contain arrow functions with typed parameters.
+ */
+const SKIP_SUBTREE_TYPES = new Set([
+  // Plain string literals (NOT template_string — it contains interpolated expressions
+  // that can hold arrow functions with typed parameters, e.g. `${(x: T) => x}`)
+  'string',              'string_literal',
+  'string_content',      'string_fragment',      'heredoc_body',
+  // Comments
+  'comment',             'line_comment',         'block_comment',
+  // Numeric/boolean/null literals
+  'number',              'integer_literal',      'float_literal',
+  'true',                'false',                'null',
+  // Regex
+  'regex',               'regex_pattern',
+]);
+
 export const buildTypeEnv = (
   tree: { rootNode: SyntaxNode },
   language: SupportedLanguages,
   symbolTable?: SymbolTable,
 ): TypeEnvironment => {
   const env: TypeEnv = new Map();
+  const patternOverrides: PatternOverrides = new Map();
   const localClassNames = new Set<string>();
   const classNames = createClassNameLookup(localClassNames, symbolTable);
   const config = typeConfigs[language];
   const bindings: ConstructorBinding[] = [];
+
+  // Pre-compute combined set of node types that need extractTypeBinding.
+  // Single Set.has() replaces 3 separate checks per node in walk().
+  const interestingNodeTypes = new Set<string>();
+  TYPED_PARAMETER_TYPES.forEach(t => interestingNodeTypes.add(t));
+  config.declarationNodeTypes.forEach(t => interestingNodeTypes.add(t));
+  config.forLoopNodeTypes?.forEach(t => interestingNodeTypes.add(t));
   const pendingAssignments: Array<{ scope: string; lhs: string; rhs: string }> = [];
   // Maps `scope\0varName` → the type annotation AST node from the original declaration.
   // Allows pattern extractors to navigate back to the declaration's generic type arguments
   // (e.g., to extract T from Result<T, E> for `if let Ok(x) = res`).
+  // NOTE: This is a SUPERSET of scopeEnv — entries exist even when extractSimpleTypeName
+  // returns undefined for container types (User[], []User, List[User]). This is intentional:
+  // for-loop Strategy 1 needs the raw AST type node for exactly those container types.
   const declarationTypeNodes = new Map<string, SyntaxNode>();
 
   /**
@@ -314,35 +406,91 @@ export const buildTypeEnv = (
   const extractTypeBinding = (node: SyntaxNode, scopeEnv: Map<string, string>, scope: string): void => {
     // This guard eliminates 90%+ of calls before any language dispatch.
     if (TYPED_PARAMETER_TYPES.has(node.type)) {
-      const keysBefore = new Set(scopeEnv.keys());
-      config.extractParameter(node, scopeEnv);
-      // Capture the type node for newly introduced parameter bindings
-      const typeNode = node.childForFieldName('type');
+      // Capture the raw type annotation BEFORE extractParameter.
+      // Most languages use 'name' field; Rust uses 'pattern'; TS uses 'pattern' for some param types.
+      // Kotlin `parameter` nodes use positional children instead of named fields,
+      // so we fall back to scanning children by type when childForFieldName returns null.
+      let typeNode = node.childForFieldName('type');
       if (typeNode) {
-        for (const varName of scopeEnv.keys()) {
-          if (!keysBefore.has(varName)) {
+        const nameNode = node.childForFieldName('name')
+          ?? node.childForFieldName('pattern');
+        if (nameNode) {
+          const varName = extractVarName(nameNode);
+          if (varName && !declarationTypeNodes.has(`${scope}\0${varName}`)) {
             declarationTypeNodes.set(`${scope}\0${varName}`, typeNode);
           }
         }
+      } else {
+        // Fallback: positional children (Kotlin `parameter` → simple_identifier + user_type)
+        let fallbackName: SyntaxNode | null = null;
+        let fallbackType: SyntaxNode | null = null;
+        for (let i = 0; i < node.namedChildCount; i++) {
+          const child = node.namedChild(i);
+          if (!child) continue;
+          if (!fallbackName && (child.type === 'simple_identifier' || child.type === 'identifier')) {
+            fallbackName = child;
+          }
+          if (!fallbackType && (child.type === 'user_type' || child.type === 'type_identifier'
+            || child.type === 'generic_type' || child.type === 'parameterized_type')) {
+            fallbackType = child;
+          }
+        }
+        if (fallbackName && fallbackType) {
+          const varName = extractVarName(fallbackName);
+          if (varName && !declarationTypeNodes.has(`${scope}\0${varName}`)) {
+            declarationTypeNodes.set(`${scope}\0${varName}`, fallbackType);
+          }
+        }
       }
+      config.extractParameter(node, scopeEnv);
       return;
     }
     // For-each loop variable bindings (Java/C#/Kotlin): explicit element types in the AST.
     // Checked before declarationNodeTypes — loop variables are not declarations.
     if (config.forLoopNodeTypes?.has(node.type)) {
-      config.extractForLoopBinding?.(node, scopeEnv);
+      config.extractForLoopBinding?.(node, scopeEnv, declarationTypeNodes, scope);
       return;
     }
     if (config.declarationNodeTypes.has(node.type)) {
-      const keysBefore = new Set(scopeEnv.keys());
-      config.extractDeclaration(node, scopeEnv);
-      // Capture the type annotation AST node for newly introduced bindings.
-      // Only declarations with an explicit 'type' field are recorded — constructor
-      // inferences (Tier 1) don't have a type annotation node to preserve.
-      const typeNode = node.childForFieldName('type');
+      // Capture the raw type annotation AST node BEFORE extractDeclaration.
+      // This decouples type node capture from scopeEnv success — container types
+      // (User[], []User, List[User]) that fail extractSimpleTypeName still get
+      // their AST type node recorded for Strategy 1 for-loop resolution.
+      // Try direct extraction first (works for Go var_spec, Python assignment, Rust let_declaration).
+      // Try direct type field first, then unwrap wrapper nodes (C# field_declaration,
+      // local_declaration_statement wrap their type inside a variable_declaration child).
+      let typeNode = node.childForFieldName('type');
+      if (!typeNode) {
+        // C# field_declaration / local_declaration_statement wrap type inside variable_declaration.
+        // Use manual loop instead of namedChildren.find() to avoid array allocation on hot path.
+        let wrapped = node.childForFieldName('declaration');
+        if (!wrapped) {
+          for (let i = 0; i < node.namedChildCount; i++) {
+            const c = node.namedChild(i);
+            if (c?.type === 'variable_declaration') { wrapped = c; break; }
+          }
+        }
+        if (wrapped) typeNode = wrapped.childForFieldName('type');
+      }
       if (typeNode) {
+        const nameNode = node.childForFieldName('name')
+          ?? node.childForFieldName('left')
+          ?? node.childForFieldName('pattern');
+        if (nameNode) {
+          const varName = extractVarName(nameNode);
+          if (varName && !declarationTypeNodes.has(`${scope}\0${varName}`)) {
+            declarationTypeNodes.set(`${scope}\0${varName}`, typeNode);
+          }
+        }
+      }
+      // Run the language-specific declaration extractor (may or may not add to scopeEnv).
+      const keysBefore = typeNode ? new Set(scopeEnv.keys()) : undefined;
+      config.extractDeclaration(node, scopeEnv);
+      // Fallback: for multi-declarator languages (TS, C#, Java) where the type field
+      // is on variable_declarator children, capture via keysBefore/keysAfter diff.
+      if (typeNode && keysBefore) {
         for (const varName of scopeEnv.keys()) {
-          if (!keysBefore.has(varName)) {
+          if (!keysBefore.has(varName) && !declarationTypeNodes.has(`${scope}\0${varName}`)) {
             declarationTypeNodes.set(`${scope}\0${varName}`, typeNode);
           }
         }
@@ -358,6 +506,9 @@ export const buildTypeEnv = (
   };
 
   const walk = (node: SyntaxNode, currentScope: string): void => {
+    // Fast skip: subtrees that can never contain type-relevant nodes (leaf-like literals).
+    if (SKIP_SUBTREE_TYPES.has(node.type)) return;
+
     // Collect class/struct names as we encounter them (used by extractInitializer
     // to distinguish constructor calls from function calls, e.g. C++ `User()` vs `getUser()`)
     // Currently only C++ uses this locally; other languages rely on the SymbolTable path.
@@ -375,20 +526,46 @@ export const buildTypeEnv = (
       if (funcName) scope = `${funcName}@${node.startIndex}`;
     }
 
-    // Get or create the sub-map for this scope
-    if (!env.has(scope)) env.set(scope, new Map());
-    const scopeEnv = env.get(scope)!;
-
-    extractTypeBinding(node, scopeEnv, scope);
+    // Only create scope map and call extractTypeBinding for interesting node types.
+    // Single Set.has() replaces 3 separate checks inside extractTypeBinding.
+    if (interestingNodeTypes.has(node.type)) {
+      if (!env.has(scope)) env.set(scope, new Map());
+      const scopeEnv = env.get(scope)!;
+      extractTypeBinding(node, scopeEnv, scope);
+    }
 
     // Pattern binding extraction: handles constructs that introduce NEW typed variables
     // via pattern matching (e.g. `if let Some(x) = opt`, `x instanceof T t`).
     // Runs after Tier 0/1 so scopeEnv already contains the source variable's type.
     // Conservative: extractor returns undefined when source type is unknown.
-    if (config.extractPatternBinding) {
+    if (config.extractPatternBinding && (!config.patternBindingNodeTypes || config.patternBindingNodeTypes.has(node.type))) {
+      // Ensure scopeEnv exists for pattern binding reads/writes
+      if (!env.has(scope)) env.set(scope, new Map());
+      const scopeEnv = env.get(scope)!;
       const patternBinding = config.extractPatternBinding(node, scopeEnv, declarationTypeNodes, scope);
-      if (patternBinding && !scopeEnv.has(patternBinding.varName)) {
-        scopeEnv.set(patternBinding.varName, patternBinding.typeName);
+      if (patternBinding) {
+        if (config.allowPatternBindingOverwrite) {
+          // Position-indexed: store per-branch binding for smart-cast narrowing.
+          // Each when arm / switch case gets its own type for the variable,
+          // preventing cross-arm contamination (e.g., Kotlin when/is).
+          const branchNode = findPatternBranchScope(node);
+          if (branchNode) {
+            if (!patternOverrides.has(scope)) patternOverrides.set(scope, new Map());
+            const varMap = patternOverrides.get(scope)!;
+            if (!varMap.has(patternBinding.varName)) varMap.set(patternBinding.varName, []);
+            varMap.get(patternBinding.varName)!.push({
+              rangeStart: branchNode.startIndex,
+              rangeEnd: branchNode.endIndex,
+              typeName: patternBinding.typeName,
+            });
+          }
+          // Also store in flat scopeEnv as fallback (last arm wins — same as before
+          // for code that doesn't use position-indexed lookup).
+          scopeEnv.set(patternBinding.varName, patternBinding.typeName);
+        } else if (!scopeEnv.has(patternBinding.varName)) {
+          // First-writer-wins for languages without smart-cast overwrite (Java instanceof, etc.)
+          scopeEnv.set(patternBinding.varName, patternBinding.typeName);
+        }
       }
     }
 
@@ -397,9 +574,14 @@ export const buildTypeEnv = (
     // (JS uses variable_declarator/name/value, Rust uses let_declaration/pattern/value,
     // Python uses assignment/left/right, Go uses short_var_declaration/expression_list).
     if (config.extractPendingAssignment && config.declarationNodeTypes.has(node.type)) {
-      const pending = config.extractPendingAssignment(node, scopeEnv);
-      if (pending) {
-        pendingAssignments.push({ scope, ...pending });
+      // scopeEnv is guaranteed to exist here because declarationNodeTypes is a subset
+      // of interestingNodeTypes, so extractTypeBinding already created the scope map above.
+      const scopeEnv = env.get(scope);
+      if (scopeEnv) {
+        const pending = config.extractPendingAssignment(node, scopeEnv);
+        if (pending) {
+          pendingAssignments.push({ scope, ...pending });
+        }
       }
     }
 
@@ -407,8 +589,11 @@ export const buildTypeEnv = (
     // Only collect if TypeEnv didn't already resolve this binding.
     if (config.scanConstructorBinding) {
       const result = config.scanConstructorBinding(node);
-      if (result && !scopeEnv.has(result.varName)) {
-        bindings.push({ scope, ...result });
+      if (result) {
+        const scopeEnv = env.get(scope);
+        if (!scopeEnv?.has(result.varName)) {
+          bindings.push({ scope, ...result });
+        }
       }
     }
 
@@ -436,7 +621,7 @@ export const buildTypeEnv = (
   }
 
   return {
-    lookup: (varName, callNode) => lookupInEnv(env, varName, callNode),
+    lookup: (varName, callNode) => lookupInEnv(env, varName, callNode, patternOverrides),
     constructorBindings: bindings,
     env,
   };

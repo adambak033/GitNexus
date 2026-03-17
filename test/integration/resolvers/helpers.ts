@@ -3,6 +3,7 @@
  */
 import path from 'path';
 import { runPipelineFromRepo } from '../../../src/core/ingestion/pipeline.js';
+import type { PipelineOptions } from '../../../src/core/ingestion/pipeline.js';
 import type { PipelineResult } from '../../../src/types/pipeline.js';
 import type { GraphRelationship } from '../../../src/core/graph/types.js';
 
@@ -50,5 +51,7 @@ export function edgeSet(edges: Array<{ source: string; target: string }>): strin
   return edges.map(e => `${e.source} → ${e.target}`).sort();
 }
 
+// Tests can pass { skipGraphPhases: true } as third arg for faster runs
+// (skips MRO, community detection, and process extraction).
 export { runPipelineFromRepo };
-export type { PipelineResult };
+export type { PipelineOptions, PipelineResult };

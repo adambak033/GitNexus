@@ -1,6 +1,6 @@
 import type { SyntaxNode } from '../utils.js';
-import type { LanguageTypeConfig, ParameterExtractor, TypeBindingExtractor, InitializerExtractor, ClassNameLookup, ConstructorBindingScanner, PendingAssignmentExtractor, PatternBindingExtractor } from './types.js';
-import { extractSimpleTypeName, extractVarName, hasTypeAnnotation, unwrapAwait, extractGenericTypeArgs } from './shared.js';
+import type { LanguageTypeConfig, ParameterExtractor, TypeBindingExtractor, InitializerExtractor, ClassNameLookup, ConstructorBindingScanner, PendingAssignmentExtractor, PatternBindingExtractor, ForLoopExtractor } from './types.js';
+import { extractSimpleTypeName, extractVarName, hasTypeAnnotation, unwrapAwait, extractGenericTypeArgs, resolveIterableElementType, methodToTypeArgPosition, type TypeArgPosition } from './shared.js';
 
 const DECLARATION_NODE_TYPES: ReadonlySet<string> = new Set([
   'let_declaration',
@@ -35,7 +35,8 @@ const extractStructPatternType = (structPattern: SyntaxNode): string | undefined
  * Recursively scan a pattern tree for captured_pattern nodes (x @ StructType { .. })
  * and extract variable → type bindings from them.
  */
-const extractCapturedPatternBindings = (pattern: SyntaxNode, env: Map<string, string>): void => {
+const extractCapturedPatternBindings = (pattern: SyntaxNode, env: Map<string, string>, depth = 0): void => {
+  if (depth > 50) return;
   if (pattern.type === 'captured_pattern') {
     // captured_pattern: identifier @ inner_pattern
     // The first named child is the identifier, followed by the inner pattern.
@@ -57,7 +58,7 @@ const extractCapturedPatternBindings = (pattern: SyntaxNode, env: Map<string, st
   if (pattern.type === 'tuple_struct_pattern') {
     for (let i = 0; i < pattern.namedChildCount; i++) {
       const child = pattern.namedChild(i);
-      if (child) extractCapturedPatternBindings(child, env);
+      if (child) extractCapturedPatternBindings(child, env, depth + 1);
     }
   }
 };
@@ -215,10 +216,25 @@ const extractPatternBinding: PatternBindingExtractor = (
   declarationTypeNodes,
   scope,
 ) => {
-  if (node.type !== 'let_condition') return undefined;
+  let patternNode: SyntaxNode | null = null;
+  let valueNode: SyntaxNode | null = null;
 
-  const patternNode = node.childForFieldName('pattern');
-  const valueNode = node.childForFieldName('value');
+  if (node.type === 'let_condition') {
+    patternNode = node.childForFieldName('pattern');
+    valueNode = node.childForFieldName('value');
+  } else if (node.type === 'match_arm') {
+    // match_arm → pattern field is match_pattern wrapping the actual pattern
+    const matchPatternNode = node.childForFieldName('pattern');
+    // Unwrap match_pattern to get the tuple_struct_pattern inside
+    patternNode = matchPatternNode?.type === 'match_pattern'
+      ? matchPatternNode.firstNamedChild
+      : matchPatternNode;
+    // source variable is in the parent match_expression's 'value' field
+    const matchExpr = node.parent?.parent; // match_arm → match_block → match_expression
+    if (matchExpr?.type === 'match_expression') {
+      valueNode = matchExpr.childForFieldName('value');
+    }
+  }
   if (!patternNode || !valueNode) return undefined;
 
   // Only handle tuple_struct_pattern: Some(x) or Ok(x)
@@ -269,12 +285,131 @@ const extractPatternBinding: PatternBindingExtractor = (
   return { varName: innerVar, typeName: typeArgs[argIndex] };
 };
 
+// --- For-loop Tier 1c ---
+
+const FOR_LOOP_NODE_TYPES: ReadonlySet<string> = new Set(['for_expression']);
+
+/** Extract element type from a Rust type annotation AST node.
+ *  Handles: generic_type (Vec<User>), reference_type (&[User]), array_type ([User; N]),
+ *  slice_type ([User]). For call-graph purposes, strips references (&User → User). */
+const extractRustElementTypeFromTypeNode = (typeNode: SyntaxNode, pos: TypeArgPosition = 'last', depth = 0): string | undefined => {
+  if (depth > 50) return undefined;
+  // generic_type: Vec<User>, HashMap<K, V> — extract type arg based on position
+  if (typeNode.type === 'generic_type') {
+    const args = extractGenericTypeArgs(typeNode);
+    if (args.length >= 1) return pos === 'first' ? args[0] : args[args.length - 1];
+  }
+  // reference_type: &[User] or &Vec<User> — unwrap the reference and recurse
+  if (typeNode.type === 'reference_type') {
+    const inner = typeNode.lastNamedChild;
+    if (inner) return extractRustElementTypeFromTypeNode(inner, pos, depth + 1);
+  }
+  // array_type: [User; N] — element is the first child
+  if (typeNode.type === 'array_type') {
+    const elemNode = typeNode.firstNamedChild;
+    if (elemNode) return extractSimpleTypeName(elemNode);
+  }
+  // slice_type: [User] — element is the first child
+  if (typeNode.type === 'slice_type') {
+    const elemNode = typeNode.firstNamedChild;
+    if (elemNode) return extractSimpleTypeName(elemNode);
+  }
+  return undefined;
+};
+
+/** Walk up from a for-loop to the enclosing function_item and search parameters
+ *  for one named `iterableName`. Returns the element type from its annotation. */
+const findRustParamElementType = (iterableName: string, startNode: SyntaxNode, pos: TypeArgPosition = 'last'): string | undefined => {
+  let current: SyntaxNode | null = startNode.parent;
+  while (current) {
+    if (current.type === 'function_item') {
+      const paramsNode = current.childForFieldName('parameters');
+      if (paramsNode) {
+        for (let i = 0; i < paramsNode.namedChildCount; i++) {
+          const param = paramsNode.namedChild(i);
+          if (!param || param.type !== 'parameter') continue;
+          const nameNode = param.childForFieldName('pattern');
+          if (!nameNode) continue;
+          // Unwrap reference patterns: &users, &mut users
+          let identNode = nameNode;
+          if (identNode.type === 'reference_pattern') {
+            identNode = identNode.lastNamedChild ?? identNode;
+          }
+          if (identNode.type === 'mut_pattern') {
+            identNode = identNode.firstNamedChild ?? identNode;
+          }
+          if (identNode.text !== iterableName) continue;
+          const typeNode = param.childForFieldName('type');
+          if (typeNode) return extractRustElementTypeFromTypeNode(typeNode, pos);
+        }
+      }
+      break;
+    }
+    current = current.parent;
+  }
+  return undefined;
+};
+
+/** Rust: for user in &users where users has a known container type.
+ *  Unwraps reference_expression (&users, &mut users) to get the iterable name. */
+const extractForLoopBinding: ForLoopExtractor = (
+  node: SyntaxNode,
+  scopeEnv: Map<string, string>,
+  declarationTypeNodes: ReadonlyMap<string, SyntaxNode>,
+  scope: string,
+): void => {
+  if (node.type !== 'for_expression') return;
+
+  const patternNode = node.childForFieldName('pattern');
+  const valueNode = node.childForFieldName('value');
+  if (!patternNode || !valueNode) return;
+
+  // Extract iterable name + method — may be &users, users, or users.iter()/keys()/values()
+  let iterableName: string | undefined;
+  let methodName: string | undefined;
+  if (valueNode.type === 'reference_expression') {
+    const inner = valueNode.lastNamedChild;
+    if (inner?.type === 'identifier') iterableName = inner.text;
+  } else if (valueNode.type === 'identifier') {
+    iterableName = valueNode.text;
+  } else if (valueNode.type === 'field_expression') {
+    const prop = valueNode.lastNamedChild;
+    if (prop) iterableName = prop.text;
+  } else if (valueNode.type === 'call_expression') {
+    // users.iter() → call_expression > function: field_expression > identifier + field_identifier
+    const fieldExpr = valueNode.childForFieldName('function');
+    if (fieldExpr?.type === 'field_expression') {
+      const obj = fieldExpr.firstNamedChild;
+      if (obj?.type === 'identifier') iterableName = obj.text;
+      // Extract method name: iter, keys, values, into_iter, etc.
+      const field = fieldExpr.lastNamedChild;
+      if (field?.type === 'field_identifier') methodName = field.text;
+    }
+  }
+  if (!iterableName) return;
+
+  const containerTypeName = scopeEnv.get(iterableName);
+  const typeArgPos = methodToTypeArgPosition(methodName, containerTypeName);
+  const elementType = resolveIterableElementType(
+    iterableName, node, scopeEnv, declarationTypeNodes, scope,
+    extractRustElementTypeFromTypeNode, findRustParamElementType,
+    typeArgPos,
+  );
+  if (!elementType) return;
+
+  const loopVarName = extractVarName(patternNode);
+  if (loopVarName) scopeEnv.set(loopVarName, elementType);
+};
+
 export const typeConfig: LanguageTypeConfig = {
   declarationNodeTypes: DECLARATION_NODE_TYPES,
+  forLoopNodeTypes: FOR_LOOP_NODE_TYPES,
+  patternBindingNodeTypes: new Set(['let_condition', 'match_arm']),
   extractDeclaration,
   extractInitializer,
   extractParameter,
   scanConstructorBinding,
+  extractForLoopBinding,
   extractPendingAssignment,
   extractPatternBinding,
 };

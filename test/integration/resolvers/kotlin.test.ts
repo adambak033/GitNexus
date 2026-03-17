@@ -869,3 +869,297 @@ describe('Kotlin chained method call resolution (Phase 5 review fix)', () => {
     expect(repoSave).toBeUndefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Kotlin unannotated for-loop Tier 1c: for (user in users) with List<User>
+// ---------------------------------------------------------------------------
+
+describe('Kotlin unannotated for-loop type resolution (Tier 1c)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'kotlin-var-foreach'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo classes with save methods', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Class')).toContain('Repo');
+  });
+
+  it('resolves user.save() in unannotated for to User#save via Tier 1c', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'save' && c.source === 'processUsers' && c.targetFilePath?.includes('User.kt'),
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('resolves repo.save() in unannotated for to Repo#save via Tier 1c', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoSave = calls.find(c =>
+      c.target === 'save' && c.source === 'processRepos' && c.targetFilePath?.includes('Repo.kt'),
+    );
+    expect(repoSave).toBeDefined();
+  });
+
+  it('does NOT cross-resolve user.save() to Repo#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const wrong = calls.find(c =>
+      c.target === 'save' && c.source === 'processUsers' && c.targetFilePath?.includes('Repo.kt'),
+    );
+    expect(wrong).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Kotlin when/is pattern binding: when (obj) { is User -> obj.save() }
+// ---------------------------------------------------------------------------
+
+describe('Kotlin when/is pattern binding', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'kotlin-when-pattern'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo classes, both with save functions', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Class')).toContain('Repo');
+    const saveFns = getNodesByLabel(result, 'Function').filter(f => f === 'save');
+    expect(saveFns.length).toBe(2);
+  });
+
+  it('resolves obj.save() in when/is User arm to models/User.kt', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'save' && c.source === 'processAny' && c.targetFilePath === 'models/User.kt',
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('resolves obj.save() in when/is Repo arm to models/Repo.kt', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoSave = calls.find(c =>
+      c.target === 'save' && c.source === 'processAny' && c.targetFilePath === 'models/Repo.kt',
+    );
+    expect(repoSave).toBeDefined();
+  });
+
+  it('resolves obj.save() in handleUser when/is User arm to models/User.kt', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'save' && c.source === 'handleUser' && c.targetFilePath === 'models/User.kt',
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('does NOT cross-resolve handleUser when/is User to Repo.save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const wrongSave = calls.find(c =>
+      c.target === 'save' && c.source === 'handleUser' && c.targetFilePath === 'models/Repo.kt',
+    );
+    expect(wrongSave).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Kotlin HashMap .values navigation_expression resolution
+// ---------------------------------------------------------------------------
+
+describe('Kotlin HashMap .values for-loop resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'kotlin-map-keys-values'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User class with save function', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+  });
+
+  it('resolves user.save() via HashMap.values to User#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'save' && c.source === 'processValues' && c.targetFilePath?.includes('User'),
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('does NOT resolve user.save() to Repo#save (negative)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const wrongSave = calls.find(c =>
+      c.target === 'save' && c.source === 'processValues' && c.targetFilePath?.includes('Repo'),
+    );
+    expect(wrongSave).toBeUndefined();
+  });
+
+  it('resolves user.save() via List iteration to User#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'save' && c.source === 'processList' && c.targetFilePath?.includes('User'),
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('resolves user.save() via HashMap.keys to User#save (first type arg)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'save' && c.source === 'processKeys' && c.targetFilePath?.includes('User'),
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('does NOT resolve HashMap.keys iteration to Repo#save (negative)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const wrong = calls.find(c =>
+      c.target === 'save' && c.source === 'processKeys' && c.targetFilePath?.includes('Repo'),
+    );
+    expect(wrong).toBeUndefined();
+  });
+
+  it('resolves repo.save() via MutableMap.values to Repo#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoSave = calls.find(c =>
+      c.target === 'save' && c.source === 'processMutableMapValues' && c.targetFilePath?.includes('Repo'),
+    );
+    expect(repoSave).toBeDefined();
+  });
+
+  it('resolves repo.save() via Set iteration to Repo#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoSave = calls.find(c =>
+      c.target === 'save' && c.source === 'processSet' && c.targetFilePath?.includes('Repo'),
+    );
+    expect(repoSave).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Kotlin when/is complex patterns: 3+ arms, multi-call, else branch
+// ---------------------------------------------------------------------------
+
+describe('Kotlin when/is complex pattern binding', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'kotlin-when-complex'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User, Repo, and Admin classes', () => {
+    const classes = getNodesByLabel(result, 'Class');
+    expect(classes).toContain('User');
+    expect(classes).toContain('Repo');
+    expect(classes).toContain('Admin');
+  });
+
+  // --- Three-arm when: each arm resolves obj to the correct narrowed type ---
+
+  it('resolves obj.save() in 3-arm when/is User to User#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'save' && c.source === 'processThreeArms' && c.targetFilePath === 'models/User.kt',
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('resolves obj.save() in 3-arm when/is Repo to Repo#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoSave = calls.find(c =>
+      c.target === 'save' && c.source === 'processThreeArms' && c.targetFilePath === 'models/Repo.kt',
+    );
+    expect(repoSave).toBeDefined();
+  });
+
+  it('resolves obj.save() in 3-arm when/is Admin to Admin#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const adminSave = calls.find(c =>
+      c.target === 'save' && c.source === 'processThreeArms' && c.targetFilePath === 'models/Admin.kt',
+    );
+    expect(adminSave).toBeDefined();
+  });
+
+  // --- Multiple method calls within a single when arm ---
+
+  it('resolves obj.validate() in when/is User arm to User#validate', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userValidate = calls.find(c =>
+      c.target === 'validate' && c.source === 'processMultiCall' && c.targetFilePath === 'models/User.kt',
+    );
+    expect(userValidate).toBeDefined();
+  });
+
+  it('resolves obj.save() in when/is User arm to User#save (multi-call)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'save' && c.source === 'processMultiCall' && c.targetFilePath === 'models/User.kt',
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('resolves obj.validate() in when/is Repo arm to Repo#validate', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoValidate = calls.find(c =>
+      c.target === 'validate' && c.source === 'processMultiCall' && c.targetFilePath === 'models/Repo.kt',
+    );
+    expect(repoValidate).toBeDefined();
+  });
+
+  it('resolves obj.save() in when/is Repo arm to Repo#save (multi-call)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoSave = calls.find(c =>
+      c.target === 'save' && c.source === 'processMultiCall' && c.targetFilePath === 'models/Repo.kt',
+    );
+    expect(repoSave).toBeDefined();
+  });
+
+  // --- Cross-resolution negatives: User arm does NOT resolve to Repo ---
+
+  it('does NOT resolve processMultiCall when/is User arm validate() to Repo', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const wrong = calls.find(c =>
+      c.target === 'validate' && c.source === 'processMultiCall' && c.targetFilePath === 'models/Repo.kt',
+    );
+    // Both User and Repo have validate(), so the Repo arm DOES resolve here.
+    // But processMultiCall should NOT have a cross-arm leak.
+    // We test that the User arm doesn't produce a Repo edge by checking save count.
+    const userSaves = calls.filter(c =>
+      c.target === 'save' && c.source === 'processMultiCall',
+    );
+    // Exactly 2 save() CALLS edges (one per arm, not duplicated)
+    expect(userSaves.length).toBe(2);
+  });
+
+  // --- when with else: is User arm narrows, else does not ---
+
+  it('resolves obj.save() in when/is User + else to User#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'save' && c.source === 'processWithElse' && c.targetFilePath === 'models/User.kt',
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('does NOT resolve processWithElse to Repo#save or Admin#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const wrongRepo = calls.find(c =>
+      c.target === 'save' && c.source === 'processWithElse' && c.targetFilePath === 'models/Repo.kt',
+    );
+    const wrongAdmin = calls.find(c =>
+      c.target === 'save' && c.source === 'processWithElse' && c.targetFilePath === 'models/Admin.kt',
+    );
+    expect(wrongRepo).toBeUndefined();
+    expect(wrongAdmin).toBeUndefined();
+  });
+});

@@ -1,5 +1,171 @@
 import type { SyntaxNode } from '../utils.js';
 
+/** Which type argument to extract from a multi-arg generic container.
+ *  - 'first': key type (e.g., K from Map<K,V>) — used for .keys(), .keySet()
+ *  - 'last':  value type (e.g., V from Map<K,V>) — used for .values(), .items(), .iter() */
+export type TypeArgPosition = 'first' | 'last';
+
+// ---------------------------------------------------------------------------
+// Container type descriptors — maps container base names to type parameter
+// semantics per access method. Replaces the simple KEY_METHODS heuristic.
+//
+// For user-defined generics (MyCache<K,V> extends Map<K,V>), heritage-aware
+// fallback can walk the EXTENDS chain to find a matching descriptor.
+// ---------------------------------------------------------------------------
+
+/** Describes which type parameter position each access method yields. */
+interface ContainerDescriptor {
+  /** Number of type parameters (1 = single-element, 2 = key-value) */
+  arity: number;
+  /** Methods that yield the first type parameter (key type for maps) */
+  keyMethods: ReadonlySet<string>;
+  /** Methods that yield the last type parameter (value type) */
+  valueMethods: ReadonlySet<string>;
+}
+
+/** Empty set for containers that have no key-yielding methods */
+const NO_KEYS: ReadonlySet<string> = new Set();
+
+/** Standard key-yielding methods across languages */
+const STD_KEY_METHODS: ReadonlySet<string> = new Set(['keys']);
+const JAVA_KEY_METHODS: ReadonlySet<string> = new Set(['keySet']);
+const CSHARP_KEY_METHODS: ReadonlySet<string> = new Set(['Keys']);
+
+/** Standard value-yielding methods across languages */
+const STD_VALUE_METHODS: ReadonlySet<string> = new Set(['values', 'get', 'pop', 'remove']);
+const CSHARP_VALUE_METHODS: ReadonlySet<string> = new Set(['Values', 'TryGetValue']);
+const SINGLE_ELEMENT_METHODS: ReadonlySet<string> = new Set([
+  'iter', 'into_iter', 'iterator', 'get', 'first', 'last', 'pop',
+  'peek', 'poll', 'find', 'filter', 'map',
+]);
+
+const CONTAINER_DESCRIPTORS: ReadonlyMap<string, ContainerDescriptor> = new Map([
+  // --- Map / Dict types (arity 2: key + value) ---
+  ['Map',           { arity: 2, keyMethods: STD_KEY_METHODS,    valueMethods: STD_VALUE_METHODS }],
+  ['WeakMap',       { arity: 2, keyMethods: STD_KEY_METHODS,    valueMethods: STD_VALUE_METHODS }],
+  ['HashMap',       { arity: 2, keyMethods: STD_KEY_METHODS,    valueMethods: STD_VALUE_METHODS }],
+  ['BTreeMap',      { arity: 2, keyMethods: STD_KEY_METHODS,    valueMethods: STD_VALUE_METHODS }],
+  ['LinkedHashMap', { arity: 2, keyMethods: JAVA_KEY_METHODS,   valueMethods: STD_VALUE_METHODS }],
+  ['TreeMap',       { arity: 2, keyMethods: JAVA_KEY_METHODS,   valueMethods: STD_VALUE_METHODS }],
+  ['dict',          { arity: 2, keyMethods: STD_KEY_METHODS,    valueMethods: STD_VALUE_METHODS }],
+  ['Dict',          { arity: 2, keyMethods: STD_KEY_METHODS,    valueMethods: STD_VALUE_METHODS }],
+  ['Dictionary',    { arity: 2, keyMethods: CSHARP_KEY_METHODS, valueMethods: CSHARP_VALUE_METHODS }],
+  ['SortedDictionary', { arity: 2, keyMethods: CSHARP_KEY_METHODS, valueMethods: CSHARP_VALUE_METHODS }],
+  ['Record',        { arity: 2, keyMethods: STD_KEY_METHODS,    valueMethods: STD_VALUE_METHODS }],
+  ['OrderedDict',   { arity: 2, keyMethods: STD_KEY_METHODS,    valueMethods: STD_VALUE_METHODS }],
+  ['ConcurrentHashMap', { arity: 2, keyMethods: JAVA_KEY_METHODS, valueMethods: STD_VALUE_METHODS }],
+  ['ConcurrentDictionary', { arity: 2, keyMethods: CSHARP_KEY_METHODS, valueMethods: CSHARP_VALUE_METHODS }],
+
+  // --- Single-element containers (arity 1) ---
+  ['Array',     { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['List',      { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['ArrayList', { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['LinkedList',{ arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['Vec',       { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['VecDeque',  { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['Set',       { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['HashSet',   { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['BTreeSet',  { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['TreeSet',   { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['Queue',     { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['Deque',     { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['Stack',     { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['Sequence',  { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['Iterable',  { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['Iterator',  { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['IEnumerable', { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['IList',     { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['ICollection', { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['Collection',  { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['ObservableCollection', { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['IEnumerator', { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['SortedSet', { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['Stream',    { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['MutableList', { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['MutableSet',  { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['LinkedHashSet', { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['ArrayDeque',  { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['PriorityQueue', { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['MutableMap', { arity: 2, keyMethods: STD_KEY_METHODS, valueMethods: STD_VALUE_METHODS }],
+  ['list',      { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['set',       { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['tuple',     { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['frozenset', { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+]);
+
+/** Determine which type arg to extract based on container type name and access method.
+ *
+ *  Resolution order:
+ *  1. If container is known and method is in keyMethods → 'first'
+ *  2. If container is known with arity 1 → 'last' (same as 'first' for single-arg)
+ *  3. If container is unknown → fall back to method name heuristic
+ *  4. Default: 'last' (value type)
+ */
+export function methodToTypeArgPosition(methodName: string | undefined, containerTypeName?: string): TypeArgPosition {
+  if (containerTypeName) {
+    const desc = CONTAINER_DESCRIPTORS.get(containerTypeName);
+    if (desc) {
+      // Single-element container: always 'last' (= only arg)
+      if (desc.arity === 1) return 'last';
+      // Multi-element: check if method yields key type
+      if (methodName && desc.keyMethods.has(methodName)) return 'first';
+      // Default for multi-element: value type
+      return 'last';
+    }
+  }
+  // Fallback for unknown containers: simple method name heuristic
+  if (methodName && (methodName === 'keys' || methodName === 'keySet' || methodName === 'Keys')) {
+    return 'first';
+  }
+  return 'last';
+}
+
+/** Look up the container descriptor for a type name. Exported for heritage-chain lookups. */
+export function getContainerDescriptor(typeName: string): ContainerDescriptor | undefined {
+  return CONTAINER_DESCRIPTORS.get(typeName);
+}
+
+/**
+ * Shared 3-strategy fallback for resolving the element type of a container variable.
+ * Used by all for-loop extractors to resolve the loop variable's type from the iterable.
+ *
+ * Strategy 1: declarationTypeNodes — raw AST type annotation node (handles container types
+ *             where extractSimpleTypeName returned undefined, e.g., User[], List[User])
+ * Strategy 2: scopeEnv string — extractElementTypeFromString on the stored type string
+ * Strategy 3: AST walk — language-specific upward walk to enclosing function parameters
+ *
+ * @param extractFromTypeNode Language-specific function to extract element type from AST node
+ * @param findParamElementType Optional language-specific AST walk to find parameter type
+ * @param typeArgPos Which generic type arg to extract: 'first' for keys, 'last' for values (default)
+ */
+export function resolveIterableElementType(
+  iterableName: string,
+  node: SyntaxNode,
+  scopeEnv: ReadonlyMap<string, string>,
+  declarationTypeNodes: ReadonlyMap<string, SyntaxNode>,
+  scope: string,
+  extractFromTypeNode: (typeNode: SyntaxNode, pos?: TypeArgPosition) => string | undefined,
+  findParamElementType?: (name: string, startNode: SyntaxNode, pos?: TypeArgPosition) => string | undefined,
+  typeArgPos: TypeArgPosition = 'last',
+): string | undefined {
+  // Strategy 1: declarationTypeNodes AST node (check current scope, then file scope)
+  const typeNode = declarationTypeNodes.get(`${scope}\0${iterableName}`)
+    ?? (scope !== '' ? declarationTypeNodes.get(`\0${iterableName}`) : undefined);
+  if (typeNode) {
+    const t = extractFromTypeNode(typeNode, typeArgPos);
+    if (t) return t;
+  }
+  // Strategy 2: scopeEnv string → extractElementTypeFromString
+  const iterableType = scopeEnv.get(iterableName);
+  if (iterableType) {
+    const el = extractElementTypeFromString(iterableType, typeArgPos);
+    if (el) return el;
+  }
+  // Strategy 3: AST walk to function parameters
+  if (findParamElementType) return findParamElementType(iterableName, node, typeArgPos);
+  return undefined;
+}
+
 /** Known single-arg nullable wrapper types that unwrap to their inner type
  *  for receiver resolution. Optional<User> → "User", Option<User> → "User".
  *  Only nullable wrappers — NOT containers (List, Vec) or async wrappers (Promise, Future).
@@ -16,7 +182,8 @@ const NULLABLE_WRAPPER_TYPES = new Set([
  * (e.g., models.User → User), and nullable types (e.g., User? → User).
  * Returns undefined for complex types (unions, intersections, function types).
  */
-export const extractSimpleTypeName = (typeNode: SyntaxNode): string | undefined => {
+export const extractSimpleTypeName = (typeNode: SyntaxNode, depth = 0): string | undefined => {
+  if (depth > 50 || typeNode.text.length > 2048) return undefined;
   // Direct type identifier (includes Ruby 'constant' for class names)
   if (typeNode.type === 'type_identifier' || typeNode.type === 'identifier'
     || typeNode.type === 'simple_identifier' || typeNode.type === 'constant') {
@@ -40,14 +207,21 @@ export const extractSimpleTypeName = (typeNode: SyntaxNode): string | undefined 
     }
   }
 
+  // C++ template_type (e.g., vector<User>, map<string, User>): extract base name
+  if (typeNode.type === 'template_type') {
+    const base = typeNode.childForFieldName('name') ?? typeNode.firstNamedChild;
+    if (base) return extractSimpleTypeName(base, depth + 1);
+  }
+
   // Generic types: extract the base type (e.g., List<User> → List)
   // For nullable wrappers (Optional<User>, Option<User>), unwrap to inner type.
-  if (typeNode.type === 'generic_type' || typeNode.type === 'parameterized_type') {
+  if (typeNode.type === 'generic_type' || typeNode.type === 'parameterized_type'
+    || typeNode.type === 'generic_name') {
     const base = typeNode.childForFieldName('name')
       ?? typeNode.childForFieldName('type')
       ?? typeNode.firstNamedChild;
     if (!base) return undefined;
-    const baseName = extractSimpleTypeName(base);
+    const baseName = extractSimpleTypeName(base, depth + 1);
     // Unwrap known nullable wrappers: Optional<User> → User, Option<User> → User
     if (baseName && NULLABLE_WRAPPER_TYPES.has(baseName)) {
       const args = extractGenericTypeArgs(typeNode);
@@ -59,7 +233,7 @@ export const extractSimpleTypeName = (typeNode: SyntaxNode): string | undefined 
   // Nullable types (Kotlin User?, C# User?)
   if (typeNode.type === 'nullable_type') {
     const inner = typeNode.firstNamedChild;
-    if (inner) return extractSimpleTypeName(inner);
+    if (inner) return extractSimpleTypeName(inner, depth + 1);
   }
 
   // Nullable union types (TS/JS: User | null, User | undefined, User | null | undefined)
@@ -76,7 +250,7 @@ export const extractSimpleTypeName = (typeNode: SyntaxNode): string | undefined 
     }
     // Only unwrap if exactly one meaningful type remains
     if (nonNullTypes.length === 1) {
-      return extractSimpleTypeName(nonNullTypes[0]);
+      return extractSimpleTypeName(nonNullTypes[0], depth + 1);
     }
   }
 
@@ -84,24 +258,25 @@ export const extractSimpleTypeName = (typeNode: SyntaxNode): string | undefined 
   if (typeNode.type === 'type_annotation' || typeNode.type === 'type'
     || typeNode.type === 'user_type') {
     const inner = typeNode.firstNamedChild;
-    if (inner) return extractSimpleTypeName(inner);
+    if (inner) return extractSimpleTypeName(inner, depth + 1);
   }
 
   // Pointer/reference types (C++, Rust): User*, &User, &mut User
   if (typeNode.type === 'pointer_type' || typeNode.type === 'reference_type') {
     const inner = typeNode.firstNamedChild;
-    if (inner) return extractSimpleTypeName(inner);
+    if (inner) return extractSimpleTypeName(inner, depth + 1);
   }
 
-  // PHP primitive_type (string, int, float, bool)
-  if (typeNode.type === 'primitive_type') {
+  // Primitive/predefined types: string, int, float, bool, number, unknown, any
+  // PHP: primitive_type; TS/JS: predefined_type
+  if (typeNode.type === 'primitive_type' || typeNode.type === 'predefined_type') {
     return typeNode.text;
   }
 
   // PHP named_type / optional_type
   if (typeNode.type === 'named_type' || typeNode.type === 'optional_type') {
     const inner = typeNode.childForFieldName('name') ?? typeNode.firstNamedChild;
-    if (inner) return extractSimpleTypeName(inner);
+    if (inner) return extractSimpleTypeName(inner, depth + 1);
   }
 
   // Name node (PHP)
@@ -119,7 +294,7 @@ export const extractSimpleTypeName = (typeNode: SyntaxNode): string | undefined 
 export const extractVarName = (node: SyntaxNode): string | undefined => {
   if (node.type === 'identifier' || node.type === 'simple_identifier'
     || node.type === 'variable_name' || node.type === 'name'
-    || node.type === 'constant') {
+    || node.type === 'constant' || node.type === 'property_identifier') {
     return node.text;
   }
   // variable_declarator (Java/C#): has a 'name' field
@@ -141,9 +316,11 @@ export const TYPED_PARAMETER_TYPES = new Set([
   'optional_parameter',      // TS: (x?: Foo)
   'formal_parameter',        // Java/Kotlin
   'parameter',               // C#/Rust/Go/Python/Swift
+  'typed_parameter',         // Python: def f(x: Foo) — distinct from 'parameter' in tree-sitter-python
   'parameter_declaration',   // C/C++ void f(Type name)
   'simple_parameter',        // PHP function(Foo $x)
   'property_promotion_parameter', // PHP 8.0+ constructor promotion: __construct(private Foo $x)
+  'closure_parameter',       // Rust: |user: User| — typed closure parameters
 ]);
 
 /**
@@ -164,18 +341,20 @@ export const TYPED_PARAMETER_TYPES = new Set([
  *   returns [] for non-generic types).
  * @returns Array of resolved type argument names. Unresolvable arguments are omitted.
  */
-export const extractGenericTypeArgs = (typeNode: SyntaxNode): string[] => {
+export const extractGenericTypeArgs = (typeNode: SyntaxNode, depth = 0): string[] => {
+  if (depth > 50) return [];
   // Unwrap wrapper nodes that may sit above the generic_type
   if (typeNode.type === 'type_annotation' || typeNode.type === 'type'
     || typeNode.type === 'user_type' || typeNode.type === 'nullable_type'
     || typeNode.type === 'optional_type') {
     const inner = typeNode.firstNamedChild;
-    if (inner) return extractGenericTypeArgs(inner);
+    if (inner) return extractGenericTypeArgs(inner, depth + 1);
     return [];
   }
 
-  // Only process generic/parameterized type nodes
-  if (typeNode.type !== 'generic_type' && typeNode.type !== 'parameterized_type') {
+  // Only process generic/parameterized type nodes (includes C#'s generic_name)
+  if (typeNode.type !== 'generic_type' && typeNode.type !== 'parameterized_type'
+    && typeNode.type !== 'generic_name') {
     return [];
   }
 
@@ -316,3 +495,116 @@ export const findChildByType = (node: SyntaxNode, type: string): SyntaxNode | nu
   }
   return null;
 };
+
+// Internal helper: extract the first comma-separated argument from a string,
+// respecting nested angle-bracket and square-bracket depth.
+function extractFirstArg(args: string): string {
+  let depth = 0;
+  for (let i = 0; i < args.length; i++) {
+    const ch = args[i];
+    if (ch === '<' || ch === '[') depth++;
+    else if (ch === '>' || ch === ']') depth--;
+    else if (ch === ',' && depth === 0) return args.slice(0, i).trim();
+  }
+  return args.trim();
+}
+
+/**
+ * Extract element type from a container type string.
+ * Uses bracket-balanced parsing (no regex) for generic argument extraction.
+ * Returns undefined for ambiguous or unparseable strings.
+ *
+ * Handles:
+ * - Array<User>    → User  (generic angle brackets)
+ * - User[]         → User  (array suffix)
+ * - []User         → User  (Go slice prefix)
+ * - List[User]     → User  (Python subscript)
+ * - [User]         → User  (Swift array sugar)
+ * - vector<User>   → User  (C++ container)
+ * - Vec<User>      → User  (Rust container)
+ *
+ * For multi-argument generics (Map<K, V>), returns the first or last type arg
+ * based on `pos` ('first' for keys, 'last' for values — default 'last').
+ * Returns undefined when the extracted type is not a simple word.
+ */
+export function extractElementTypeFromString(typeStr: string, pos: TypeArgPosition = 'last'): string | undefined {
+  if (!typeStr || typeStr.length === 0 || typeStr.length > 2048) return undefined;
+
+  // 1. Array suffix: User[] → User
+  if (typeStr.endsWith('[]')) {
+    const base = typeStr.slice(0, -2).trim();
+    return base && /^\w+$/.test(base) ? base : undefined;
+  }
+
+  // 2. Go slice prefix: []User → User
+  if (typeStr.startsWith('[]')) {
+    const element = typeStr.slice(2).trim();
+    return element && /^\w+$/.test(element) ? element : undefined;
+  }
+
+  // 3. Swift array sugar: [User] → User
+  //    Must start with '[', end with ']', and contain no angle brackets
+  //    (to avoid confusing with List[User] handled below).
+  if (typeStr.startsWith('[') && typeStr.endsWith(']') && !typeStr.includes('<')) {
+    const element = typeStr.slice(1, -1).trim();
+    return element && /^\w+$/.test(element) ? element : undefined;
+  }
+
+  // 4. Generic bracket-balanced extraction: Array<User> / List[User] / Vec<User>
+  //    Find the first opening bracket (< or [) and pick the one that appears first.
+  const openAngle = typeStr.indexOf('<');
+  const openSquare = typeStr.indexOf('[');
+
+  let openIdx = -1;
+  let openChar = '';
+  let closeChar = '';
+
+  if (openAngle >= 0 && (openSquare < 0 || openAngle < openSquare)) {
+    openIdx = openAngle;
+    openChar = '<';
+    closeChar = '>';
+  } else if (openSquare >= 0) {
+    openIdx = openSquare;
+    openChar = '[';
+    closeChar = ']';
+  }
+
+  if (openIdx < 0) return undefined;
+
+  // Walk bracket-balanced from the character after the opening bracket to find
+  // the matching close bracket, tracking depth for nested brackets.
+  // All bracket types (<, >, [, ]) contribute to depth uniformly, but only the
+  // selected closeChar can match at depth 0 (prevents cross-bracket miscounting).
+  let depth = 0;
+  const start = openIdx + 1;
+  let lastCommaIdx = -1; // Track last top-level comma for 'last' position
+  for (let i = start; i < typeStr.length; i++) {
+    const ch = typeStr[i];
+    if (ch === '<' || ch === '[') {
+      depth++;
+    } else if (ch === '>' || ch === ']') {
+      if (depth === 0) {
+        // At depth 0 — only match if it is our selected close bracket.
+        if (ch !== closeChar) return undefined; // mismatched bracket = malformed
+        if (pos === 'last' && lastCommaIdx >= 0) {
+          // Return last arg (text after last comma)
+          const lastArg = typeStr.slice(lastCommaIdx + 1, i).trim();
+          return lastArg && /^\w+$/.test(lastArg) ? lastArg : undefined;
+        }
+        const inner = typeStr.slice(start, i).trim();
+        const firstArg = extractFirstArg(inner);
+        return firstArg && /^\w+$/.test(firstArg) ? firstArg : undefined;
+      }
+      depth--;
+    } else if (ch === ',' && depth === 0) {
+      if (pos === 'first') {
+        // Return first arg (text before first comma)
+        const arg = typeStr.slice(start, i).trim();
+        return arg && /^\w+$/.test(arg) ? arg : undefined;
+      }
+      lastCommaIdx = i;
+    }
+  }
+
+  return undefined;
+}

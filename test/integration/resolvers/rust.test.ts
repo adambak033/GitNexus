@@ -1020,3 +1020,206 @@ describe('Rust if-let Err(e) pattern binding (Phase 5 review fix)', () => {
     expect(wrongCall).toBeUndefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Chained method calls: svc.get_user().save()
+// Tests that Rust chain call resolution correctly infers the intermediate
+// receiver type from get_user()'s return type and resolves save() to User.
+// ---------------------------------------------------------------------------
+
+describe('Rust chained method call resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'rust-chain-call'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo structs, and UserService', () => {
+    expect(getNodesByLabel(result, 'Struct')).toContain('User');
+    expect(getNodesByLabel(result, 'Struct')).toContain('Repo');
+    expect(getNodesByLabel(result, 'Struct')).toContain('UserService');
+  });
+
+  it('detects get_user and save functions', () => {
+    const fns = getNodesByLabel(result, 'Function');
+    expect(fns).toContain('get_user');
+    expect(fns).toContain('save');
+  });
+
+  it('resolves svc.get_user().save() to User#save via chain resolution', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'save' &&
+      c.source === 'process_user' &&
+      c.targetFilePath?.includes('user.rs'),
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('does NOT resolve svc.get_user().save() to Repo#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoSave = calls.find(c =>
+      c.target === 'save' &&
+      c.source === 'process_user' &&
+      c.targetFilePath?.includes('repo.rs'),
+    );
+    expect(repoSave).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Rust for-loop Tier 1c: for user in &users with Vec<User> parameter
+// ---------------------------------------------------------------------------
+
+describe('Rust for-loop type resolution (Tier 1c)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'rust-for-loop'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo structs with save functions', () => {
+    expect(getNodesByLabel(result, 'Struct')).toContain('User');
+    expect(getNodesByLabel(result, 'Struct')).toContain('Repo');
+    const saveFns = getNodesByLabel(result, 'Function').filter(f => f === 'save');
+    expect(saveFns.length).toBe(2);
+  });
+
+  it('resolves user.save() in for-loop to User#save via Tier 1c', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'save' && c.source === 'process_users' && c.targetFilePath?.includes('user.rs'),
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('does NOT resolve user.save() to Repo#save (negative)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const wrongSave = calls.find(c =>
+      c.target === 'save' && c.source === 'process_users' && c.targetFilePath?.includes('repo.rs'),
+    );
+    expect(wrongSave).toBeUndefined();
+  });
+
+  it('resolves repo.save() in for-loop to Repo#save via Tier 1c', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoSave = calls.find(c =>
+      c.target === 'save' && c.source === 'process_repos' && c.targetFilePath?.includes('repo.rs'),
+    );
+    expect(repoSave).toBeDefined();
+  });
+
+  it('does NOT resolve repo.save() to User#save (negative)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const wrongSave = calls.find(c =>
+      c.target === 'save' && c.source === 'process_repos' && c.targetFilePath?.includes('user.rs'),
+    );
+    expect(wrongSave).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Rust match arm: match opt { Some(user) => user.save() }
+// ---------------------------------------------------------------------------
+
+describe('Rust match arm type resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'rust-match-unwrap'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo structs with save functions', () => {
+    expect(getNodesByLabel(result, 'Struct')).toContain('User');
+    expect(getNodesByLabel(result, 'Struct')).toContain('Repo');
+    const saveFns = getNodesByLabel(result, 'Function').filter(f => f === 'save');
+    expect(saveFns.length).toBe(2);
+  });
+
+  it('resolves user.save() inside match Some(user) to User#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'save' && c.source === 'process' && c.targetFilePath?.includes('user.rs'),
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('does NOT resolve user.save() in match to Repo#save (negative)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const wrongSave = calls.find(c =>
+      c.target === 'save' && c.source === 'process' && c.targetFilePath?.includes('repo.rs'),
+    );
+    expect(wrongSave).toBeUndefined();
+  });
+
+  it('resolves repo.save() inside if-let Ok(repo) to Repo#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoSave = calls.find(c =>
+      c.target === 'save' && c.source === 'check' && c.targetFilePath?.includes('repo.rs'),
+    );
+    expect(repoSave).toBeDefined();
+  });
+
+  it('does NOT resolve repo.save() in if-let to User#save (negative)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const wrongSave = calls.find(c =>
+      c.target === 'save' && c.source === 'check' && c.targetFilePath?.includes('user.rs'),
+    );
+    expect(wrongSave).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// for user in users.iter() — call_expression iterable resolution
+// ---------------------------------------------------------------------------
+
+describe('Rust .iter() for-loop call_expression resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'rust-iter-for-loop'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo structs with save functions', () => {
+    expect(getNodesByLabel(result, 'Struct')).toContain('User');
+    expect(getNodesByLabel(result, 'Struct')).toContain('Repo');
+    const saveFns = getNodesByLabel(result, 'Function').filter(f => f === 'save');
+    expect(saveFns.length).toBe(2);
+  });
+
+  it('resolves user.save() via users.iter() to User#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'save' && c.source === 'process_users' && c.targetFilePath?.includes('user.rs'),
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('resolves repo.save() via repos.into_iter() to Repo#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoSave = calls.find(c =>
+      c.target === 'save' && c.source === 'process_repos' && c.targetFilePath?.includes('repo.rs'),
+    );
+    expect(repoSave).toBeDefined();
+  });
+
+  it('does NOT cross-resolve user.save() to Repo#save (negative)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const wrongSave = calls.find(c =>
+      c.target === 'save' && c.source === 'process_users' && c.targetFilePath?.includes('repo.rs'),
+    );
+    expect(wrongSave).toBeUndefined();
+  });
+});

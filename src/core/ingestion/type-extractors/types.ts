@@ -24,10 +24,14 @@ export type ConstructorBindingScanner = (node: SyntaxNode) => { varName: string;
  *  rather than in AST fields. Returns undefined if no return type can be determined. */
 export type ReturnTypeExtractor = (node: SyntaxNode) => string | undefined;
 
-/** Extracts loop variable type binding from a for-each statement. */
+/** Extracts loop variable type binding from a for-each statement.
+ *  All parameters are required (aligned with PatternBindingExtractor convention)
+ *  to prevent new extractors from silently ignoring declarationTypeNodes/scope. */
 export type ForLoopExtractor = (
   node: SyntaxNode,
   scopeEnv: Map<string, string>,
+  declarationTypeNodes: ReadonlyMap<string, SyntaxNode>,
+  scope: string,
 ) => void;
 
 /** Extracts a plain-identifier assignment for Tier 2 propagation.
@@ -57,10 +61,20 @@ export type PatternBindingExtractor = (
 
 /** Per-language type extraction configuration */
 export interface LanguageTypeConfig {
+  /** Allow pattern binding to overwrite existing scopeEnv entries.
+   *  WARNING: Enables function-scope type pollution. Only for languages with
+   *  smart-cast semantics (e.g., Kotlin `when/is`) where the subject variable
+   *  already exists in scopeEnv from its declaration. */
+  readonly allowPatternBindingOverwrite?: boolean;
   /** Node types that represent typed declarations for this language */
   declarationNodeTypes: ReadonlySet<string>;
   /** AST node types for for-each/for-in statements with explicit element types. */
   forLoopNodeTypes?: ReadonlySet<string>;
+  /** Optional allowlist of AST node types on which extractPatternBinding should run.
+   *  When present, extractPatternBinding is only invoked for nodes whose type is in this set,
+   *  short-circuiting the call for all other node types. When absent, every node is passed to
+   *  extractPatternBinding (legacy behaviour). */
+  patternBindingNodeTypes?: ReadonlySet<string>;
   /** Extract a (varName → typeName) binding from a declaration node */
   extractDeclaration: TypeBindingExtractor;
   /** Extract a (varName → typeName) binding from a parameter node */

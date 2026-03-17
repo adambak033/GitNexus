@@ -1,31 +1,18 @@
 import type { SyntaxNode } from '../utils.js';
-import type { ConstructorBindingScanner, ForLoopExtractor, LanguageTypeConfig, ParameterExtractor, TypeBindingExtractor, PendingAssignmentExtractor } from './types.js';
-import { extractSimpleTypeName, extractVarName, findChildByType, unwrapAwait } from './shared.js';
+import type { ConstructorBindingScanner, ForLoopExtractor, LanguageTypeConfig, ParameterExtractor, TypeBindingExtractor, PendingAssignmentExtractor, PatternBindingExtractor } from './types.js';
+import { extractSimpleTypeName, extractVarName, findChildByType, unwrapAwait, extractGenericTypeArgs, resolveIterableElementType, methodToTypeArgPosition, type TypeArgPosition } from './shared.js';
+
+/** Known container property accessors that operate on the container itself (e.g., dict.Keys, dict.Values) */
+const KNOWN_CONTAINER_PROPS: ReadonlySet<string> = new Set(['Keys', 'Values']);
 
 const DECLARATION_NODE_TYPES: ReadonlySet<string> = new Set([
   'local_declaration_statement',
   'variable_declaration',
   'field_declaration',
-  'is_pattern_expression',
 ]);
 
-/** C#: Type x = ...; var x = new Type(); obj is Type x */
+/** C#: Type x = ...; var x = new Type(); */
 const extractDeclaration: TypeBindingExtractor = (node: SyntaxNode, env: Map<string, string>): void => {
-  // C# pattern matching: `obj is User user` → is_pattern_expression > declaration_pattern
-  if (node.type === 'is_pattern_expression') {
-    const pattern = node.childForFieldName('pattern');
-    if (pattern?.type === 'declaration_pattern') {
-      const typeNode = pattern.childForFieldName('type');
-      const nameNode = pattern.childForFieldName('name');
-      if (typeNode && nameNode) {
-        const typeName = extractSimpleTypeName(typeNode);
-        const varName = extractVarName(nameNode);
-        if (typeName && varName) env.set(varName, typeName);
-      }
-    }
-    return;
-  }
-
   // C# tree-sitter: local_declaration_statement > variable_declaration > ...
   // Recursively descend through wrapper nodes
   for (let i = 0; i < node.namedChildCount; i++) {
@@ -147,17 +134,170 @@ const FOR_LOOP_NODE_TYPES: ReadonlySet<string> = new Set([
   'foreach_statement',
 ]);
 
-/** C#: foreach (User user in users) — extract loop variable binding */
-const extractForLoopBinding: ForLoopExtractor = (node: SyntaxNode, scopeEnv: Map<string, string>): void => {
+/** Extract element type from a C# type annotation AST node.
+ *  Handles generic_name (List<User>), array_type (User[]), nullable_type (?).
+ *  `pos` selects which type arg: 'first' for keys, 'last' for values (default). */
+const extractCSharpElementTypeFromTypeNode = (typeNode: SyntaxNode, pos: TypeArgPosition = 'last', depth = 0): string | undefined => {
+  if (depth > 50) return undefined;
+  // generic_name: List<User>, IEnumerable<User>, Dictionary<string, User>
+  // C# uses generic_name (not generic_type)
+  if (typeNode.type === 'generic_name') {
+    const argList = findChildByType(typeNode, 'type_argument_list');
+    if (argList && argList.namedChildCount >= 1) {
+      if (pos === 'first') {
+        const firstArg = argList.namedChild(0);
+        if (firstArg) return extractSimpleTypeName(firstArg);
+      } else {
+        const lastArg = argList.namedChild(argList.namedChildCount - 1);
+        if (lastArg) return extractSimpleTypeName(lastArg);
+      }
+    }
+  }
+  // array_type: User[]
+  if (typeNode.type === 'array_type') {
+    const elemNode = typeNode.firstNamedChild;
+    if (elemNode) return extractSimpleTypeName(elemNode);
+  }
+  // nullable_type: unwrap and recurse (List<User>? → List<User> → User)
+  if (typeNode.type === 'nullable_type') {
+    const inner = typeNode.firstNamedChild;
+    if (inner) return extractCSharpElementTypeFromTypeNode(inner, pos, depth + 1);
+  }
+  return undefined;
+};
+
+/** Walk up from a foreach to the enclosing method and search parameters. */
+const findCSharpParamElementType = (iterableName: string, startNode: SyntaxNode, pos: TypeArgPosition = 'last'): string | undefined => {
+  let current: SyntaxNode | null = startNode.parent;
+  while (current) {
+    if (current.type === 'method_declaration' || current.type === 'local_function_statement') {
+      const paramsNode = current.childForFieldName('parameters');
+      if (paramsNode) {
+        for (let i = 0; i < paramsNode.namedChildCount; i++) {
+          const param = paramsNode.namedChild(i);
+          if (!param || param.type !== 'parameter') continue;
+          const nameNode = param.childForFieldName('name');
+          if (nameNode?.text !== iterableName) continue;
+          const typeNode = param.childForFieldName('type');
+          if (typeNode) return extractCSharpElementTypeFromTypeNode(typeNode, pos);
+        }
+      }
+      break;
+    }
+    current = current.parent;
+  }
+  return undefined;
+};
+
+/** C#: foreach (User user in users) — extract loop variable binding.
+ *  Tier 1c: for `foreach (var user in users)`, resolves element type from iterable. */
+const extractForLoopBinding: ForLoopExtractor = (
+  node: SyntaxNode,
+  scopeEnv: Map<string, string>,
+  declarationTypeNodes: ReadonlyMap<string, SyntaxNode>,
+  scope: string,
+): void => {
   const typeNode = node.childForFieldName('type');
-  // The loop variable name is in the 'left' field in tree-sitter-c-sharp
   const nameNode = node.childForFieldName('left');
   if (!typeNode || !nameNode) return;
-  // Skip 'var' — type would need to be inferred from the collection element type
-  if (typeNode.type === 'implicit_type' && typeNode.text === 'var') return;
-  const typeName = extractSimpleTypeName(typeNode);
   const varName = extractVarName(nameNode);
-  if (typeName && varName) scopeEnv.set(varName, typeName);
+  if (!varName) return;
+
+  // Explicit type (existing behavior): foreach (User user in users)
+  if (!(typeNode.type === 'implicit_type' && typeNode.text === 'var')) {
+    const typeName = extractSimpleTypeName(typeNode);
+    if (typeName) scopeEnv.set(varName, typeName);
+    return;
+  }
+
+  // Tier 1c: implicit type (var) — resolve from iterable's container type
+  const rightNode = node.childForFieldName('right');
+  let iterableName: string | undefined;
+  let methodName: string | undefined;
+
+  if (rightNode?.type === 'identifier') {
+    iterableName = rightNode.text;
+  } else if (rightNode?.type === 'member_access_expression') {
+    // C# property access: data.Keys, data.Values → member_access_expression
+    // Also handles bare member access: this.users, repo.users → use property as iterableName
+    const obj = rightNode.childForFieldName('expression');
+    const prop = rightNode.childForFieldName('name');
+    const propText = prop?.type === 'identifier' ? prop.text : undefined;
+    if (propText && KNOWN_CONTAINER_PROPS.has(propText)) {
+      if (obj?.type === 'identifier') {
+        iterableName = obj.text;
+      } else if (obj?.type === 'member_access_expression') {
+        // Nested member access: this.data.Values → obj is "this.data", extract "data"
+        const innerProp = obj.childForFieldName('name');
+        if (innerProp) iterableName = innerProp.text;
+      }
+      methodName = propText;
+    } else if (propText) {
+      // Bare member access: this.users → use property name for scopeEnv lookup
+      iterableName = propText;
+    }
+  } else if (rightNode?.type === 'invocation_expression') {
+    // C# method call: data.Select(...) → invocation_expression > member_access_expression
+    const fn = rightNode.firstNamedChild;
+    if (fn?.type === 'member_access_expression') {
+      const obj = fn.childForFieldName('expression');
+      const prop = fn.childForFieldName('name');
+      if (obj?.type === 'identifier') iterableName = obj.text;
+      if (prop?.type === 'identifier') methodName = prop.text;
+    }
+  }
+  if (!iterableName) return;
+
+  const containerTypeName = scopeEnv.get(iterableName);
+  const typeArgPos = methodToTypeArgPosition(methodName, containerTypeName);
+  const elementType = resolveIterableElementType(
+    iterableName, node, scopeEnv, declarationTypeNodes, scope,
+    extractCSharpElementTypeFromTypeNode, findCSharpParamElementType,
+    typeArgPos,
+  );
+  if (elementType) scopeEnv.set(varName, elementType);
+};
+
+/**
+ * C# pattern binding extractor for `obj is Type variable` (type pattern).
+ *
+ * AST structure:
+ *   is_pattern_expression
+ *     expression: (the variable being tested)
+ *     pattern: declaration_pattern
+ *       type: (the declared type)
+ *       name: single_variable_designation > identifier (the new variable name)
+ *
+ * Conservative: returns undefined when the pattern field is absent, is not a
+ * declaration_pattern, or when the type/name cannot be extracted.
+ * No scopeEnv lookup is needed — the pattern explicitly declares the new variable's type.
+ */
+const extractPatternBinding: PatternBindingExtractor = (node) => {
+  // is_pattern_expression: `obj is User user` — has a declaration_pattern child
+  if (node.type === 'is_pattern_expression') {
+    const pattern = node.childForFieldName('pattern');
+    if (pattern?.type !== 'declaration_pattern' && pattern?.type !== 'recursive_pattern') return undefined;
+    const typeNode = pattern.childForFieldName('type');
+    const nameNode = pattern.childForFieldName('name');
+    if (!typeNode || !nameNode) return undefined;
+    const typeName = extractSimpleTypeName(typeNode);
+    const varName = extractVarName(nameNode);
+    if (!typeName || !varName) return undefined;
+    return { varName, typeName };
+  }
+  // declaration_pattern / recursive_pattern: standalone in switch statements and switch expressions
+  // `case User u:` or `User u =>` or `User { Name: "Alice" } u =>`
+  // Both use the same 'type' and 'name' fields.
+  if (node.type === 'declaration_pattern' || node.type === 'recursive_pattern') {
+    const typeNode = node.childForFieldName('type');
+    const nameNode = node.childForFieldName('name');
+    if (!typeNode || !nameNode) return undefined;
+    const typeName = extractSimpleTypeName(typeNode);
+    const varName = extractVarName(nameNode);
+    if (!typeName || !varName) return undefined;
+    return { varName, typeName };
+  }
+  return undefined;
 };
 
 /** C#: var alias = u → variable_declarator with name + equals_value_clause.
@@ -188,9 +328,11 @@ const extractPendingAssignment: PendingAssignmentExtractor = (node, scopeEnv) =>
 export const typeConfig: LanguageTypeConfig = {
   declarationNodeTypes: DECLARATION_NODE_TYPES,
   forLoopNodeTypes: FOR_LOOP_NODE_TYPES,
+  patternBindingNodeTypes: new Set(['is_pattern_expression', 'declaration_pattern', 'recursive_pattern']),
   extractDeclaration,
   extractParameter,
   scanConstructorBinding,
   extractForLoopBinding,
   extractPendingAssignment,
+  extractPatternBinding,
 };

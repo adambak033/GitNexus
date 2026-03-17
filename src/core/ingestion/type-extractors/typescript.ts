@@ -1,12 +1,13 @@
 import type { SyntaxNode } from '../utils.js';
-import type { LanguageTypeConfig, ParameterExtractor, TypeBindingExtractor, InitializerExtractor, ClassNameLookup, ConstructorBindingScanner, ReturnTypeExtractor, PendingAssignmentExtractor } from './types.js';
-import { extractSimpleTypeName, extractVarName, hasTypeAnnotation, unwrapAwait, extractCalleeName } from './shared.js';
+import type { LanguageTypeConfig, ParameterExtractor, TypeBindingExtractor, InitializerExtractor, ClassNameLookup, ConstructorBindingScanner, ReturnTypeExtractor, PendingAssignmentExtractor, ForLoopExtractor, PatternBindingExtractor } from './types.js';
+import { extractSimpleTypeName, extractVarName, hasTypeAnnotation, unwrapAwait, extractCalleeName, extractElementTypeFromString, extractGenericTypeArgs, resolveIterableElementType, methodToTypeArgPosition, type TypeArgPosition } from './shared.js';
 
 const DECLARATION_NODE_TYPES: ReadonlySet<string> = new Set([
   'lexical_declaration',
   'variable_declaration',
   'function_declaration',   // JSDoc @param on function declarations
   'method_definition',      // JSDoc @param on class methods
+  'public_field_definition', // class field: private users: User[]
 ]);
 
 const normalizeJsDocType = (raw: string): string | undefined => {
@@ -77,6 +78,18 @@ const extractDeclaration: TypeBindingExtractor = (node: SyntaxNode, env: Map<str
     for (const [paramName, typeName] of jsDocParams) {
       if (!env.has(paramName)) env.set(paramName, typeName);
     }
+    return;
+  }
+
+  // Class field: `private users: User[]` — public_field_definition has name + type fields directly.
+  if (node.type === 'public_field_definition') {
+    const nameNode = node.childForFieldName('name');
+    const typeAnnotation = node.childForFieldName('type');
+    if (!nameNode || !typeAnnotation) return;
+    const varName = nameNode.text;
+    if (!varName) return;
+    const typeName = extractSimpleTypeName(typeAnnotation);
+    if (typeName) env.set(varName, typeName);
     return;
   }
 
@@ -191,6 +204,225 @@ const extractReturnType: ReturnTypeExtractor = (node) => {
   return undefined;
 };
 
+const FOR_LOOP_NODE_TYPES: ReadonlySet<string> = new Set([
+  'for_in_statement',
+]);
+
+/** TS function/method node types that carry a parameters list. */
+const TS_FUNCTION_NODE_TYPES = new Set([
+  'function_declaration', 'function_expression', 'arrow_function',
+  'method_definition', 'generator_function', 'generator_function_declaration',
+]);
+
+/**
+ * Extract element type from a TypeScript type annotation AST node.
+ * Handles:
+ *   type_annotation ": User[]"  →  array_type → type_identifier "User"
+ *   type_annotation ": Array<User>"  →  generic_type → extractGenericTypeArgs → "User"
+ * Falls back to text-based extraction via extractElementTypeFromString.
+ */
+const extractTsElementTypeFromAnnotation = (typeAnnotation: SyntaxNode, pos: TypeArgPosition = 'last', depth = 0): string | undefined => {
+  if (depth > 50) return undefined;
+  // Unwrap type_annotation (the node text includes ': ' prefix)
+  const inner = typeAnnotation.type === 'type_annotation'
+    ? (typeAnnotation.firstNamedChild ?? typeAnnotation)
+    : typeAnnotation;
+
+  // readonly User[] — readonly_type wraps array_type: unwrap and recurse
+  if (inner.type === 'readonly_type') {
+    const wrapped = inner.firstNamedChild;
+    if (wrapped) return extractTsElementTypeFromAnnotation(wrapped, pos, depth + 1);
+  }
+
+  // User[] — array_type: first named child is the element type
+  if (inner.type === 'array_type') {
+    const elem = inner.firstNamedChild;
+    if (elem) return extractSimpleTypeName(elem);
+  }
+
+  // Array<User>, Map<string, User> — generic_type
+  // pos determines which type arg: 'first' for keys, 'last' for values
+  if (inner.type === 'generic_type') {
+    const args = extractGenericTypeArgs(inner);
+    if (args.length >= 1) return pos === 'first' ? args[0] : args[args.length - 1];
+  }
+
+  // Fallback: strip ': ' prefix from type_annotation text and use string extraction
+  const rawText = inner.text;
+  return extractElementTypeFromString(rawText, pos);
+};
+
+/**
+ * Search a statement_block (function body) for a variable_declarator named `iterableName`
+ * that has a type annotation, preceding the given `beforeNode`.
+ * Returns the element type from the type annotation, or undefined.
+ */
+const findTsLocalDeclElementType = (
+  iterableName: string,
+  blockNode: SyntaxNode,
+  beforeNode: SyntaxNode,
+  pos: TypeArgPosition = 'last',
+): string | undefined => {
+  for (let i = 0; i < blockNode.namedChildCount; i++) {
+    const stmt = blockNode.namedChild(i);
+    if (!stmt) continue;
+    // Stop when we reach the for-loop itself
+    if (stmt === beforeNode || stmt.startIndex >= beforeNode.startIndex) break;
+    // Look for lexical_declaration or variable_declaration
+    if (stmt.type !== 'lexical_declaration' && stmt.type !== 'variable_declaration') continue;
+    for (let j = 0; j < stmt.namedChildCount; j++) {
+      const decl = stmt.namedChild(j);
+      if (decl?.type !== 'variable_declarator') continue;
+      const nameNode = decl.childForFieldName('name');
+      if (nameNode?.text !== iterableName) continue;
+      const typeAnnotation = decl.childForFieldName('type');
+      if (typeAnnotation) return extractTsElementTypeFromAnnotation(typeAnnotation, pos);
+    }
+  }
+  return undefined;
+};
+
+/**
+ * Walk up the AST from a for-loop node to find the enclosing function scope,
+ * then search (1) its parameter list and (2) local declarations in the body
+ * for a variable named `iterableName` with a container type annotation.
+ * Returns the element type extracted from the annotation, or undefined.
+ */
+const findTsIterableElementType = (iterableName: string, startNode: SyntaxNode, pos: TypeArgPosition = 'last'): string | undefined => {
+  let current: SyntaxNode | null = startNode.parent;
+  // Capture the immediate statement_block parent to search local declarations
+  const blockNode = current?.type === 'statement_block' ? current : null;
+
+  while (current) {
+    if (TS_FUNCTION_NODE_TYPES.has(current.type)) {
+      // Search function parameters
+      const paramsNode = current.childForFieldName('parameters')
+        ?? current.childForFieldName('formal_parameters');
+      if (paramsNode) {
+        for (let i = 0; i < paramsNode.namedChildCount; i++) {
+          const param = paramsNode.namedChild(i);
+          if (!param) continue;
+          const patternNode = param.childForFieldName('pattern') ?? param.childForFieldName('name');
+          if (patternNode?.text === iterableName) {
+            const typeAnnotation = param.childForFieldName('type');
+            if (typeAnnotation) return extractTsElementTypeFromAnnotation(typeAnnotation, pos);
+          }
+        }
+      }
+      // Search local declarations in the function body (statement_block)
+      if (blockNode) {
+        const result = findTsLocalDeclElementType(iterableName, blockNode, startNode, pos);
+        if (result) return result;
+      }
+      break; // stop at the nearest function boundary
+    }
+    current = current.parent;
+  }
+  return undefined;
+};
+
+/**
+ * TypeScript/JavaScript: for (const user of users) where users has a known array type.
+ *
+ * Both `for...of` and `for...in` use the same `for_in_statement` AST node in tree-sitter.
+ * We differentiate by checking for the `of` keyword among the unnamed children.
+ *
+ * Tier 1c: resolves the element type via three strategies in priority order:
+ *   1. declarationTypeNodes — raw type annotation AST node (covers Array<User> from declarations)
+ *   2. scopeEnv string — extractElementTypeFromString on the stored type (covers locally annotated vars)
+ *   3. AST walk — walks up to the enclosing function's parameters to read User[] annotations directly
+ * Only handles `for...of`; `for...in` produces string keys, not element types.
+ */
+const extractForLoopBinding: ForLoopExtractor = (
+  node: SyntaxNode,
+  scopeEnv: Map<string, string>,
+  declarationTypeNodes: ReadonlyMap<string, SyntaxNode>,
+  scope: string,
+): void => {
+  if (node.type !== 'for_in_statement') return;
+
+  // Confirm this is `for...of`, not `for...in`, by scanning unnamed children for the keyword text.
+  let isForOf = false;
+  for (let i = 0; i < node.childCount; i++) {
+    const child = node.child(i);
+    if (child && !child.isNamed && child.text === 'of') {
+      isForOf = true;
+      break;
+    }
+  }
+  if (!isForOf) return;
+
+  // The iterable is the `right` field — may be identifier or call_expression.
+  const rightNode = node.childForFieldName('right');
+  let iterableName: string | undefined;
+  let methodName: string | undefined;
+  if (rightNode?.type === 'identifier') {
+    iterableName = rightNode.text;
+  } else if (rightNode?.type === 'member_expression') {
+    const prop = rightNode.childForFieldName('property');
+    if (prop) iterableName = prop.text;
+  } else if (rightNode?.type === 'call_expression') {
+    // entries.values() → call_expression > function: member_expression > object + property
+    // this.repos.values() → nested member_expression: extract property from inner member
+    const fn = rightNode.childForFieldName('function');
+    if (fn?.type === 'member_expression') {
+      const obj = fn.childForFieldName('object');
+      const prop = fn.childForFieldName('property');
+      if (obj?.type === 'identifier') {
+        iterableName = obj.text;
+      } else if (obj?.type === 'member_expression') {
+        // this.repos.values() → obj = this.repos → extract 'repos'
+        const innerProp = obj.childForFieldName('property');
+        if (innerProp) iterableName = innerProp.text;
+      }
+      if (prop?.type === 'property_identifier') methodName = prop.text;
+    }
+  }
+  if (!iterableName) return;
+
+  // Look up the container's base type name for descriptor-aware resolution
+  const containerTypeName = scopeEnv.get(iterableName);
+  const typeArgPos = methodToTypeArgPosition(methodName, containerTypeName);
+  const elementType = resolveIterableElementType(
+    iterableName, node, scopeEnv, declarationTypeNodes, scope,
+    extractTsElementTypeFromAnnotation, findTsIterableElementType,
+    typeArgPos,
+  );
+  if (!elementType) return;
+
+  // The loop variable is the `left` field.
+  const leftNode = node.childForFieldName('left');
+  if (!leftNode) return;
+
+  // Handle destructured for-of: for (const [k, v] of entries)
+  // AST: left = array_pattern directly (no variable_declarator wrapper)
+  // Bind the LAST identifier to the element type (value in [key, value] patterns)
+  if (leftNode.type === 'array_pattern') {
+    const lastChild = leftNode.lastNamedChild;
+    if (lastChild?.type === 'identifier') {
+      scopeEnv.set(lastChild.text, elementType);
+    }
+    return;
+  }
+
+  if (leftNode.type === 'object_pattern') {
+    // Object destructuring (e.g., `for (const { id } of users)`) destructures
+    // into fields of the element type. Without field-level resolution, we cannot
+    // bind individual properties to their correct types. Skip to avoid false bindings.
+    return;
+  }
+
+  let loopVarNode: SyntaxNode | null = leftNode;
+  // `const user` parses as: left → variable_declarator containing an identifier named `user`
+  if (loopVarNode.type === 'variable_declarator') {
+    loopVarNode = loopVarNode.childForFieldName('name') ?? loopVarNode.firstNamedChild;
+  }
+  if (!loopVarNode) return;
+
+  const loopVarName = extractVarName(loopVarNode);
+  if (loopVarName) scopeEnv.set(loopVarName, elementType);
+};
+
 /** TS/JS: const alias = u → variable_declarator with name/value fields */
 const extractPendingAssignment: PendingAssignmentExtractor = (node, scopeEnv) => {
   for (let i = 0; i < node.namedChildCount; i++) {
@@ -206,12 +438,31 @@ const extractPendingAssignment: PendingAssignmentExtractor = (node, scopeEnv) =>
   return undefined;
 };
 
+/** TS instanceof narrowing: `x instanceof User` → bind x to User.
+ *  Only works when x has no prior type binding (e.g. x: unknown, untyped params).
+ *  Typed params (x: Animal) are blocked by the !scopeEnv.has() guard in buildTypeEnv.
+ *  Uses first-writer-wins, same as Rust match arm bindings. */
+const extractPatternBinding: PatternBindingExtractor = (node) => {
+  if (node.type !== 'binary_expression') return undefined;
+  const op = node.children.find(c => !c.isNamed && c.text === 'instanceof');
+  if (!op) return undefined;
+  // binary_expression children are positional — no left/right fields
+  const left = node.namedChild(0);
+  const right = node.namedChild(1);
+  if (left?.type !== 'identifier' || right?.type !== 'identifier') return undefined;
+  return { varName: left.text, typeName: right.text };
+};
+
 export const typeConfig: LanguageTypeConfig = {
   declarationNodeTypes: DECLARATION_NODE_TYPES,
+  forLoopNodeTypes: FOR_LOOP_NODE_TYPES,
+  patternBindingNodeTypes: new Set(['binary_expression']),
   extractDeclaration,
   extractParameter,
   extractInitializer,
   scanConstructorBinding,
   extractReturnType,
+  extractForLoopBinding,
   extractPendingAssignment,
+  extractPatternBinding,
 };

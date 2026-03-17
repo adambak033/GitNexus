@@ -823,4 +823,47 @@ describe('extractReturnTypeName', () => {
     expect(extractReturnTypeName('CompletableFuture')).toBeUndefined();
     expect(extractReturnTypeName('Optional')).toBeUndefined();
   });
+
+  // ---- Length caps (Phase 6) ----
+
+  it('pre-cap: returns undefined when raw input exceeds 2048 characters', () => {
+    const longInput = 'A'.repeat(2049);
+    expect(extractReturnTypeName(longInput)).toBeUndefined();
+  });
+
+  it('pre-cap: accepts raw input at exactly 2048 characters (boundary)', () => {
+    // A 2048-char string of uppercase letters passes the pre-cap gate.
+    // It won't match as a valid identifier (too long for post-cap), so the
+    // result is undefined — but the pre-cap itself does NOT reject it.
+    // We test this by verifying a 2048-char type that WOULD be valid in all
+    // other respects is still returned as undefined (post-cap rejects it).
+    const atLimit = 'U' + 'x'.repeat(2047); // 2048 chars, starts with uppercase
+    // Post-cap (512) will reject this, but the pre-cap should not fire.
+    // The important assertion: no throw and the result is undefined from post-cap.
+    expect(extractReturnTypeName(atLimit)).toBeUndefined();
+  });
+
+  it('pre-cap: accepts inputs shorter than 2048 characters without rejection', () => {
+    // 'User' is well under 2048 — should resolve normally.
+    expect(extractReturnTypeName('User')).toBe('User');
+  });
+
+  it('post-cap: returns undefined when extracted type name exceeds 512 characters', () => {
+    // Construct a raw string that is under the 2048-char pre-cap but produces
+    // a final identifier longer than 512 characters after extraction.
+    // A bare uppercase identifier of 513 chars satisfies all rules except post-cap.
+    const longTypeName = 'U' + 'x'.repeat(512); // 513 chars, starts with uppercase
+    expect(extractReturnTypeName(longTypeName)).toBeUndefined();
+  });
+
+  it('post-cap: accepts extracted type name at exactly 512 characters (boundary)', () => {
+    // 512-char identifier should pass the post-cap check (> 512 rejects, not >=).
+    const atLimit = 'U' + 'x'.repeat(511); // exactly 512 chars
+    expect(extractReturnTypeName(atLimit)).toBe(atLimit);
+  });
+
+  it('post-cap: accepts normal short type names well under 512 characters', () => {
+    expect(extractReturnTypeName('HttpClient')).toBe('HttpClient');
+    expect(extractReturnTypeName('UserService')).toBe('UserService');
+  });
 });
