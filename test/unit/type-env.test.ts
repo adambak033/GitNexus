@@ -3526,4 +3526,65 @@ fn process(opt: Option<User>) {
     });
   });
 
+  describe('performance optimizations — coverage for new code paths', () => {
+    it('fastStripNullable: passes through simple identifier without stripping', () => {
+      const tree = parse('function f(user: User) { user.save(); }', TypeScript.typescript);
+      const typeEnv = buildTypeEnv(tree, 'typescript');
+      // lookup exercises fastStripNullable — "User" has no | or ? markers
+      const callNode = tree.rootNode.descendantForIndex(tree.rootNode.text.indexOf('save'));
+      expect(typeEnv.lookup('user', callNode)).toBe('User');
+    });
+
+    it('fastStripNullable: strips nullable union type via full stripNullable', () => {
+      const tree = parse('function f(user: User | null) { user.save(); }', TypeScript.typescript);
+      const typeEnv = buildTypeEnv(tree, 'typescript');
+      const callNode = tree.rootNode.descendantForIndex(tree.rootNode.text.indexOf('save'));
+      expect(typeEnv.lookup('user', callNode)).toBe('User');
+    });
+
+    it('fastStripNullable: rejects bare nullable keyword', () => {
+      const tree = parse('function f(x: null) { x.save(); }', TypeScript.typescript);
+      const typeEnv = buildTypeEnv(tree, 'typescript');
+      const callNode = tree.rootNode.descendantForIndex(tree.rootNode.text.indexOf('save'));
+      expect(typeEnv.lookup('x', callNode)).toBeUndefined();
+    });
+
+    it('fastStripNullable: strips optional type suffix', () => {
+      const tree = parse(`
+class Foo {
+    process(user: User) {
+        user.save();
+    }
+}
+      `, TypeScript.typescript);
+      const typeEnv = buildTypeEnv(tree, 'typescript');
+      const callNode = tree.rootNode.descendantForIndex(tree.rootNode.text.indexOf('save'));
+      expect(typeEnv.lookup('user', callNode)).toBe('User');
+    });
+
+    it('SKIP_SUBTREE_TYPES: string literal subtrees do not affect type extraction', () => {
+      const tree = parse(`
+function f(user: User) {
+    const msg = "hello world this is a long string";
+    user.save();
+}
+      `, TypeScript.typescript);
+      const { env } = buildTypeEnv(tree, 'typescript');
+      expect(flatGet(env, 'user')).toBe('User');
+    });
+
+    it('interestingNodeTypes: non-declaration nodes skip extractTypeBinding', () => {
+      // Large code with many non-interesting nodes (binary expressions, calls, etc.)
+      const tree = parse(`
+function calculate(service: Service) {
+    const a = 1 + 2 + 3;
+    const b = true && false;
+    if (a > b) { service.run(); }
+}
+      `, TypeScript.typescript);
+      const { env } = buildTypeEnv(tree, 'typescript');
+      expect(flatGet(env, 'service')).toBe('Service');
+    });
+  });
+
 });

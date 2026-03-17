@@ -9,6 +9,39 @@ import {
 } from './helpers.js';
 
 // ---------------------------------------------------------------------------
+// skipGraphPhases: verify pipeline works correctly when graph phases are skipped
+// ---------------------------------------------------------------------------
+
+describe('Pipeline skipGraphPhases option', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'javascript-self-this-resolution'),
+      () => {},
+      { skipGraphPhases: true },
+    );
+  }, 60000);
+
+  it('produces graph nodes without community/process phases', () => {
+    expect(getNodesByLabel(result, 'Class').length).toBeGreaterThan(0);
+  });
+
+  it('still resolves CALLS edges correctly', () => {
+    const calls = getRelationships(result, 'CALLS');
+    expect(calls.length).toBeGreaterThan(0);
+  });
+
+  it('omits communityResult when skipGraphPhases is true', () => {
+    expect(result.communityResult).toBeUndefined();
+  });
+
+  it('omits processResult when skipGraphPhases is true', () => {
+    expect(result.processResult).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // this.save() resolves to enclosing class's own save method
 // ---------------------------------------------------------------------------
 
