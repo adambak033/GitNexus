@@ -36,8 +36,8 @@ import {
   inferCallForm,
   extractReceiverName,
   extractReceiverNode,
-  CALL_EXPRESSION_TYPES,
-  extractCallChain,
+  extractMixedChain,
+  type MixedChainStep,
 } from '../utils.js';
 import { buildTypeEnv } from '../type-env.js';
 import type { ConstructorBinding } from '../type-env.js';
@@ -48,6 +48,8 @@ import { generateId } from '../../../lib/utils.js';
 import { extractNamedBindings } from '../named-binding-extraction.js';
 import { appendKotlinWildcard } from '../resolvers/index.js';
 import { callRouters } from '../call-routing.js';
+import { extractPropertyDeclaredType } from '../type-extractors/shared.js';
+import type { NodeLabel } from '../../graph/types.js';
 
 // ============================================================================
 // Types for serializable results
@@ -75,7 +77,7 @@ interface ParsedRelationship {
   id: string;
   sourceId: string;
   targetId: string;
-  type: 'DEFINES' | 'HAS_METHOD';
+  type: 'DEFINES' | 'HAS_METHOD' | 'HAS_PROPERTY';
   confidence: number;
   reason: string;
 }
@@ -84,9 +86,10 @@ interface ParsedSymbol {
   filePath: string;
   name: string;
   nodeId: string;
-  type: string;
+  type: NodeLabel;
   parameterCount?: number;
   returnType?: string;
+  declaredType?: string;
   ownerId?: string;
 }
 
@@ -111,13 +114,14 @@ export interface ExtractedCall {
   /** Resolved type name of the receiver (e.g., 'User' for user.save() when user: User) */
   receiverTypeName?: string;
   /**
-   * Chained call names when the receiver is itself a call expression.
-   * For `svc.getUser().save()`, the `save` ExtractedCall gets receiverCallChain = ['getUser']
-   * with receiverName = 'svc'.  The chain is ordered outermost-last, e.g.:
-   *   `a.b().c().d()` → calledName='d', receiverCallChain=['b','c'], receiverName='a'
+   * Unified mixed chain when the receiver is a chain of field accesses and/or method calls.
+   * Steps are ordered base-first (innermost to outermost). Examples:
+   *   `svc.getUser().save()`        → chain=[{kind:'call',name:'getUser'}], receiverName='svc'
+   *   `user.address.save()`         → chain=[{kind:'field',name:'address'}], receiverName='user'
+   *   `svc.getUser().address.save()` → chain=[{kind:'call',name:'getUser'},{kind:'field',name:'address'}]
    * Length is capped at MAX_CHAIN_DEPTH (3).
    */
-  receiverCallChain?: string[];
+  receiverMixedChain?: MixedChainStep[];
 }
 
 export interface ExtractedHeritage {
@@ -233,7 +237,7 @@ const findEnclosingFunctionId = (node: any, filePath: string): string | null => 
 // Label detection from capture map
 // ============================================================================
 
-const getLabelFromCaptures = (captureMap: Record<string, any>): string | null => {
+const getLabelFromCaptures = (captureMap: Record<string, any>): NodeLabel | null => {
   // Skip imports (handled separately) and calls
   if (captureMap['import'] || captureMap['call']) return null;
   if (!captureMap['name']) return null;
@@ -965,6 +969,7 @@ const processFileGroup = (
                   nodeId,
                   type: 'Property',
                   ...(propEnclosingClassId ? { ownerId: propEnclosingClassId } : {}),
+                  ...(item.declaredType ? { declaredType: item.declaredType } : {}),
                 });
                 const fileId = generateId('File', file.path);
                 const relId = generateId('DEFINES', `${fileId}->${nodeId}`);
@@ -978,10 +983,10 @@ const processFileGroup = (
                 });
                 if (propEnclosingClassId) {
                   result.relationships.push({
-                    id: generateId('HAS_METHOD', `${propEnclosingClassId}->${nodeId}`),
+                    id: generateId('HAS_PROPERTY', `${propEnclosingClassId}->${nodeId}`),
                     sourceId: propEnclosingClassId,
                     targetId: nodeId,
-                    type: 'HAS_METHOD',
+                    type: 'HAS_PROPERTY',
                     confidence: 1.0,
                     reason: '',
                   });
@@ -1000,27 +1005,20 @@ const processFileGroup = (
             const callForm = inferCallForm(callNode, callNameNode);
             let receiverName = callForm === 'member' ? extractReceiverName(callNameNode) : undefined;
             let receiverTypeName = receiverName ? typeEnv.lookup(receiverName, callNode) : undefined;
-            let receiverCallChain: string[] | undefined;
+            let receiverMixedChain: MixedChainStep[] | undefined;
 
-            // When the receiver is a call_expression (e.g. svc.getUser().save()),
-            // extractReceiverName returns undefined because it refuses complex expressions.
-            // Instead, walk the receiver node to build a call chain for deferred resolution.
-            // We capture the base receiver name so processCallsFromExtracted can look it up
-            // from constructor bindings. receiverTypeName is intentionally left unset here —
-            // the chain resolver in processCallsFromExtracted needs the base type as input and
-            // produces the final receiver type as output.
+            // When the receiver is a complex expression (call chain, field chain, or mixed),
+            // extractReceiverName returns undefined. Walk the receiver node to build a unified
+            // mixed chain for deferred resolution in processCallsFromExtracted.
             if (callForm === 'member' && receiverName === undefined && !receiverTypeName) {
               const receiverNode = extractReceiverNode(callNameNode);
-              if (receiverNode && CALL_EXPRESSION_TYPES.has(receiverNode.type)) {
-                const extracted = extractCallChain(receiverNode);
-                if (extracted) {
-                  receiverCallChain = extracted.chain;
-                  // Set receiverName to the base object so Step 1 in processCallsFromExtracted
-                  // can resolve it via constructor bindings to a base type for the chain.
+              if (receiverNode) {
+                const extracted = extractMixedChain(receiverNode);
+                if (extracted && extracted.chain.length > 0) {
+                  receiverMixedChain = extracted.chain;
                   receiverName = extracted.baseReceiverName;
-                  // Also try the type environment immediately (covers explicitly-typed locals
-                  // and annotated parameters like `fn process(svc: &UserService)`).
-                  // This sets a base type that chain resolution (Step 2) will use as input.
+                  // Try the type environment immediately for the base receiver
+                  // (covers explicitly-typed locals and annotated parameters).
                   if (receiverName) {
                     receiverTypeName = typeEnv.lookup(receiverName, callNode);
                   }
@@ -1036,7 +1034,7 @@ const processFileGroup = (
               ...(callForm !== undefined ? { callForm } : {}),
               ...(receiverName !== undefined ? { receiverName } : {}),
               ...(receiverTypeName !== undefined ? { receiverTypeName } : {}),
-              ...(receiverCallChain !== undefined ? { receiverCallChain } : {}),
+              ...(receiverMixedChain !== undefined ? { receiverMixedChain } : {}),
             });
           }
         }
@@ -1086,6 +1084,23 @@ const processFileGroup = (
       const nodeLabel = getLabelFromCaptures(captureMap);
       if (!nodeLabel) continue;
 
+      // C/C++: @definition.function is broad and also matches inline class methods (inside
+      // a class/struct body). Those are already captured by @definition.method, so skip
+      // the duplicate Function entry to prevent double-indexing in globalIndex.
+      if (
+        (language === SupportedLanguages.CPlusPlus || language === SupportedLanguages.C) &&
+        nodeLabel === 'Function'
+      ) {
+        let ancestor = captureMap['definition.function']?.parent;
+        while (ancestor) {
+          if (ancestor.type === 'class_specifier' || ancestor.type === 'struct_specifier') {
+            break; // inside a class body — duplicate of @definition.method
+          }
+          ancestor = ancestor.parent;
+        }
+        if (ancestor) continue; // found a class/struct ancestor → skip
+      }
+
       const nameNode = captureMap['name'];
       // Synthesize name for constructors without explicit @name capture (e.g. Swift init)
       if (!nameNode && nodeLabel !== 'Constructor') continue;
@@ -1109,6 +1124,7 @@ const processFileGroup = (
 
       let parameterCount: number | undefined;
       let returnType: string | undefined;
+      let declaredType: string | undefined;
       if (nodeLabel === 'Function' || nodeLabel === 'Method' || nodeLabel === 'Constructor') {
         const sig = extractMethodSignature(definitionNode);
         parameterCount = sig.parameterCount;
@@ -1123,6 +1139,10 @@ const processFileGroup = (
             if (docReturn) returnType = docReturn;
           }
         }
+      } else if (nodeLabel === 'Property' && definitionNode) {
+        // Extract the declared type for property/field nodes.
+        // Walk the definition node for type annotation children.
+        declaredType = extractPropertyDeclaredType(definitionNode);
       }
 
       result.nodes.push({
@@ -1157,6 +1177,7 @@ const processFileGroup = (
         type: nodeLabel,
         ...(parameterCount !== undefined ? { parameterCount } : {}),
         ...(returnType !== undefined ? { returnType } : {}),
+        ...(declaredType !== undefined ? { declaredType } : {}),
         ...(enclosingClassId ? { ownerId: enclosingClassId } : {}),
       });
 
@@ -1171,13 +1192,14 @@ const processFileGroup = (
         reason: '',
       });
 
-      // ── HAS_METHOD: link method/constructor/property to enclosing class ──
+      // ── HAS_METHOD / HAS_PROPERTY: link member to enclosing class ──
       if (enclosingClassId) {
+        const memberEdgeType = nodeLabel === 'Property' ? 'HAS_PROPERTY' : 'HAS_METHOD';
         result.relationships.push({
-          id: generateId('HAS_METHOD', `${enclosingClassId}->${nodeId}`),
+          id: generateId(memberEdgeType, `${enclosingClassId}->${nodeId}`),
           sourceId: enclosingClassId,
           targetId: nodeId,
-          type: 'HAS_METHOD',
+          type: memberEdgeType,
           confidence: 1.0,
           reason: '',
         });

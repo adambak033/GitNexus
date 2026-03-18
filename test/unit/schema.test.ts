@@ -122,11 +122,11 @@ describe('LadybugDB Schema', () => {
 
     it('has all FROM/TO pairs needed for HAS_METHOD edges', () => {
       // HAS_METHOD sources: Class, Interface, Struct, Trait, Impl, Record
-      // HAS_METHOD targets: Method, Constructor, Property
+      // HAS_METHOD targets: Method, Constructor (Property is now HAS_PROPERTY)
       const sources = ['Class', 'Interface'];
       const backtickSources = ['Struct', 'Trait', 'Impl', 'Record'];
       const targets = ['Method'];
-      const backtickTargets = ['Constructor', 'Property'];
+      const backtickTargets = ['Constructor'];
 
       // Non-backtick source → non-backtick target
       for (const src of sources) {

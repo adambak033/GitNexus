@@ -1,14 +1,16 @@
-import { KnowledgeGraph, GraphNode, GraphRelationship } from '../graph/types.js';
+import { KnowledgeGraph, GraphNode, GraphRelationship, type NodeLabel } from '../graph/types.js';
 import Parser from 'tree-sitter';
 import { loadParser, loadLanguage, isLanguageAvailable } from '../tree-sitter/parser-loader.js';
 import { LANGUAGE_QUERIES } from './tree-sitter-queries.js';
 import { generateId } from '../../lib/utils.js';
 import { SymbolTable } from './symbol-table.js';
 import { ASTCache } from './ast-cache.js';
-import { getLanguageFromFilename, yieldToEventLoop, DEFINITION_CAPTURE_KEYS, getDefinitionNodeFromCaptures, findEnclosingClassId, extractMethodSignature } from './utils.js';
+import { getLanguageFromFilename, yieldToEventLoop, getDefinitionNodeFromCaptures, findEnclosingClassId, extractMethodSignature } from './utils.js';
+import { extractPropertyDeclaredType } from './type-extractors/shared.js';
 import { isNodeExported } from './export-detection.js';
 import { detectFrameworkFromAST } from './framework-detection.js';
 import { typeConfigs } from './type-extractors/index.js';
+import { SupportedLanguages } from '../../config/supported-languages.js';
 import { WorkerPool } from './workers/worker-pool.js';
 import type { ParseWorkerResult, ParseWorkerInput, ExtractedImport, ExtractedCall, ExtractedHeritage, ExtractedRoute, FileConstructorBindings } from './workers/parse-worker.js';
 import { getTreeSitterBufferSize, TREE_SITTER_MAX_BUFFER } from './constants.js';
@@ -81,6 +83,7 @@ const processParsingWithWorkers = async (
       symbolTable.add(sym.filePath, sym.name, sym.nodeId, sym.type, {
         parameterCount: sym.parameterCount,
         returnType: sym.returnType,
+        declaredType: sym.declaredType,
         ownerId: sym.ownerId,
       });
     }
@@ -198,9 +201,24 @@ const processParsingSequential = async (
       if (!nameNode && !captureMap['definition.constructor']) return;
       const nodeName = nameNode ? nameNode.text : 'init';
 
-      let nodeLabel = 'CodeElement';
+      let nodeLabel: NodeLabel = 'CodeElement';
 
-      if (captureMap['definition.function']) nodeLabel = 'Function';
+      if (captureMap['definition.function']) {
+        // C/C++: @definition.function is broad and also matches inline class methods (inside
+        // a class/struct body). Those are already captured by @definition.method, so skip
+        // the duplicate Function entry to prevent double-indexing in globalIndex.
+        if (language === SupportedLanguages.CPlusPlus || language === SupportedLanguages.C) {
+          let ancestor = captureMap['definition.function']?.parent;
+          while (ancestor) {
+            if (ancestor.type === 'class_specifier' || ancestor.type === 'struct_specifier') {
+              break;
+            }
+            ancestor = ancestor.parent;
+          }
+          if (ancestor) return; // inside a class body — handled by @definition.method
+        }
+        nodeLabel = 'Function';
+      }
       else if (captureMap['definition.class']) nodeLabel = 'Class';
       else if (captureMap['definition.interface']) nodeLabel = 'Interface';
       else if (captureMap['definition.method']) nodeLabel = 'Method';
@@ -275,9 +293,15 @@ const processParsingSequential = async (
       const needsOwner = nodeLabel === 'Method' || nodeLabel === 'Constructor' || nodeLabel === 'Property' || nodeLabel === 'Function';
       const enclosingClassId = needsOwner ? findEnclosingClassId(nameNode || definitionNodeForRange, file.path) : null;
 
+      // Extract declared type for Property nodes (field/property type annotations)
+      const declaredType = (nodeLabel === 'Property' && definitionNode)
+        ? extractPropertyDeclaredType(definitionNode)
+        : undefined;
+
       symbolTable.add(file.path, nodeName, nodeId, nodeLabel, {
         parameterCount: methodSig?.parameterCount,
         returnType: methodSig?.returnType,
+        declaredType,
         ownerId: enclosingClassId ?? undefined,
       });
 
@@ -296,13 +320,14 @@ const processParsingSequential = async (
 
       graph.addRelationship(relationship);
 
-      // ── HAS_METHOD: link method/constructor/property to enclosing class ──
+      // ── HAS_METHOD / HAS_PROPERTY: link member to enclosing class ──
       if (enclosingClassId) {
+        const memberEdgeType = nodeLabel === 'Property' ? 'HAS_PROPERTY' : 'HAS_METHOD';
         graph.addRelationship({
-          id: generateId('HAS_METHOD', `${enclosingClassId}->${nodeId}`),
+          id: generateId(memberEdgeType, `${enclosingClassId}->${nodeId}`),
           sourceId: enclosingClassId,
           targetId: nodeId,
-          type: 'HAS_METHOD',
+          type: memberEdgeType,
           confidence: 1.0,
           reason: '',
         });

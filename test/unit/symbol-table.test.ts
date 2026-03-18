@@ -137,14 +137,187 @@ describe('SymbolTable', () => {
     });
   });
 
+  describe('declaredType metadata', () => {
+    it('stores declaredType in SymbolDefinition', () => {
+      table.add('src/models.ts', 'address', 'prop:address', 'Property', {
+        declaredType: 'Address',
+        ownerId: 'class:User',
+      });
+      const def = table.lookupExactFull('src/models.ts', 'address');
+      expect(def).toBeDefined();
+      expect(def!.declaredType).toBe('Address');
+    });
+
+    it('omits declaredType when not provided', () => {
+      table.add('src/models.ts', 'name', 'prop:name', 'Property', { ownerId: 'class:User' });
+      const def = table.lookupExactFull('src/models.ts', 'name');
+      expect(def).toBeDefined();
+      expect(def!.declaredType).toBeUndefined();
+    });
+  });
+
+  describe('Property exclusion from globalIndex', () => {
+    it('Property with ownerId is NOT added to globalIndex', () => {
+      table.add('src/models.ts', 'name', 'prop:name', 'Property', {
+        declaredType: 'string',
+        ownerId: 'class:User',
+      });
+      // Should not appear in fuzzy lookup
+      expect(table.lookupFuzzy('name')).toEqual([]);
+      // But should still be in fileIndex
+      expect(table.lookupExact('src/models.ts', 'name')).toBe('prop:name');
+    });
+
+    it('Property without ownerId IS added to globalIndex', () => {
+      table.add('src/models.ts', 'name', 'prop:name', 'Property');
+      expect(table.lookupFuzzy('name')).toHaveLength(1);
+    });
+
+    it('Property without declaredType is still added to fieldByOwner index only (not globalIndex)', () => {
+      table.add('src/models.ts', 'name', 'prop:name', 'Property', { ownerId: 'class:User' });
+      // No declaredType → not in fieldByOwner, but still excluded from globalIndex
+      expect(table.lookupFuzzy('name')).toEqual([]);
+      expect(table.lookupFieldByOwner('class:User', 'name')).toBeUndefined();
+    });
+
+    it('non-Property types are always added to globalIndex', () => {
+      table.add('src/models.ts', 'save', 'method:save', 'Method', { ownerId: 'class:User' });
+      expect(table.lookupFuzzy('save')).toHaveLength(1);
+    });
+  });
+
+  describe('conditional callableIndex invalidation', () => {
+    it('adding a Function invalidates callableIndex', () => {
+      table.add('src/a.ts', 'foo', 'func:foo', 'Function', { returnType: 'void' });
+      // First call builds the index
+      expect(table.lookupFuzzyCallable('foo')).toHaveLength(1);
+      // Add another callable — should invalidate and rebuild
+      table.add('src/a.ts', 'bar', 'func:bar', 'Method');
+      expect(table.lookupFuzzyCallable('bar')).toHaveLength(1);
+    });
+
+    it('adding a Property does NOT invalidate callableIndex', () => {
+      table.add('src/a.ts', 'foo', 'func:foo', 'Function');
+      // Build callable index
+      expect(table.lookupFuzzyCallable('foo')).toHaveLength(1);
+      // Add a Property — callable index should still be valid (foo still found)
+      table.add('src/models.ts', 'name', 'prop:name', 'Property', {
+        declaredType: 'string',
+        ownerId: 'class:User',
+      });
+      expect(table.lookupFuzzyCallable('foo')).toHaveLength(1);
+    });
+
+    it('adding a Class does NOT invalidate callableIndex', () => {
+      table.add('src/a.ts', 'foo', 'func:foo', 'Function');
+      expect(table.lookupFuzzyCallable('foo')).toHaveLength(1);
+      table.add('src/models.ts', 'User', 'class:User', 'Class');
+      // Class is not callable, should not trigger rebuild
+      expect(table.lookupFuzzyCallable('foo')).toHaveLength(1);
+    });
+  });
+
+  describe('lookupFieldByOwner', () => {
+    it('finds a Property by ownerNodeId and fieldName', () => {
+      table.add('src/models.ts', 'address', 'prop:address', 'Property', {
+        declaredType: 'Address',
+        ownerId: 'class:User',
+      });
+      const def = table.lookupFieldByOwner('class:User', 'address');
+      expect(def).toBeDefined();
+      expect(def!.declaredType).toBe('Address');
+      expect(def!.nodeId).toBe('prop:address');
+    });
+
+    it('returns undefined for unknown owner', () => {
+      table.add('src/models.ts', 'address', 'prop:address', 'Property', {
+        declaredType: 'Address',
+        ownerId: 'class:User',
+      });
+      expect(table.lookupFieldByOwner('class:Unknown', 'address')).toBeUndefined();
+    });
+
+    it('returns undefined for unknown field name', () => {
+      table.add('src/models.ts', 'address', 'prop:address', 'Property', {
+        declaredType: 'Address',
+        ownerId: 'class:User',
+      });
+      expect(table.lookupFieldByOwner('class:User', 'email')).toBeUndefined();
+    });
+
+    it('returns undefined for empty table', () => {
+      expect(table.lookupFieldByOwner('class:User', 'name')).toBeUndefined();
+    });
+
+    it('does not index Property without declaredType', () => {
+      table.add('src/models.ts', 'name', 'prop:name', 'Property', { ownerId: 'class:User' });
+      expect(table.lookupFieldByOwner('class:User', 'name')).toBeUndefined();
+    });
+
+    it('distinguishes fields by owner', () => {
+      table.add('src/models.ts', 'name', 'prop:user:name', 'Property', {
+        declaredType: 'string',
+        ownerId: 'class:User',
+      });
+      table.add('src/models.ts', 'name', 'prop:repo:name', 'Property', {
+        declaredType: 'RepoName',
+        ownerId: 'class:Repo',
+      });
+      expect(table.lookupFieldByOwner('class:User', 'name')!.declaredType).toBe('string');
+      expect(table.lookupFieldByOwner('class:Repo', 'name')!.declaredType).toBe('RepoName');
+    });
+  });
+
+  describe('lookupFuzzyCallable', () => {
+    it('returns only callable types (Function, Method, Constructor)', () => {
+      table.add('src/a.ts', 'foo', 'func:foo', 'Function');
+      table.add('src/a.ts', 'bar', 'method:bar', 'Method');
+      table.add('src/a.ts', 'Baz', 'ctor:Baz', 'Constructor');
+      table.add('src/a.ts', 'User', 'class:User', 'Class');
+      table.add('src/a.ts', 'IUser', 'iface:IUser', 'Interface');
+      expect(table.lookupFuzzyCallable('foo')).toHaveLength(1);
+      expect(table.lookupFuzzyCallable('bar')).toHaveLength(1);
+      expect(table.lookupFuzzyCallable('Baz')).toHaveLength(1);
+      expect(table.lookupFuzzyCallable('User')).toEqual([]);
+      expect(table.lookupFuzzyCallable('IUser')).toEqual([]);
+    });
+
+    it('returns empty array for unknown name', () => {
+      table.add('src/a.ts', 'foo', 'func:foo', 'Function');
+      expect(table.lookupFuzzyCallable('unknown')).toEqual([]);
+    });
+
+    it('rebuilds index after adding new callable', () => {
+      table.add('src/a.ts', 'foo', 'func:foo', 'Function');
+      expect(table.lookupFuzzyCallable('foo')).toHaveLength(1);
+      expect(table.lookupFuzzyCallable('bar')).toEqual([]);
+      table.add('src/a.ts', 'bar', 'func:bar', 'Function');
+      expect(table.lookupFuzzyCallable('bar')).toHaveLength(1);
+    });
+
+    it('filters non-callable types from mixed name entries', () => {
+      table.add('src/a.ts', 'save', 'func:save', 'Function');
+      table.add('src/b.ts', 'save', 'class:save', 'Class');
+      const callables = table.lookupFuzzyCallable('save');
+      expect(callables).toHaveLength(1);
+      expect(callables[0].type).toBe('Function');
+    });
+  });
+
   describe('clear', () => {
-    it('resets all state', () => {
+    it('resets all state including fieldByOwner', () => {
       table.add('src/a.ts', 'foo', 'func:foo', 'Function');
       table.add('src/b.ts', 'bar', 'func:bar', 'Function');
+      table.add('src/models.ts', 'address', 'prop:address', 'Property', {
+        declaredType: 'Address',
+        ownerId: 'class:User',
+      });
       table.clear();
       expect(table.getStats()).toEqual({ fileCount: 0, globalSymbolCount: 0 });
       expect(table.lookupExact('src/a.ts', 'foo')).toBeUndefined();
       expect(table.lookupFuzzy('foo')).toEqual([]);
+      expect(table.lookupFieldByOwner('class:User', 'address')).toBeUndefined();
+      expect(table.lookupFuzzyCallable('foo')).toEqual([]);
     });
 
     it('allows re-adding after clear', () => {

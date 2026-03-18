@@ -62,6 +62,19 @@ export const TYPESCRIPT_QUERIES = `
 (new_expression
   constructor: (identifier) @call.name) @call
 
+; Class properties — public_field_definition covers most TS class fields
+(public_field_definition
+  name: (property_identifier) @name) @definition.property
+
+; Private class fields: #address: Address
+(public_field_definition
+  name: (private_property_identifier) @name) @definition.property
+
+; Constructor parameter properties: constructor(public address: Address)
+(required_parameter
+  (accessibility_modifier)
+  pattern: (identifier) @name) @definition.property
+
 ; Heritage queries - class extends
 (class_declaration
   name: (type_identifier) @heritage.class
@@ -128,6 +141,10 @@ export const JAVASCRIPT_QUERIES = `
 (new_expression
   constructor: (identifier) @call.name) @call
 
+; Class fields — field_definition captures JS class fields (class User { address = ... })
+(field_definition
+  property: (property_identifier) @name) @definition.property
+
 ; Heritage queries - class extends (JavaScript uses different AST than TypeScript)
 ; In tree-sitter-javascript, class_heritage directly contains the parent identifier
 (class_declaration
@@ -160,6 +177,14 @@ export const PYTHON_QUERIES = `
   function: (attribute
     attribute: (identifier) @call.name)) @call
 
+; Class attribute type annotations — PEP 526: address: Address or address: Address = Address()
+; Both bare annotations (address: Address) and annotated assignments (name: str = "test")
+; are parsed as (assignment left: ... type: ...) in tree-sitter-python.
+(expression_statement
+  (assignment
+    left: (identifier) @name
+    type: (type)) @definition.property)
+
 ; Heritage queries - Python class inheritance
 (class_definition
   name: (identifier) @heritage.class
@@ -178,6 +203,11 @@ export const JAVA_QUERIES = `
 ; Methods & Constructors
 (method_declaration name: (identifier) @name) @definition.method
 (constructor_declaration name: (identifier) @name) @definition.constructor
+
+; Fields — typed field declarations inside class bodies
+(field_declaration
+  declarator: (variable_declarator
+    name: (identifier) @name)) @definition.property
 
 ; Imports - capture any import declaration child as source
 (import_declaration (_) @import.source) @import
@@ -243,6 +273,11 @@ export const GO_QUERIES = `
 (import_declaration (import_spec path: (interpreted_string_literal) @import.source)) @import
 (import_declaration (import_spec_list (import_spec path: (interpreted_string_literal) @import.source))) @import
 
+; Struct fields — named field declarations inside struct types
+(field_declaration_list
+  (field_declaration
+    name: (field_identifier) @name) @definition.property)
+
 ; Struct embedding (anonymous fields = inheritance)
 (type_declaration
   (type_spec
@@ -298,6 +333,21 @@ export const CPP_QUERIES = `
 ; Function declarations / prototypes (common in headers)
 (declaration declarator: (function_declarator declarator: (identifier) @name)) @definition.function
 (declaration declarator: (pointer_declarator declarator: (function_declarator declarator: (identifier) @name))) @definition.function
+
+; Class/struct data member fields (Address address; int count;)
+; Uses field_identifier to exclude method declarations (which use function_declarator)
+(field_declaration
+  declarator: (field_identifier) @name) @definition.property
+
+; Pointer member fields (Address* address;)
+(field_declaration
+  declarator: (pointer_declarator
+    declarator: (field_identifier) @name)) @definition.property
+
+; Reference member fields (Address& address;)
+(field_declaration
+  declarator: (reference_declarator
+    (field_identifier) @name)) @definition.property
 
 ; Inline class method declarations (inside class body, no body: void Foo();)
 (field_declaration declarator: (function_declarator declarator: (identifier) @name)) @definition.method
@@ -414,6 +464,11 @@ export const RUST_QUERIES = `
 ; Struct literal construction: User { name: value }
 (struct_expression name: (type_identifier) @call.name) @call
 
+; Struct fields — named field declarations inside struct bodies
+(field_declaration_list
+  (field_declaration
+    name: (field_identifier) @name) @definition.property)
+
 ; Heritage (trait implementation) — all combinations of concrete/generic trait × concrete/generic type
 (impl_item trait: (type_identifier) @heritage.trait type: (type_identifier) @heritage.class) @heritage
 (impl_item trait: (generic_type type: (type_identifier) @heritage.trait) type: (type_identifier) @heritage.class) @heritage
@@ -456,6 +511,13 @@ export const PHP_QUERIES = `
   (property_element
     (variable_name
       (name) @name))) @definition.property
+
+; Constructor property promotion (PHP 8.0+: public Address $address in __construct)
+(method_declaration
+  parameters: (formal_parameters
+    (property_promotion_parameter
+      name: (variable_name
+        (name) @name)))) @definition.property
 
 ; ── Imports: use statements ──────────────────────────────────────────────────
 ; Simple: use App\\Models\\User;
@@ -581,6 +643,12 @@ export const KOTLIN_QUERIES = `
 (property_declaration
   (variable_declaration
     (simple_identifier) @name)) @definition.property
+
+; Primary constructor val/var parameters (data class, value class, regular class)
+; binding_pattern_kind contains "val" or "var" — without it, the param is not a property
+(class_parameter
+  (binding_pattern_kind)
+  (simple_identifier) @name) @definition.property
 
 ; ── Enum entries ─────────────────────────────────────────────────────────
 (enum_entry

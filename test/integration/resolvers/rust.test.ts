@@ -832,10 +832,25 @@ describe('Rust nullable receiver resolution (Option<T>)', () => {
     expect(saveFns.length).toBe(2);
   });
 
-  // Known limitation: user.unwrap().save() chains two method calls. unwrap()
-  // returns User but TypeEnv doesn't track intermediate return values in chains.
-  // Disambiguating through .unwrap() requires chained return type inference (Phase 5).
-  it.todo('resolves user.unwrap().save() to User.save (requires chained call inference)');
+  it('resolves user.unwrap().save() to User#save via Option<User> unwrapping', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'save' &&
+      c.source === 'process_entities' &&
+      c.targetFilePath?.includes('user'),
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('resolves repo.unwrap().save() to Repo#save via Option<Repo> unwrapping', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoSave = calls.find(c =>
+      c.target === 'save' &&
+      c.source === 'process_entities' &&
+      c.targetFilePath?.includes('repo'),
+    );
+    expect(repoSave).toBeDefined();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1277,5 +1292,90 @@ describe('Rust for-loop direct call_expression iterable resolution (Phase 7.3)',
       c.target === 'save' && c.source === 'process_repos' && c.targetFilePath?.includes('user.rs'),
     );
     expect(wrongSave).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 8: Field/property type resolution — struct field capture
+// ---------------------------------------------------------------------------
+
+describe('Field type resolution (Rust)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'rust-field-types'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects structs: Address, User', () => {
+    expect(getNodesByLabel(result, 'Struct')).toEqual(['Address', 'User']);
+  });
+
+  it('detects Property nodes for Rust struct fields', () => {
+    const properties = getNodesByLabel(result, 'Property');
+    expect(properties).toContain('address');
+    expect(properties).toContain('name');
+    expect(properties).toContain('city');
+  });
+
+  it('emits HAS_PROPERTY edges linking fields to structs', () => {
+    const propEdges = getRelationships(result, 'HAS_PROPERTY');
+    expect(propEdges.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('resolves user.address.save() → Address#save via field type', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCalls = calls.filter(
+      e => e.target === 'save' && e.source === 'process_user',
+    );
+    expect(saveCalls.length).toBe(1);
+    expect(saveCalls[0].targetFilePath).toContain('models');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 8B: Deep field chain resolution (3-level)
+// ---------------------------------------------------------------------------
+
+describe('Deep field chain resolution (Rust)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'rust-deep-field-chain'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects structs: Address, City, User', () => {
+    expect(getNodesByLabel(result, 'Struct')).toEqual(['Address', 'City', 'User']);
+  });
+
+  it('detects Property nodes for Rust struct fields', () => {
+    const properties = getNodesByLabel(result, 'Property');
+    expect(properties).toContain('address');
+    expect(properties).toContain('city');
+    expect(properties).toContain('zip_code');
+  });
+
+  it('emits HAS_PROPERTY edges for nested type chain', () => {
+    const propEdges = getRelationships(result, 'HAS_PROPERTY');
+    expect(propEdges.length).toBeGreaterThanOrEqual(3);
+  });
+
+  it('resolves 2-level chain: user.address.save() → Address#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCalls = calls.filter(e => e.target === 'save' && e.source === 'process_user');
+    const addressSave = saveCalls.find(e => e.targetFilePath.includes('models'));
+    expect(addressSave).toBeDefined();
+  });
+
+  it('resolves 3-level chain: user.address.city.get_name() → City#get_name', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const getNameCalls = calls.filter(e => e.target === 'get_name' && e.source === 'process_user');
+    const cityGetName = getNameCalls.find(e => e.targetFilePath.includes('models'));
+    expect(cityGetName).toBeDefined();
   });
 });
