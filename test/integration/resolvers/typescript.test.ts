@@ -1726,10 +1726,11 @@ describe('Field type resolution (TypeScript)', () => {
 
   it('emits HAS_PROPERTY edges linking properties to classes', () => {
     const propEdges = getRelationships(result, 'HAS_PROPERTY');
-    expect(propEdges.length).toBeGreaterThanOrEqual(3);
+    expect(propEdges.length).toBe(4);
     expect(edgeSet(propEdges)).toContain('User → address');
     expect(edgeSet(propEdges)).toContain('User → name');
     expect(edgeSet(propEdges)).toContain('Address → city');
+    expect(edgeSet(propEdges)).toContain('Config → DEFAULT');
   });
 
   it('resolves user.address.save() → Address#save via field type', () => {

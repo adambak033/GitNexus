@@ -702,7 +702,7 @@ describe('Rust ::default() constructor resolution', () => {
 
   it('detects save methods on both structs', () => {
     const methods = [...getNodesByLabel(result, 'Function'), ...getNodesByLabel(result, 'Method')];
-    expect(methods.filter((m: string) => m === 'save').length).toBeGreaterThanOrEqual(2);
+    expect(methods.filter((m: string) => m === 'save').length).toBe(2);
   });
 
   it('resolves user.save() in process_with_new() via User::new() constructor', () => {
@@ -774,7 +774,7 @@ describe('Rust async .await constructor binding resolution', () => {
 
   it('detects save methods in separate files', () => {
     const methods = [...getNodesByLabel(result, 'Function'), ...getNodesByLabel(result, 'Method')];
-    expect(methods.filter((m: string) => m === 'save').length).toBeGreaterThanOrEqual(2);
+    expect(methods.filter((m: string) => m === 'save').length).toBe(2);
   });
 
   it('resolves user.save() after .await to user.rs via return type of get_user()', () => {
@@ -1322,7 +1322,10 @@ describe('Field type resolution (Rust)', () => {
 
   it('emits HAS_PROPERTY edges linking fields to structs', () => {
     const propEdges = getRelationships(result, 'HAS_PROPERTY');
-    expect(propEdges.length).toBeGreaterThanOrEqual(2);
+    expect(propEdges.length).toBe(3);
+    expect(edgeSet(propEdges)).toContain('User → name');
+    expect(edgeSet(propEdges)).toContain('User → address');
+    expect(edgeSet(propEdges)).toContain('Address → city');
   });
 
   it('resolves user.address.save() → Address#save via field type', () => {
@@ -1362,7 +1365,12 @@ describe('Deep field chain resolution (Rust)', () => {
 
   it('emits HAS_PROPERTY edges for nested type chain', () => {
     const propEdges = getRelationships(result, 'HAS_PROPERTY');
-    expect(propEdges.length).toBeGreaterThanOrEqual(3);
+    expect(propEdges.length).toBe(5);
+    expect(edgeSet(propEdges)).toContain('User → name');
+    expect(edgeSet(propEdges)).toContain('User → address');
+    expect(edgeSet(propEdges)).toContain('Address → city');
+    expect(edgeSet(propEdges)).toContain('Address → street');
+    expect(edgeSet(propEdges)).toContain('City → zip_code');
   });
 
   it('resolves 2-level chain: user.address.save() → Address#save', () => {
@@ -1396,10 +1404,11 @@ describe('Write access tracking (Rust)', () => {
   it('emits ACCESSES write edges for field assignments', () => {
     const accesses = getRelationships(result, 'ACCESSES');
     const writes = accesses.filter(e => e.rel.reason === 'write');
-    expect(writes.length).toBeGreaterThanOrEqual(2);
+    expect(writes.length).toBe(3);
     const fieldNames = writes.map(e => e.target);
     expect(fieldNames).toContain('name');
     expect(fieldNames).toContain('address');
+    expect(fieldNames).toContain('score');
     const sources = writes.map(e => e.source);
     expect(sources).toContain('update_user');
   });

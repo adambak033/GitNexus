@@ -968,7 +968,10 @@ describe('Field type resolution (Go)', () => {
 
   it('emits HAS_PROPERTY edges linking struct fields to structs', () => {
     const propEdges = getRelationships(result, 'HAS_PROPERTY');
-    expect(propEdges.length).toBeGreaterThanOrEqual(2);
+    expect(propEdges.length).toBe(3);
+    expect(edgeSet(propEdges)).toContain('User → Name');
+    expect(edgeSet(propEdges)).toContain('User → Address');
+    expect(edgeSet(propEdges)).toContain('Address → City');
   });
 
   it('resolves user.Address.Save() → Address#Save via field type', () => {
@@ -1008,7 +1011,12 @@ describe('Deep field chain resolution (Go)', () => {
 
   it('emits HAS_PROPERTY edges for nested type chain', () => {
     const propEdges = getRelationships(result, 'HAS_PROPERTY');
-    expect(propEdges.length).toBeGreaterThanOrEqual(3);
+    expect(propEdges.length).toBe(5);
+    expect(edgeSet(propEdges)).toContain('User → Name');
+    expect(edgeSet(propEdges)).toContain('User → Address');
+    expect(edgeSet(propEdges)).toContain('Address → City');
+    expect(edgeSet(propEdges)).toContain('Address → Street');
+    expect(edgeSet(propEdges)).toContain('City → ZipCode');
   });
 
   it('resolves 2-level chain: user.Address.Save() → Address#Save', () => {

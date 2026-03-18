@@ -105,7 +105,7 @@ describe('Ruby require_relative, heritage & property resolution', () => {
 
   it('emits EXTENDS edge: User → BaseModel', () => {
     const extends_ = getRelationships(result, 'EXTENDS');
-    expect(extends_.length).toBeGreaterThanOrEqual(1);
+    expect(extends_.length).toBe(1);
     const edges = edgeSet(extends_);
     expect(edges).toContain('User → BaseModel');
   });
@@ -620,7 +620,7 @@ describe('Ruby return type inference via function call', () => {
   it('detects save method on both User and Repo (disambiguation required)', () => {
     const methods = getNodesByLabel(result, 'Method');
     // Both classes have save — fuzzy match alone cannot resolve this
-    expect(methods.filter(m => m === 'save').length).toBeGreaterThanOrEqual(2);
+    expect(methods.filter(m => m === 'save').length).toBe(2);
   });
 
   it('resolves user.save to User#save via YARD @return [User] on get_user()', () => {
@@ -874,7 +874,7 @@ describe('Field type resolution (Ruby)', () => {
 
   it('emits HAS_PROPERTY edges linking properties to classes', () => {
     const propEdges = getRelationships(result, 'HAS_PROPERTY');
-    expect(propEdges.length).toBeGreaterThanOrEqual(3);
+    expect(propEdges.length).toBe(3);
     expect(edgeSet(propEdges)).toContain('User → address');
     expect(edgeSet(propEdges)).toContain('User → name');
     expect(edgeSet(propEdges)).toContain('Address → city');
@@ -938,13 +938,16 @@ describe('Write access tracking (Ruby)', () => {
   it('emits ACCESSES write edges for setter assignments', () => {
     const accesses = getRelationships(result, 'ACCESSES');
     const writes = accesses.filter(e => e.rel.reason === 'write');
-    expect(writes.length).toBeGreaterThanOrEqual(2);
+    expect(writes.length).toBe(3);
     const nameWrite = writes.find(e => e.target === 'name');
     const addressWrite = writes.find(e => e.target === 'address');
+    const scoreWrite = writes.find(e => e.target === 'score');
     expect(nameWrite).toBeDefined();
     expect(nameWrite!.source).toBe('update_user');
     expect(addressWrite).toBeDefined();
     expect(addressWrite!.source).toBe('update_user');
+    expect(scoreWrite).toBeDefined();
+    expect(scoreWrite!.source).toBe('update_user');
   });
 
   it('emits ACCESSES write edge for compound assignment (operator_assignment)', () => {

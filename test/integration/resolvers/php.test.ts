@@ -138,7 +138,7 @@ describe('PHP heritage & import resolution', () => {
 
   it('emits OVERRIDES edge for User overriding log (inherited from BaseModel)', () => {
     const overrides = getRelationships(result, 'OVERRIDES');
-    expect(overrides.length).toBeGreaterThanOrEqual(1);
+    expect(overrides.length).toBe(1);
     const logOverride = overrides.find(e => e.source === 'User' && e.target === 'log');
     expect(logOverride).toBeDefined();
   });
@@ -1189,7 +1189,7 @@ describe('Field type resolution (PHP)', () => {
 
   it('emits HAS_PROPERTY edges linking properties to classes', () => {
     const propEdges = getRelationships(result, 'HAS_PROPERTY');
-    expect(propEdges.length).toBeGreaterThanOrEqual(3);
+    expect(propEdges.length).toBe(3);
   });
 
   it('resolves $user->address->save() → Address#save via field type', () => {
@@ -1229,7 +1229,12 @@ describe('Deep field chain resolution (PHP)', () => {
 
   it('emits HAS_PROPERTY edges for nested type chain', () => {
     const propEdges = getRelationships(result, 'HAS_PROPERTY');
-    expect(propEdges.length).toBeGreaterThanOrEqual(3);
+    expect(propEdges.length).toBe(5);
+    expect(edgeSet(propEdges)).toContain('User → name');
+    expect(edgeSet(propEdges)).toContain('User → address');
+    expect(edgeSet(propEdges)).toContain('Address → city');
+    expect(edgeSet(propEdges)).toContain('Address → street');
+    expect(edgeSet(propEdges)).toContain('City → zipCode');
   });
 
   it('resolves 2-level chain: $user->address->save() → Address#save', () => {
@@ -1303,14 +1308,16 @@ describe('Write access tracking (PHP)', () => {
   it('emits ACCESSES write edges for field assignments', () => {
     const accesses = getRelationships(result, 'ACCESSES');
     const writes = accesses.filter(e => e.rel.reason === 'write');
-    // user->name (x2: simple + compound), user->address, User::$count
-    expect(writes.length).toBeGreaterThanOrEqual(2);
+    expect(writes.length).toBe(3);
     const nameWrite = writes.find(e => e.target === 'name');
     const addressWrite = writes.find(e => e.target === 'address');
+    const countWrite = writes.find(e => e.target === 'count');
     expect(nameWrite).toBeDefined();
     expect(nameWrite!.source).toBe('updateUser');
     expect(addressWrite).toBeDefined();
     expect(addressWrite!.source).toBe('updateUser');
+    expect(countWrite).toBeDefined();
+    expect(countWrite!.source).toBe('updateUser');
   });
 
   it('emits ACCESSES write edge for static property assignment', () => {

@@ -1246,7 +1246,7 @@ describe('Field type resolution (Kotlin)', () => {
 
   it('emits HAS_PROPERTY edges linking properties to classes', () => {
     const propEdges = getRelationships(result, 'HAS_PROPERTY');
-    expect(propEdges.length).toBeGreaterThanOrEqual(3);
+    expect(propEdges.length).toBe(3);
     expect(edgeSet(propEdges)).toContain('User → address');
     expect(edgeSet(propEdges)).toContain('User → name');
     expect(edgeSet(propEdges)).toContain('Address → city');
@@ -1367,13 +1367,16 @@ describe('Write access tracking (Kotlin)', () => {
   it('emits ACCESSES write edges for property assignments', () => {
     const accesses = getRelationships(result, 'ACCESSES');
     const writes = accesses.filter(e => e.rel.reason === 'write');
-    expect(writes.length).toBeGreaterThanOrEqual(2);
+    expect(writes.length).toBe(3);
     const nameWrite = writes.find(e => e.target === 'name');
     const addressWrite = writes.find(e => e.target === 'address');
+    const scoreWrite = writes.find(e => e.target === 'score');
     expect(nameWrite).toBeDefined();
     expect(nameWrite!.source).toBe('updateUser');
     expect(addressWrite).toBeDefined();
     expect(addressWrite!.source).toBe('updateUser');
+    expect(scoreWrite).toBeDefined();
+    expect(scoreWrite!.source).toBe('updateUser');
   });
 
   it('emits ACCESSES write edge for compound assignment (+=)', () => {

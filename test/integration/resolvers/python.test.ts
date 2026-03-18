@@ -720,10 +720,10 @@ describe('Python static/classmethod class resolution (issue #289)', () => {
     const hasMethod = getRelationships(result, 'HAS_METHOD');
 
     const userServiceMethods = hasMethod.filter(e => e.source === 'UserService');
-    expect(userServiceMethods.length).toBeGreaterThanOrEqual(3); // find_user, create_user, from_config
+    expect(userServiceMethods.length).toBe(3); // find_user, create_user, from_config
 
     const adminServiceMethods = hasMethod.filter(e => e.source === 'AdminService');
-    expect(adminServiceMethods.length).toBeGreaterThanOrEqual(2); // find_user, delete_user
+    expect(adminServiceMethods.length).toBe(2); // find_user, delete_user
   });
 
   it('resolves unique static method calls (create_user, delete_user, from_config)', () => {
@@ -1309,7 +1309,7 @@ describe('Field type resolution (Python)', () => {
 
   it('emits HAS_PROPERTY edges linking attributes to classes', () => {
     const propEdges = getRelationships(result, 'HAS_PROPERTY');
-    expect(propEdges.length).toBeGreaterThanOrEqual(3);
+    expect(propEdges.length).toBe(3);
     expect(edgeSet(propEdges)).toContain('User → address');
     expect(edgeSet(propEdges)).toContain('User → name');
     expect(edgeSet(propEdges)).toContain('Address → city');

@@ -840,8 +840,9 @@ describe('Field type resolution (C++)', () => {
 
   it('emits HAS_PROPERTY edges linking fields to classes', () => {
     const propEdges = getRelationships(result, 'HAS_PROPERTY');
-    expect(propEdges.length).toBeGreaterThanOrEqual(2);
+    expect(propEdges.length).toBe(3);
     expect(edgeSet(propEdges)).toContain('User → address');
+    expect(edgeSet(propEdges)).toContain('User → name');
     expect(edgeSet(propEdges)).toContain('Address → city');
   });
 
@@ -952,7 +953,7 @@ describe('Write access tracking (C++)', () => {
   it('emits ACCESSES write edges for field assignments', () => {
     const accesses = getRelationships(result, 'ACCESSES');
     const writes = accesses.filter(e => e.rel.reason === 'write');
-    expect(writes.length).toBeGreaterThanOrEqual(2);
+    expect(writes.length).toBe(2);
     const fieldNames = writes.map(e => e.target);
     expect(fieldNames).toContain('name');
     expect(fieldNames).toContain('address');

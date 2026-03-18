@@ -554,7 +554,7 @@ class UserService {
       }
       findCalls(tree.rootNode);
 
-      expect(calls.length).toBeGreaterThanOrEqual(1);
+      expect(calls.length).toBe(1);
       // $this should resolve to enclosing class 'UserService'
       expect(typeEnv.lookup('$this', calls[0])).toBe('UserService');
     });
@@ -822,7 +822,7 @@ object AppConfig {
       }
       findCalls(tree.rootNode);
 
-      expect(calls.length).toBeGreaterThanOrEqual(1);
+      expect(calls.length).toBe(1);
       expect(typeEnv.lookup('this', calls[0])).toBe('AppConfig');
     });
   });
