@@ -26,7 +26,7 @@ import {
 import { buildTypeEnv } from './type-env.js';
 import type { ConstructorBinding } from './type-env.js';
 import { getTreeSitterBufferSize } from './constants.js';
-import type { ExtractedCall, ExtractedHeritage, ExtractedRoute, FileConstructorBindings } from './workers/parse-worker.js';
+import type { ExtractedCall, ExtractedAssignment, ExtractedHeritage, ExtractedRoute, FileConstructorBindings } from './workers/parse-worker.js';
 import { callRouters } from './call-routing.js';
 import { extractReturnTypeName, stripNullable } from './type-extractors/shared.js';
 
@@ -138,6 +138,7 @@ export const processCalls = async (
 ): Promise<ExtractedHeritage[]> => {
   const parser = await loadParser();
   const collectedHeritage: ExtractedHeritage[] = [];
+  const pendingWrites: { receiverTypeName: string; propertyName: string; filePath: string; srcId: string }[] = [];
   const logSkipped = isVerboseIngestionEnabled();
   const skippedByLang = logSkipped ? new Map<string, number>() : null;
 
@@ -195,6 +196,43 @@ export const processCalls = async (
     matches.forEach(match => {
       const captureMap: Record<string, any> = {};
       match.captures.forEach(c => captureMap[c.name] = c.node);
+      // ── Write access: emit ACCESSES {reason: 'write'} for assignments to member fields ──
+      if (captureMap['assignment'] && captureMap['assignment.receiver'] && captureMap['assignment.property']) {
+        const receiverNode = captureMap['assignment.receiver'];
+        const propertyName: string = captureMap['assignment.property'].text;
+        // Resolve receiver type: simple identifier → TypeEnv lookup or class resolution
+        let receiverTypeName: string | undefined;
+        const receiverText = receiverNode.text;
+        if (receiverText && typeEnv) {
+          receiverTypeName = typeEnv.lookup(receiverText, captureMap['assignment']);
+        }
+        // Fall back to verified constructor bindings (mirrors CALLS resolution tier 2)
+        if (!receiverTypeName && receiverText && receiverIndex.size > 0) {
+          const enclosing = findEnclosingFunction(captureMap['assignment'], file.path, ctx);
+          const funcName = enclosing ? extractFuncNameFromSourceId(enclosing) : '';
+          receiverTypeName = lookupReceiverType(receiverIndex, funcName, receiverText);
+        }
+        if (!receiverTypeName && receiverText) {
+          const resolved = ctx.resolve(receiverText, file.path);
+          if (resolved?.candidates.some(d =>
+            d.type === 'Class' || d.type === 'Struct' || d.type === 'Interface'
+              || d.type === 'Enum' || d.type === 'Record' || d.type === 'Impl',
+          )) {
+            receiverTypeName = receiverText;
+          }
+        }
+        if (receiverTypeName) {
+          const enclosing = findEnclosingFunction(captureMap['assignment'], file.path, ctx);
+          const srcId = enclosing || generateId('File', file.path);
+          // Defer resolution: Ruby attr_accessor properties are registered during
+          // this same loop, so cross-file lookups fail if the declaring file hasn't
+          // been processed yet. Collect now, resolve after all files are done.
+          pendingWrites.push({ receiverTypeName, propertyName, filePath: file.path, srcId });
+        }
+        // Assignment-only capture (no @call sibling): skip the rest of this
+        // forEach iteration — this acts as a `continue` in the match loop.
+        if (!captureMap['call']) return;
+      }
 
       if (!captureMap['call']) return;
 
@@ -284,6 +322,10 @@ export const processCalls = async (
           receiverTypeName = receiverName;
         }
       }
+      // Hoist sourceId so it's available for ACCESSES edge emission during chain walk.
+      const enclosingFuncId = findEnclosingFunction(callNode, file.path, ctx);
+      const sourceId = enclosingFuncId || generateId('File', file.path);
+
       // Fall back to mixed chain resolution when the receiver is a complex expression
       // (field chain, call chain, or interleaved — e.g. user.address.city.save() or
       // svc.getUser().address.save()). Handles all cases with a single unified walk.
@@ -296,8 +338,7 @@ export const processCalls = async (
               ? typeEnv.lookup(extracted.baseReceiverName, callNode)
               : undefined;
             if (!currentType && extracted.baseReceiverName && receiverIndex.size > 0) {
-              const enclosingFunc = findEnclosingFunction(callNode, file.path, ctx);
-              const funcName = enclosingFunc ? extractFuncNameFromSourceId(enclosingFunc) : '';
+              const funcName = enclosingFuncId ? extractFuncNameFromSourceId(enclosingFuncId) : '';
               currentType = lookupReceiverType(receiverIndex, funcName, extracted.baseReceiverName);
             }
             if (!currentType && extracted.baseReceiverName) {
@@ -309,7 +350,10 @@ export const processCalls = async (
               }
             }
             if (currentType) {
-              receiverTypeName = walkMixedChain(extracted.chain, currentType, file.path, ctx);
+              receiverTypeName = walkMixedChain(
+                extracted.chain, currentType, file.path, ctx,
+                makeAccessEmitter(graph, sourceId),
+              );
             }
           }
         }
@@ -323,9 +367,6 @@ export const processCalls = async (
       }, file.path, ctx);
 
       if (!resolved) return;
-
-      const enclosingFuncId = findEnclosingFunction(callNode, file.path, ctx);
-      const sourceId = enclosingFuncId || generateId('File', file.path);
       const relId = generateId('CALLS', `${sourceId}:${calledName}->${resolved.nodeId}`);
 
       graph.addRelationship({
@@ -339,6 +380,22 @@ export const processCalls = async (
     });
 
     ctx.clearCache();
+  }
+
+  // ── Resolve deferred write-access edges ──
+  // All properties (including Ruby attr_accessor) are now registered.
+  for (const pw of pendingWrites) {
+    const fieldOwner = resolveFieldOwnership(pw.receiverTypeName, pw.propertyName, pw.filePath, ctx);
+    if (fieldOwner) {
+      graph.addRelationship({
+        id: generateId('ACCESSES', `${pw.srcId}:${fieldOwner.nodeId}:write`),
+        sourceId: pw.srcId,
+        targetId: fieldOwner.nodeId,
+        type: 'ACCESSES',
+        confidence: 1.0,
+        reason: 'write',
+      });
+    }
   }
 
   if (skippedByLang && skippedByLang.size > 0) {
@@ -570,13 +627,43 @@ const lookupReceiverType = (
   return undefined;
 };
 
+interface FieldResolution {
+  typeName: string;      // resolved declared type (continues chain threading)
+  fieldNodeId: string;   // nodeId of the Property symbol (for ACCESSES edge target)
+}
+
+/**
+ * Resolve the type that results from accessing `receiverName.fieldName`.
+ * Requires declaredType on the Property node (needed for chain walking continuation).
+ */
 const resolveFieldAccessType = (
   receiverName: string,
   fieldName: string,
   filePath: string,
   ctx: ResolutionContext,
-): string | undefined => {
-  // Resolve the receiver's type to a class/struct nodeId
+): FieldResolution | undefined => {
+  const fieldDef = resolveFieldOwnership(receiverName, fieldName, filePath, ctx);
+  if (!fieldDef?.declaredType) return undefined;
+
+  // Use stripNullable (not extractReturnTypeName) — field types like List<User>
+  // should be preserved as-is, not unwrapped to User. Only strip nullable wrappers.
+  return {
+    typeName: stripNullable(fieldDef.declaredType),
+    fieldNodeId: fieldDef.nodeId,
+  };
+};
+
+/**
+ * Resolve a field's Property node given a receiver type name and field name.
+ * Does NOT require declaredType — used by write-access tracking where only the
+ * fieldNodeId is needed (no chain continuation).
+ */
+const resolveFieldOwnership = (
+  receiverName: string,
+  fieldName: string,
+  filePath: string,
+  ctx: ResolutionContext,
+): { nodeId: string; declaredType?: string } | undefined => {
   const typeResolved = ctx.resolve(receiverName, filePath);
   if (!typeResolved) return undefined;
   const classDef = typeResolved.candidates.find(
@@ -585,12 +672,32 @@ const resolveFieldAccessType = (
   );
   if (!classDef) return undefined;
 
-  const fieldDef = ctx.symbols.lookupFieldByOwner(classDef.nodeId, fieldName);
-  if (!fieldDef?.declaredType) return undefined;
+  return ctx.symbols.lookupFieldByOwner(classDef.nodeId, fieldName) ?? undefined;
+};
 
-  // Use stripNullable (not extractReturnTypeName) — field types like List<User>
-  // should be preserved as-is, not unwrapped to User. Only strip nullable wrappers.
-  return stripNullable(fieldDef.declaredType);
+/**
+ * Create a deduplicated ACCESSES edge emitter for a single source node.
+ * Each (sourceId, fieldNodeId) pair is emitted at most once per source.
+ */
+const makeAccessEmitter = (
+  graph: KnowledgeGraph,
+  sourceId: string,
+): OnFieldResolved => {
+  const emitted = new Set<string>();
+  return (fieldNodeId: string): void => {
+    const key = `${sourceId}\0${fieldNodeId}`;
+    if (emitted.has(key)) return;
+    emitted.add(key);
+
+    graph.addRelationship({
+      id: generateId('ACCESSES', `${sourceId}:${fieldNodeId}:read`),
+      sourceId,
+      targetId: fieldNodeId,
+      type: 'ACCESSES',
+      confidence: 1.0,
+      reason: 'read',
+    });
+  };
 };
 
 /**
@@ -601,24 +708,31 @@ const resolveFieldAccessType = (
  * The caller is responsible for seeding `startType` from its own context
  * (TypeEnv, constructor bindings, or static-class fallback).
  */
+type OnFieldResolved = (fieldNodeId: string) => void;
+
 const walkMixedChain = (
   chain: MixedChainStep[],
   startType: string,
   filePath: string,
   ctx: ResolutionContext,
+  onFieldResolved?: OnFieldResolved,
 ): string | undefined => {
   let currentType: string | undefined = startType;
   for (const step of chain) {
     if (!currentType) break;
     if (step.kind === 'field') {
-      currentType = resolveFieldAccessType(currentType, step.name, filePath, ctx);
+      const resolved = resolveFieldAccessType(currentType, step.name, filePath, ctx);
+      if (!resolved) { currentType = undefined; break; }
+      onFieldResolved?.(resolved.fieldNodeId);
+      currentType = resolved.typeName;
     } else {
       // Ruby/Python: property access is syntactically identical to method calls.
       // Try field resolution first — if the name is a known property with declaredType,
       // use that type directly. Otherwise fall back to method call resolution.
-      const fieldType = resolveFieldAccessType(currentType, step.name, filePath, ctx);
-      if (fieldType) {
-        currentType = fieldType;
+      const fieldResolved = resolveFieldAccessType(currentType, step.name, filePath, ctx);
+      if (fieldResolved) {
+        onFieldResolved?.(fieldResolved.fieldNodeId);
+        currentType = fieldResolved.typeName;
         continue;
       }
       const resolved = resolveCallTarget(
@@ -726,6 +840,7 @@ export const processCallsFromExtracted = async (
         if (currentType) {
           const walkedType = walkMixedChain(
             effectiveCall.receiverMixedChain, currentType, effectiveCall.filePath, ctx,
+            makeAccessEmitter(graph, effectiveCall.sourceId),
           );
           if (walkedType) {
             effectiveCall = { ...effectiveCall, receiverTypeName: walkedType };
@@ -751,6 +866,63 @@ export const processCallsFromExtracted = async (
   }
 
   onProgress?.(totalFiles, totalFiles);
+};
+
+/**
+ * Resolve pre-extracted field write assignments to ACCESSES {reason: 'write'} edges.
+ * Accepts optional constructorBindings for return-type-aware receiver inference,
+ * mirroring processCallsFromExtracted's verified binding lookup.
+ */
+export const processAssignmentsFromExtracted = (
+  graph: KnowledgeGraph,
+  assignments: ExtractedAssignment[],
+  ctx: ResolutionContext,
+  constructorBindings?: FileConstructorBindings[],
+): void => {
+  // Build per-file receiver type indexes from verified constructor bindings
+  const fileReceiverTypes = new Map<string, ReceiverTypeIndex>();
+  if (constructorBindings) {
+    for (const { filePath, bindings } of constructorBindings) {
+      const verified = verifyConstructorBindings(bindings, filePath, ctx, graph);
+      if (verified.size > 0) {
+        fileReceiverTypes.set(filePath, buildReceiverTypeIndex(verified));
+      }
+    }
+  }
+
+  for (const asn of assignments) {
+    // Resolve the receiver type
+    let receiverTypeName = asn.receiverTypeName;
+    // Tier 2: verified constructor bindings (return-type inference)
+    if (!receiverTypeName && fileReceiverTypes.size > 0) {
+      const receiverMap = fileReceiverTypes.get(asn.filePath);
+      if (receiverMap) {
+        const funcName = extractFuncNameFromSourceId(asn.sourceId);
+        receiverTypeName = lookupReceiverType(receiverMap, funcName, asn.receiverText);
+      }
+    }
+    // Tier 3: static class-as-receiver fallback
+    if (!receiverTypeName) {
+      const resolved = ctx.resolve(asn.receiverText, asn.filePath);
+      if (resolved?.candidates.some(d =>
+        d.type === 'Class' || d.type === 'Struct' || d.type === 'Interface'
+          || d.type === 'Enum' || d.type === 'Record' || d.type === 'Impl',
+      )) {
+        receiverTypeName = asn.receiverText;
+      }
+    }
+    if (!receiverTypeName) continue;
+    const fieldOwner = resolveFieldOwnership(receiverTypeName, asn.propertyName, asn.filePath, ctx);
+    if (!fieldOwner) continue;
+    graph.addRelationship({
+      id: generateId('ACCESSES', `${asn.sourceId}:${fieldOwner.nodeId}:write`),
+      sourceId: asn.sourceId,
+      targetId: fieldOwner.nodeId,
+      type: 'ACCESSES',
+      confidence: 1.0,
+      reason: 'write',
+    });
+  }
 };
 
 /**

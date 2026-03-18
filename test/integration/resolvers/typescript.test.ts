@@ -1739,6 +1739,29 @@ describe('Field type resolution (TypeScript)', () => {
     expect(addressSave).toBeDefined();
     expect(addressSave!.source).toBe('processUser');
   });
+
+  it('emits ACCESSES read edge for user.address field access in chain', () => {
+    const accesses = getRelationships(result, 'ACCESSES');
+    const addressReads = accesses.filter(e => e.target === 'address' && e.rel.reason === 'read');
+    expect(addressReads.length).toBe(1);
+    expect(addressReads[0].source).toBe('processUser');
+    expect(addressReads[0].targetLabel).toBe('Property');
+  });
+
+  it('emits ACCESSES read edge for Config.DEFAULT field access in chain', () => {
+    const accesses = getRelationships(result, 'ACCESSES');
+    const defaultReads = accesses.filter(e => e.target === 'DEFAULT' && e.rel.reason === 'read');
+    expect(defaultReads.length).toBe(1);
+    expect(defaultReads[0].source).toBe('validateConfig');
+  });
+
+  it('all ACCESSES edges have confidence 1.0 and reason read', () => {
+    const accesses = getRelationships(result, 'ACCESSES');
+    for (const edge of accesses) {
+      expect(edge.rel.confidence).toBe(1.0);
+      expect(edge.rel.reason).toBe('read');
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1898,5 +1921,40 @@ describe('Mixed field+call chain resolution (TypeScript)', () => {
     const getNameCalls = calls.filter(e => e.target === 'getName' && e.source === 'processWithUser');
     expect(getNameCalls.length).toBe(1);
     expect(getNameCalls[0].targetFilePath).toContain('models');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ACCESSES write edges from assignment expressions
+// ---------------------------------------------------------------------------
+
+describe('Write access tracking (TypeScript)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'ts-write-access'),
+      () => {},
+    );
+  }, 60000);
+
+  it('emits ACCESSES write edges for field assignments', () => {
+    const accesses = getRelationships(result, 'ACCESSES');
+    const writes = accesses.filter(e => e.rel.reason === 'write');
+    expect(writes.length).toBe(2);
+    const nameWrite = writes.find(e => e.target === 'name');
+    const addressWrite = writes.find(e => e.target === 'address');
+    expect(nameWrite).toBeDefined();
+    expect(nameWrite!.source).toBe('updateUser');
+    expect(addressWrite).toBeDefined();
+    expect(addressWrite!.source).toBe('updateUser');
+  });
+
+  it('write ACCESSES edges have confidence 1.0', () => {
+    const accesses = getRelationships(result, 'ACCESSES');
+    const writes = accesses.filter(e => e.rel.reason === 'write');
+    for (const edge of writes) {
+      expect(edge.rel.confidence).toBe(1.0);
+    }
   });
 });
