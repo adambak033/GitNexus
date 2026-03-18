@@ -229,18 +229,14 @@ const findPyParamElementType = (iterableName: string, startNode: SyntaxNode, pos
  *   2. scopeEnv string — extractElementTypeFromString on the stored type
  *   3. AST walk — walks up to the enclosing function's parameters to read List[User] directly
  */
-const extractForLoopBinding: ForLoopExtractor = (
-  node: SyntaxNode,
-  scopeEnv: Map<string, string>,
-  declarationTypeNodes: ReadonlyMap<string, SyntaxNode>,
-  scope: string,
-): void => {
+const extractForLoopBinding: ForLoopExtractor = (node, { scopeEnv, declarationTypeNodes, scope, returnTypeLookup }): void => {
   if (node.type !== 'for_statement') return;
 
-  // The iterable is the `right` field — may be identifier or call (data.items()/keys()/values()).
+  // The iterable is the `right` field — may be identifier, attribute, or call.
   const rightNode = node.childForFieldName('right');
   let iterableName: string | undefined;
   let methodName: string | undefined;
+  let callExprElementType: string | undefined;
   if (rightNode?.type === 'identifier') {
     iterableName = rightNode.text;
   } else if (rightNode?.type === 'attribute') {
@@ -248,6 +244,7 @@ const extractForLoopBinding: ForLoopExtractor = (
     if (prop) iterableName = prop.text;
   } else if (rightNode?.type === 'call') {
     // data.items() → call > function: attribute > identifier('data') + identifier('items')
+    // get_users() → call > function: identifier (Phase 7.3 — return-type path)
     const fn = rightNode.childForFieldName('function');
     if (fn?.type === 'attribute') {
       const obj = fn.firstNamedChild;
@@ -255,17 +252,26 @@ const extractForLoopBinding: ForLoopExtractor = (
       // Extract method name: items, keys, values
       const method = fn.lastNamedChild;
       if (method?.type === 'identifier' && method !== obj) methodName = method.text;
+    } else if (fn?.type === 'identifier') {
+      // Direct function call: for user in get_users()
+      const rawReturn = returnTypeLookup.lookupRawReturnType(fn.text);
+      if (rawReturn) callExprElementType = extractElementTypeFromString(rawReturn);
     }
   }
-  if (!iterableName) return;
+  if (!iterableName && !callExprElementType) return;
 
-  const containerTypeName = scopeEnv.get(iterableName);
-  const typeArgPos = methodToTypeArgPosition(methodName, containerTypeName);
-  const elementType = resolveIterableElementType(
-    iterableName, node, scopeEnv, declarationTypeNodes, scope,
-    extractPyElementTypeFromAnnotation, findPyParamElementType,
-    typeArgPos,
-  );
+  let elementType: string | undefined;
+  if (callExprElementType) {
+    elementType = callExprElementType;
+  } else {
+    const containerTypeName = scopeEnv.get(iterableName!);
+    const typeArgPos = methodToTypeArgPosition(methodName, containerTypeName);
+    elementType = resolveIterableElementType(
+      iterableName!, node, scopeEnv, declarationTypeNodes, scope,
+      extractPyElementTypeFromAnnotation, findPyParamElementType,
+      typeArgPos,
+    );
+  }
   if (!elementType) return;
 
   // The loop variable is the `left` field — identifier or pattern_list.
@@ -304,7 +310,7 @@ const extractPendingAssignment: PendingAssignmentExtractor = (node, scopeEnv) =>
   if (!left || !right) return undefined;
   const lhs = left.type === 'identifier' ? left.text : undefined;
   if (!lhs || scopeEnv.has(lhs)) return undefined;
-  if (right.type === 'identifier') return { lhs, rhs: right.text };
+  if (right.type === 'identifier') return { kind: 'copy', lhs, rhs: right.text };
   return undefined;
 };
 

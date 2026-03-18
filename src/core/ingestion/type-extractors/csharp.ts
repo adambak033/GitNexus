@@ -1,6 +1,6 @@
 import type { SyntaxNode } from '../utils.js';
 import type { ConstructorBindingScanner, ForLoopExtractor, LanguageTypeConfig, ParameterExtractor, TypeBindingExtractor, PendingAssignmentExtractor, PatternBindingExtractor } from './types.js';
-import { extractSimpleTypeName, extractVarName, findChildByType, unwrapAwait, extractGenericTypeArgs, resolveIterableElementType, methodToTypeArgPosition, type TypeArgPosition } from './shared.js';
+import { extractSimpleTypeName, extractVarName, findChildByType, unwrapAwait, extractGenericTypeArgs, resolveIterableElementType, methodToTypeArgPosition, extractElementTypeFromString, type TypeArgPosition } from './shared.js';
 
 /** Known container property accessors that operate on the container itself (e.g., dict.Keys, dict.Values) */
 const KNOWN_CONTAINER_PROPS: ReadonlySet<string> = new Set(['Keys', 'Values']);
@@ -191,12 +191,7 @@ const findCSharpParamElementType = (iterableName: string, startNode: SyntaxNode,
 
 /** C#: foreach (User user in users) — extract loop variable binding.
  *  Tier 1c: for `foreach (var user in users)`, resolves element type from iterable. */
-const extractForLoopBinding: ForLoopExtractor = (
-  node: SyntaxNode,
-  scopeEnv: Map<string, string>,
-  declarationTypeNodes: ReadonlyMap<string, SyntaxNode>,
-  scope: string,
-): void => {
+const extractForLoopBinding: ForLoopExtractor = (node, { scopeEnv, declarationTypeNodes, scope, returnTypeLookup }): void => {
   const typeNode = node.childForFieldName('type');
   const nameNode = node.childForFieldName('left');
   if (!typeNode || !nameNode) return;
@@ -214,6 +209,7 @@ const extractForLoopBinding: ForLoopExtractor = (
   const rightNode = node.childForFieldName('right');
   let iterableName: string | undefined;
   let methodName: string | undefined;
+  let callExprElementType: string | undefined;
 
   if (rightNode?.type === 'identifier') {
     iterableName = rightNode.text;
@@ -238,23 +234,33 @@ const extractForLoopBinding: ForLoopExtractor = (
     }
   } else if (rightNode?.type === 'invocation_expression') {
     // C# method call: data.Select(...) → invocation_expression > member_access_expression
+    // Direct function call: GetUsers() → invocation_expression > identifier
     const fn = rightNode.firstNamedChild;
     if (fn?.type === 'member_access_expression') {
       const obj = fn.childForFieldName('expression');
       const prop = fn.childForFieldName('name');
       if (obj?.type === 'identifier') iterableName = obj.text;
       if (prop?.type === 'identifier') methodName = prop.text;
+    } else if (fn?.type === 'identifier') {
+      // Direct function call: foreach (var u in GetUsers())
+      const rawReturn = returnTypeLookup.lookupRawReturnType(fn.text);
+      if (rawReturn) callExprElementType = extractElementTypeFromString(rawReturn);
     }
   }
-  if (!iterableName) return;
+  if (!iterableName && !callExprElementType) return;
 
-  const containerTypeName = scopeEnv.get(iterableName);
-  const typeArgPos = methodToTypeArgPosition(methodName, containerTypeName);
-  const elementType = resolveIterableElementType(
-    iterableName, node, scopeEnv, declarationTypeNodes, scope,
-    extractCSharpElementTypeFromTypeNode, findCSharpParamElementType,
-    typeArgPos,
-  );
+  let elementType: string | undefined;
+  if (callExprElementType) {
+    elementType = callExprElementType;
+  } else {
+    const containerTypeName = scopeEnv.get(iterableName!);
+    const typeArgPos = methodToTypeArgPosition(methodName, containerTypeName);
+    elementType = resolveIterableElementType(
+      iterableName!, node, scopeEnv, declarationTypeNodes, scope,
+      extractCSharpElementTypeFromTypeNode, findCSharpParamElementType,
+      typeArgPos,
+    );
+  }
   if (elementType) scopeEnv.set(varName, elementType);
 };
 
@@ -319,7 +325,7 @@ const extractPendingAssignment: PendingAssignmentExtractor = (node, scopeEnv) =>
     }
     const valueNode = evc?.firstNamedChild ?? child.namedChild(child.namedChildCount - 1);
     if (valueNode && valueNode !== nameNode && (valueNode.type === 'identifier' || valueNode.type === 'simple_identifier')) {
-      return { lhs, rhs: valueNode.text };
+      return { kind: 'copy', lhs, rhs: valueNode.text };
     }
   }
   return undefined;

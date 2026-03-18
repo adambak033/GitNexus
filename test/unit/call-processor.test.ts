@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { processCallsFromExtracted, extractReturnTypeName } from '../../src/core/ingestion/call-processor.js';
+import { processCallsFromExtracted } from '../../src/core/ingestion/call-processor.js';
+import { extractReturnTypeName } from '../../src/core/ingestion/type-extractors/shared.js';
 import { createResolutionContext, type ResolutionContext } from '../../src/core/ingestion/resolution-context.js';
 import { createKnowledgeGraph } from '../../src/core/graph/graph.js';
 import type { ExtractedCall, FileConstructorBindings } from '../../src/core/ingestion/workers/parse-worker.js';

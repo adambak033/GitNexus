@@ -1,6 +1,6 @@
 import type { SyntaxNode } from '../utils.js';
 import type { LanguageTypeConfig, ParameterExtractor, TypeBindingExtractor, InitializerExtractor, ClassNameLookup, ConstructorBindingScanner, ForLoopExtractor, PendingAssignmentExtractor, PatternBindingExtractor } from './types.js';
-import { extractSimpleTypeName, extractVarName, findChildByType, extractGenericTypeArgs, resolveIterableElementType, methodToTypeArgPosition, type TypeArgPosition } from './shared.js';
+import { extractSimpleTypeName, extractVarName, findChildByType, extractGenericTypeArgs, resolveIterableElementType, methodToTypeArgPosition, extractElementTypeFromString, type TypeArgPosition } from './shared.js';
 
 // ── Java ──────────────────────────────────────────────────────────────────
 
@@ -128,12 +128,7 @@ const findJavaParamElementType = (iterableName: string, startNode: SyntaxNode, p
 
 /** Java: for (User user : users) — extract loop variable binding.
  *  Tier 1c: for `for (var user : users)`, resolves element type from iterable. */
-const extractJavaForLoopBinding: ForLoopExtractor = (
-  node: SyntaxNode,
-  scopeEnv: Map<string, string>,
-  declarationTypeNodes: ReadonlyMap<string, SyntaxNode>,
-  scope: string,
-): void => {
+const extractJavaForLoopBinding: ForLoopExtractor = (node,  { scopeEnv, declarationTypeNodes, scope, returnTypeLookup }): void => {
   const typeNode = node.childForFieldName('type');
   const nameNode = node.childForFieldName('name');
   if (!typeNode || !nameNode) return;
@@ -153,6 +148,7 @@ const extractJavaForLoopBinding: ForLoopExtractor = (
 
   let iterableName: string | undefined;
   let methodName: string | undefined;
+  let callExprElementType: string | undefined;
   if (iterableNode.type === 'identifier') {
     iterableName = iterableNode.text;
   } else if (iterableNode.type === 'field_access') {
@@ -168,18 +164,27 @@ const extractJavaForLoopBinding: ForLoopExtractor = (
     } else if (obj?.type === 'field_access') {
       const innerField = obj.childForFieldName('field');
       if (innerField) iterableName = innerField.text;
+    } else if (!obj && name) {
+      // Direct function call: for (var u : getUsers()) — no receiver object
+      const rawReturn = returnTypeLookup.lookupRawReturnType(name.text);
+      if (rawReturn) callExprElementType = extractElementTypeFromString(rawReturn);
     }
     if (name) methodName = name.text;
   }
-  if (!iterableName) return;
+  if (!iterableName && !callExprElementType) return;
 
-  const containerTypeName = scopeEnv.get(iterableName);
-  const typeArgPos = methodToTypeArgPosition(methodName, containerTypeName);
-  const elementType = resolveIterableElementType(
-    iterableName, node, scopeEnv, declarationTypeNodes, scope,
-    extractJavaElementTypeFromTypeNode, findJavaParamElementType,
-    typeArgPos,
-  );
+  let elementType: string | undefined;
+  if (callExprElementType) {
+    elementType = callExprElementType;
+  } else {
+    const containerTypeName = scopeEnv.get(iterableName!);
+    const typeArgPos = methodToTypeArgPosition(methodName, containerTypeName);
+    elementType = resolveIterableElementType(
+      iterableName!, node, scopeEnv, declarationTypeNodes, scope,
+      extractJavaElementTypeFromTypeNode, findJavaParamElementType,
+      typeArgPos,
+    );
+  }
   if (elementType) scopeEnv.set(varName, elementType);
 };
 
@@ -193,7 +198,7 @@ const extractJavaPendingAssignment: PendingAssignmentExtractor = (node, scopeEnv
     if (!nameNode || !valueNode) continue;
     const lhs = nameNode.text;
     if (scopeEnv.has(lhs)) continue;
-    if (valueNode.type === 'identifier' || valueNode.type === 'simple_identifier') return { lhs, rhs: valueNode.text };
+    if (valueNode.type === 'identifier' || valueNode.type === 'simple_identifier') return { kind: 'copy', lhs, rhs: valueNode.text };
   }
   return undefined;
 };
@@ -431,12 +436,8 @@ const findKotlinParamElementType = (iterableName: string, startNode: SyntaxNode,
 
 /** Kotlin: for (user: User in users) — extract loop variable binding.
  *  Tier 1c: for `for (user in users)` without annotation, resolves from iterable. */
-const extractKotlinForLoopBinding: ForLoopExtractor = (
-  node: SyntaxNode,
-  scopeEnv: Map<string, string>,
-  declarationTypeNodes: ReadonlyMap<string, SyntaxNode>,
-  scope: string,
-): void => {
+const extractKotlinForLoopBinding: ForLoopExtractor = (node, ctx): void => {
+  const { scopeEnv, declarationTypeNodes, scope, returnTypeLookup } = ctx;
   const varDecl = findChildByType(node, 'variable_declaration');
   if (!varDecl) return;
   const nameNode = findChildByType(varDecl, 'simple_identifier');
@@ -458,6 +459,7 @@ const extractKotlinForLoopBinding: ForLoopExtractor = (
   let iterableName: string | undefined;
   let methodName: string | undefined;
   let fallbackIterableName: string | undefined;
+  let callExprElementType: string | undefined;
   let foundVarDecl = false;
   for (let i = 0; i < node.namedChildCount; i++) {
     const child = node.namedChild(i);
@@ -494,26 +496,35 @@ const extractKotlinForLoopBinding: ForLoopExtractor = (
           const prop = findChildByType(suffix, 'simple_identifier');
           if (prop) methodName = prop.text;
         }
+      } else if (callee?.type === 'simple_identifier') {
+        // Direct function call: for (u in getUsers())
+        const rawReturn = returnTypeLookup.lookupRawReturnType(callee.text);
+        if (rawReturn) callExprElementType = extractElementTypeFromString(rawReturn);
       }
       break;
     }
   }
-  if (!iterableName) return;
+  if (!iterableName && !callExprElementType) return;
 
-  let containerTypeName = scopeEnv.get(iterableName);
-  // Fallback: if object has no type in scope, try the property as the iterable name.
-  // Handles patterns like this.users where the property itself is the iterable variable.
-  if (!containerTypeName && fallbackIterableName) {
-    iterableName = fallbackIterableName;
-    methodName = undefined;
-    containerTypeName = scopeEnv.get(iterableName);
+  let elementType: string | undefined;
+  if (callExprElementType) {
+    elementType = callExprElementType;
+  } else {
+    let containerTypeName = scopeEnv.get(iterableName!);
+    // Fallback: if object has no type in scope, try the property as the iterable name.
+    // Handles patterns like this.users where the property itself is the iterable variable.
+    if (!containerTypeName && fallbackIterableName) {
+      iterableName = fallbackIterableName;
+      methodName = undefined;
+      containerTypeName = scopeEnv.get(iterableName);
+    }
+    const typeArgPos = methodToTypeArgPosition(methodName, containerTypeName);
+    elementType = resolveIterableElementType(
+      iterableName!, node, scopeEnv, declarationTypeNodes, scope,
+      extractKotlinElementTypeFromTypeNode, findKotlinParamElementType,
+      typeArgPos,
+    );
   }
-  const typeArgPos = methodToTypeArgPosition(methodName, containerTypeName);
-  const elementType = resolveIterableElementType(
-    iterableName, node, scopeEnv, declarationTypeNodes, scope,
-    extractKotlinElementTypeFromTypeNode, findKotlinParamElementType,
-    typeArgPos,
-  );
   if (elementType) scopeEnv.set(varName, elementType);
 };
 
@@ -537,7 +548,7 @@ const extractKotlinPendingAssignment: PendingAssignmentExtractor = (node, scopeE
       if (!child) continue;
       if (child.type === '=') { foundEq = true; continue; }
       if (foundEq && child.type === 'simple_identifier') {
-        return { lhs, rhs: child.text };
+        return { kind: 'copy', lhs, rhs: child.text };
       }
     }
     return undefined;
@@ -559,7 +570,7 @@ const extractKotlinPendingAssignment: PendingAssignmentExtractor = (node, scopeE
       if (!child) continue;
       if (child.type === '=') { foundEq = true; continue; }
       if (foundEq && child.type === 'simple_identifier') {
-        return { lhs, rhs: child.text };
+        return { kind: 'copy', lhs, rhs: child.text };
       }
     }
     return undefined;

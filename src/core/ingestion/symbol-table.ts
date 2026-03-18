@@ -38,6 +38,13 @@ export interface SymbolTable {
    * Used when imports are missing or for framework magic
    */
   lookupFuzzy: (name: string) => SymbolDefinition[];
+
+  /**
+   * Low Confidence: Look for callable symbols (Function/Method/Constructor) by name.
+   * Faster than `lookupFuzzy` + filter — backed by a lazy callable-only index.
+   * Used by ReturnTypeLookup to resolve callee → return type.
+   */
+  lookupFuzzyCallable: (name: string) => SymbolDefinition[];
   
   /**
    * Debugging: See how many symbols are tracked
@@ -58,6 +65,13 @@ export const createSymbolTable = (): SymbolTable => {
   // 2. Global Reverse Index (The "Backup")
   // Structure: SymbolName -> [List of Definitions]
   const globalIndex = new Map<string, SymbolDefinition[]>();
+
+  // 3. Lazy Callable Index — populated on first lookupFuzzyCallable call.
+  // Structure: SymbolName -> [Callable Definitions]
+  // Only Function, Method, Constructor symbols are indexed.
+  let callableIndex: Map<string, SymbolDefinition[]> | null = null;
+
+  const CALLABLE_TYPES = new Set(['Function', 'Method', 'Constructor']);
 
   const add = (
     filePath: string,
@@ -86,6 +100,9 @@ export const createSymbolTable = (): SymbolTable => {
       globalIndex.set(name, []);
     }
     globalIndex.get(name)!.push(def);
+
+    // Invalidate the lazy callable index — it will be rebuilt on next use
+    callableIndex = null;
   };
 
   const lookupExact = (filePath: string, name: string): string | undefined => {
@@ -100,6 +117,18 @@ export const createSymbolTable = (): SymbolTable => {
     return globalIndex.get(name) || [];
   };
 
+  const lookupFuzzyCallable = (name: string): SymbolDefinition[] => {
+    if (!callableIndex) {
+      // Build the callable index lazily on first use
+      callableIndex = new Map();
+      for (const [symName, defs] of globalIndex) {
+        const callables = defs.filter(d => CALLABLE_TYPES.has(d.type));
+        if (callables.length > 0) callableIndex.set(symName, callables);
+      }
+    }
+    return callableIndex.get(name) ?? [];
+  };
+
   const getStats = () => ({
     fileCount: fileIndex.size,
     globalSymbolCount: globalIndex.size
@@ -108,7 +137,8 @@ export const createSymbolTable = (): SymbolTable => {
   const clear = () => {
     fileIndex.clear();
     globalIndex.clear();
+    callableIndex = null;
   };
 
-  return { add, lookupExact, lookupExactFull, lookupFuzzy, getStats, clear };
+  return { add, lookupExact, lookupExactFull, lookupFuzzy, lookupFuzzyCallable, getStats, clear };
 };

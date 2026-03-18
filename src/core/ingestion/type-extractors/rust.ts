@@ -1,6 +1,6 @@
 import type { SyntaxNode } from '../utils.js';
 import type { LanguageTypeConfig, ParameterExtractor, TypeBindingExtractor, InitializerExtractor, ClassNameLookup, ConstructorBindingScanner, PendingAssignmentExtractor, PatternBindingExtractor, ForLoopExtractor } from './types.js';
-import { extractSimpleTypeName, extractVarName, hasTypeAnnotation, unwrapAwait, extractGenericTypeArgs, resolveIterableElementType, methodToTypeArgPosition, type TypeArgPosition } from './shared.js';
+import { extractSimpleTypeName, extractVarName, hasTypeAnnotation, unwrapAwait, extractGenericTypeArgs, resolveIterableElementType, methodToTypeArgPosition, extractElementTypeFromString, type TypeArgPosition } from './shared.js';
 
 const DECLARATION_NODE_TYPES: ReadonlySet<string> = new Set([
   'let_declaration',
@@ -190,7 +190,7 @@ const extractPendingAssignment: PendingAssignmentExtractor = (node, scopeEnv) =>
   if (!pattern || !value) return undefined;
   const lhs = extractVarName(pattern);
   if (!lhs || scopeEnv.has(lhs)) return undefined;
-  if (value.type === 'identifier') return { lhs, rhs: value.text };
+  if (value.type === 'identifier') return { kind: 'copy', lhs, rhs: value.text };
   return undefined;
 };
 
@@ -352,12 +352,7 @@ const findRustParamElementType = (iterableName: string, startNode: SyntaxNode, p
 
 /** Rust: for user in &users where users has a known container type.
  *  Unwraps reference_expression (&users, &mut users) to get the iterable name. */
-const extractForLoopBinding: ForLoopExtractor = (
-  node: SyntaxNode,
-  scopeEnv: Map<string, string>,
-  declarationTypeNodes: ReadonlyMap<string, SyntaxNode>,
-  scope: string,
-): void => {
+const extractForLoopBinding: ForLoopExtractor = (node, { scopeEnv, declarationTypeNodes, scope, returnTypeLookup }): void => {
   if (node.type !== 'for_expression') return;
 
   const patternNode = node.childForFieldName('pattern');
@@ -367,6 +362,7 @@ const extractForLoopBinding: ForLoopExtractor = (
   // Extract iterable name + method — may be &users, users, or users.iter()/keys()/values()
   let iterableName: string | undefined;
   let methodName: string | undefined;
+  let callExprElementType: string | undefined;
   if (valueNode.type === 'reference_expression') {
     const inner = valueNode.lastNamedChild;
     if (inner?.type === 'identifier') iterableName = inner.text;
@@ -376,25 +372,34 @@ const extractForLoopBinding: ForLoopExtractor = (
     const prop = valueNode.lastNamedChild;
     if (prop) iterableName = prop.text;
   } else if (valueNode.type === 'call_expression') {
-    // users.iter() → call_expression > function: field_expression > identifier + field_identifier
-    const fieldExpr = valueNode.childForFieldName('function');
-    if (fieldExpr?.type === 'field_expression') {
-      const obj = fieldExpr.firstNamedChild;
+    const funcExpr = valueNode.childForFieldName('function');
+    if (funcExpr?.type === 'field_expression') {
+      // users.iter() → field_expression > identifier + field_identifier
+      const obj = funcExpr.firstNamedChild;
       if (obj?.type === 'identifier') iterableName = obj.text;
       // Extract method name: iter, keys, values, into_iter, etc.
-      const field = fieldExpr.lastNamedChild;
+      const field = funcExpr.lastNamedChild;
       if (field?.type === 'field_identifier') methodName = field.text;
+    } else if (funcExpr?.type === 'identifier') {
+      // Direct function call: for user in get_users()
+      const rawReturn = returnTypeLookup.lookupRawReturnType(funcExpr.text);
+      if (rawReturn) callExprElementType = extractElementTypeFromString(rawReturn);
     }
   }
-  if (!iterableName) return;
+  if (!iterableName && !callExprElementType) return;
 
-  const containerTypeName = scopeEnv.get(iterableName);
-  const typeArgPos = methodToTypeArgPosition(methodName, containerTypeName);
-  const elementType = resolveIterableElementType(
-    iterableName, node, scopeEnv, declarationTypeNodes, scope,
-    extractRustElementTypeFromTypeNode, findRustParamElementType,
-    typeArgPos,
-  );
+  let elementType: string | undefined;
+  if (callExprElementType) {
+    elementType = callExprElementType;
+  } else {
+    const containerTypeName = scopeEnv.get(iterableName!);
+    const typeArgPos = methodToTypeArgPosition(methodName, containerTypeName);
+    elementType = resolveIterableElementType(
+      iterableName!, node, scopeEnv, declarationTypeNodes, scope,
+      extractRustElementTypeFromTypeNode, findRustParamElementType,
+      typeArgPos,
+    );
+  }
   if (!elementType) return;
 
   const loopVarName = extractVarName(patternNode);

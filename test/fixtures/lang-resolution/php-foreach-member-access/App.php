@@ -12,15 +12,11 @@ class App {
     }
 
     /**
-     * $this->users member access in foreach — iterableName must use $ prefix
-     * to match how property_declaration stores the variable in scopeEnv ($users).
-     *
-     * Uses a typed parameter to ensure the type is in the method's scopeEnv,
-     * since class property @var types are stored at file scope (not method scope).
-     *
-     * @param User[] $users
+     * $this->users member access in foreach — resolved via Phase 7.4 Strategy C:
+     * scans the class body for the property_declaration and extracts the element
+     * type from the @var PHPDoc annotation without requiring a @param workaround.
      */
-    public function processMembers(array $users): void {
+    public function processMembers(): void {
         foreach ($this->users as $user) {
             $user->save();
         }

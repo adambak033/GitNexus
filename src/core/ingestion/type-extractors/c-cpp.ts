@@ -179,7 +179,7 @@ const extractPendingAssignment: PendingAssignmentExtractor = (node, scopeEnv) =>
   if (!finalName) return undefined;
   const lhs = extractVarName(finalName);
   if (!lhs || scopeEnv.has(lhs)) return undefined;
-  return { lhs, rhs: value.text };
+  return { kind: 'copy', lhs, rhs: value.text };
 };
 
 // --- For-loop Tier 1c ---
@@ -266,12 +266,7 @@ const findCppParamElementType = (iterableName: string, startNode: SyntaxNode, po
 /** C++: for (auto& user : users) — extract loop variable binding.
  *  Handles explicit types (for (User& user : users)) and auto (for (auto& user : users)).
  *  For auto, resolves element type from the iterable's container type. */
-const extractForLoopBinding: ForLoopExtractor = (
-  node: SyntaxNode,
-  scopeEnv: Map<string, string>,
-  declarationTypeNodes: ReadonlyMap<string, SyntaxNode>,
-  scope: string,
-): void => {
+const extractForLoopBinding: ForLoopExtractor = (node, { scopeEnv, declarationTypeNodes, scope } ): void => {
   if (node.type !== 'for_range_loop') return;
 
   const typeNode = node.childForFieldName('type');

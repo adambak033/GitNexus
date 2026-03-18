@@ -82,6 +82,67 @@ const SKIP_NODE_TYPES: ReadonlySet<string> = new Set(['attribute_list', 'attribu
 const PHPDOC_PARAM_RE = /@param\s+(\S+)\s+\$(\w+)/g;
 /** Alternate PHPDoc order: `@param $name Type` (name first) */
 const PHPDOC_PARAM_ALT_RE = /@param\s+\$(\w+)\s+(\S+)/g;
+/** Regex to extract PHPDoc @var annotations: `@var Type` */
+const PHPDOC_VAR_RE = /@var\s+(\S+)/;
+
+/**
+ * Extract the element type for a class property from its PHPDoc @var annotation or
+ * PHP 7.4+ native type. Walks backward from the property_declaration node to find
+ * an immediately preceding comment containing @var.
+ *
+ * Returns the normalized element type (e.g. User[] → User, Collection<User> → User).
+ * Returns undefined when no usable type annotation is found.
+ */
+const extractClassPropertyElementType = (propDecl: SyntaxNode): string | undefined => {
+  // Strategy 1: PHPDoc @var annotation on a preceding comment sibling
+  let sibling = propDecl.previousSibling;
+  while (sibling) {
+    if (sibling.type === 'comment') {
+      const match = PHPDOC_VAR_RE.exec(sibling.text);
+      if (match) return normalizePhpType(match[1]);
+    } else if (sibling.isNamed && !SKIP_NODE_TYPES.has(sibling.type)) {
+      break;
+    }
+    sibling = sibling.previousSibling;
+  }
+  // Strategy 2: PHP 7.4+ native type field — skip generic 'array' since element type is unknown
+  const typeNode = propDecl.childForFieldName('type');
+  if (!typeNode) return undefined;
+  const typeName = extractSimpleTypeName(typeNode);
+  if (!typeName || typeName === 'array') return undefined;
+  return typeName;
+};
+
+/**
+ * Scan a class body for a property_declaration matching the given property name,
+ * and extract its element type. The class body is the `declaration_list` child of
+ * a `class_declaration` node.
+ *
+ * Used as Strategy C in extractForLoopBinding for `$this->property` iterables
+ * where Strategy A (resolveIterableElementType) and Strategy B (scopeEnv lookup)
+ * both fail to find the type.
+ */
+const findClassPropertyElementType = (propName: string, classNode: SyntaxNode): string | undefined => {
+  const declList = classNode.childForFieldName('body')
+    ?? (classNode.namedChild(classNode.namedChildCount - 1)?.type === 'declaration_list'
+        ? classNode.namedChild(classNode.namedChildCount - 1)
+        : null); // fallback: last named child, only if it's a declaration_list
+  if (!declList) return undefined;
+  for (let i = 0; i < declList.namedChildCount; i++) {
+    const child = declList.namedChild(i);
+    if (child?.type !== 'property_declaration') continue;
+    // Check if any property_element has a variable_name matching '$propName'
+    for (let j = 0; j < child.namedChildCount; j++) {
+      const elem = child.namedChild(j);
+      if (elem?.type !== 'property_element') continue;
+      const varNameNode = elem.firstNamedChild; // variable_name node
+      if (varNameNode?.text === '$' + propName) {
+        return extractClassPropertyElementType(child);
+      }
+    }
+  }
+  return undefined;
+};
 
 /**
  * Collect PHPDoc @param type bindings from comment nodes preceding a method/function.
@@ -243,15 +304,40 @@ const scanConstructorBinding: ConstructorBindingScanner = (node) => {
 const PHPDOC_RETURN_RE = /@return\s+(\S+)/;
 
 /**
+ * Normalize a PHPDoc return type for storage in the SymbolTable.
+ * Unlike normalizePhpType (which strips User[] → User for scopeEnv), this preserves
+ * array notation so lookupRawReturnType can extract element types for for-loop resolution.
+ *   \App\Models\User[] → User[]
+ *   ?User → User
+ *   Collection<User> → Collection<User>  (preserved for extractElementTypeFromString)
+ */
+const normalizePhpReturnType = (raw: string): string | undefined => {
+  // Strip nullable prefix: ?User[] → User[]
+  let type = raw.startsWith('?') ? raw.slice(1) : raw;
+  // Strip union with null/false/void: User[]|null → User[]
+  const parts = type.split('|').filter(p => p !== 'null' && p !== 'false' && p !== 'void' && p !== 'mixed');
+  if (parts.length !== 1) return undefined;
+  type = parts[0];
+  // Strip namespace: \App\Models\User[] → User[]
+  const segments = type.split('\\');
+  type = segments[segments.length - 1];
+  // Skip uninformative types
+  if (type === 'mixed' || type === 'void' || type === 'self' || type === 'static' || type === 'object' || type === 'array') return undefined;
+  if (/^\w+(\[\])?$/.test(type) || /^\w+\s*</.test(type)) return type;
+  return undefined;
+};
+
+/**
  * Extract return type from PHPDoc `@return Type` annotation preceding a method.
  * Walks backwards through preceding siblings looking for comment nodes.
+ * Preserves array notation (e.g., User[]) for for-loop element type extraction.
  */
 const extractReturnType: ReturnTypeExtractor = (node) => {
   let sibling = node.previousSibling;
   while (sibling) {
     if (sibling.type === 'comment') {
       const match = PHPDOC_RETURN_RE.exec(sibling.text);
-      if (match) return normalizePhpType(match[1]);
+      if (match) return normalizePhpReturnType(match[1]);
     } else if (sibling.isNamed && !SKIP_NODE_TYPES.has(sibling.type)) break;
     sibling = sibling.previousSibling;
   }
@@ -269,7 +355,7 @@ const extractPendingAssignment: PendingAssignmentExtractor = (node, scopeEnv) =>
   const lhs = left.text;
   const rhs = right.text;
   if (!lhs || !rhs || scopeEnv.has(lhs)) return undefined;
-  return { lhs, rhs };
+  return { kind: 'copy', lhs, rhs };
 };
 
 const FOR_LOOP_NODE_TYPES: ReadonlySet<string> = new Set([
@@ -323,12 +409,7 @@ const findPhpParamElementType = (iterableName: string, startNode: SyntaxNode): s
  * constructor-binding cases that retain container types), then fall back to direct
  * scopeEnv lookup (for PHPDoc-normalized types).
  */
-const extractForLoopBinding: ForLoopExtractor = (
-  node: SyntaxNode,
-  scopeEnv: Map<string, string>,
-  declarationTypeNodes: ReadonlyMap<string, SyntaxNode>,
-  scope: string,
-): void => {
+const extractForLoopBinding: ForLoopExtractor = (node,  { scopeEnv, declarationTypeNodes, scope, returnTypeLookup }): void => {
   if (node.type !== 'foreach_statement') return;
 
   // Collect non-body named children: first is the iterable, second is value or pair
@@ -362,6 +443,7 @@ const extractForLoopBinding: ForLoopExtractor = (
 
   // Get iterable variable name (PHP vars include $ prefix)
   let iterableName: string | undefined;
+  let callExprElementType: string | undefined;
   if (iterableNode.type === 'variable_name') {
     iterableName = iterableNode.text;
   } else if (iterableNode?.type === 'member_access_expression') {
@@ -369,8 +451,28 @@ const extractForLoopBinding: ForLoopExtractor = (
     // PHP properties are stored in scopeEnv with $ prefix ($users), but
     // member_access_expression.name returns without $ (users). Add $ to match.
     if (name) iterableName = '$' + name.text;
+  } else if (iterableNode?.type === 'function_call_expression') {
+    // foreach (getUsers() as $user) — resolve via return type lookup
+    const calleeName = extractCalleeName(iterableNode);
+    if (calleeName) {
+      const rawReturn = returnTypeLookup.lookupRawReturnType(calleeName);
+      if (rawReturn) callExprElementType = extractElementTypeFromString(rawReturn);
+    }
+  } else if (iterableNode?.type === 'member_call_expression') {
+    // foreach ($this->getUsers() as $user) — resolve via return type lookup
+    const methodName = iterableNode.childForFieldName('name');
+    if (methodName) {
+      const rawReturn = returnTypeLookup.lookupRawReturnType(methodName.text);
+      if (rawReturn) callExprElementType = extractElementTypeFromString(rawReturn);
+    }
   }
-  if (!iterableName) return;
+  if (!iterableName && !callExprElementType) return;
+
+  // If we resolved the element type from a call expression, bind and return early
+  if (callExprElementType) {
+    scopeEnv.set(varName, callExprElementType);
+    return;
+  }
 
   // Strategy A: try resolveIterableElementType (handles constructor-binding container types)
   const elementType = resolveIterableElementType(
@@ -388,6 +490,27 @@ const extractForLoopBinding: ForLoopExtractor = (
   const iterableType = scopeEnv.get(iterableName);
   if (iterableType) {
     scopeEnv.set(varName, iterableType);
+    return;
+  }
+
+  // Strategy C: $this->property — scan the enclosing class body for the property
+  // declaration and extract its element type from @var PHPDoc or native type.
+  // This handles the common PHP pattern where the property type is declared on the
+  // class body (/** @var User[] */ private $users) but the foreach is in a method
+  // whose scopeEnv does not contain the property type.
+  if (iterableNode?.type === 'member_access_expression') {
+    const obj = iterableNode.childForFieldName('object');
+    if (obj?.text === '$this') {
+      const nameNode = iterableNode.childForFieldName('name');
+      const propName = nameNode?.text;
+      if (propName) {
+        const classNode = findEnclosingClass(iterableNode);
+        if (classNode) {
+          const elementType = findClassPropertyElementType(propName, classNode);
+          if (elementType) scopeEnv.set(varName, elementType);
+        }
+      }
+    }
   }
 };
 

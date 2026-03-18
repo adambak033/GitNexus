@@ -286,12 +286,7 @@ const findGoParamElementType = (iterableName: string, startNode: SyntaxNode, pos
  * For `_, user := range users`, the loop variable is the second identifier in
  * the `left` expression_list (index is discarded, value is the element).
  */
-const extractForLoopBinding: ForLoopExtractor = (
-  node: SyntaxNode,
-  scopeEnv: Map<string, string>,
-  declarationTypeNodes: ReadonlyMap<string, SyntaxNode>,
-  scope: string,
-): void => {
+const extractForLoopBinding: ForLoopExtractor = (node, { scopeEnv, declarationTypeNodes, scope, returnTypeLookup }): void => {
   if (node.type !== 'for_statement') return;
 
   // Find the range_clause child — this distinguishes range loops from other for forms.
@@ -308,21 +303,41 @@ const extractForLoopBinding: ForLoopExtractor = (
   // The iterable is the `right` field of the range_clause.
   const rightNode = rangeClause.childForFieldName('right');
   let iterableName: string | undefined;
+  let callExprElementType: string | undefined;
   if (rightNode?.type === 'identifier') {
     iterableName = rightNode.text;
   } else if (rightNode?.type === 'selector_expression') {
     const field = rightNode.childForFieldName('field');
     if (field) iterableName = field.text;
+  } else if (rightNode?.type === 'call_expression') {
+    // Range over a call result: `for _, v := range getItems()` or `for _, v := range repo.All()`
+    const funcNode = rightNode.childForFieldName('function');
+    let callee: string | undefined;
+    if (funcNode?.type === 'identifier') {
+      callee = funcNode.text;
+    } else if (funcNode?.type === 'selector_expression') {
+      const field = funcNode.childForFieldName('field');
+      if (field) callee = field.text;
+    }
+    if (callee) {
+      const rawReturn = returnTypeLookup.lookupRawReturnType(callee);
+      if (rawReturn) callExprElementType = extractElementTypeFromString(rawReturn);
+    }
   }
-  if (!iterableName) return;
+  if (!iterableName && !callExprElementType) return;
 
-  const containerTypeName = scopeEnv.get(iterableName);
-  const typeArgPos = methodToTypeArgPosition(undefined, containerTypeName);
-  const elementType = resolveIterableElementType(
-    iterableName, node, scopeEnv, declarationTypeNodes, scope,
-    extractGoElementTypeFromTypeNode, findGoParamElementType,
-    typeArgPos,
-  );
+  let elementType: string | undefined;
+  if (callExprElementType) {
+    elementType = callExprElementType;
+  } else {
+    const containerTypeName = scopeEnv.get(iterableName!);
+    const typeArgPos = methodToTypeArgPosition(undefined, containerTypeName);
+    elementType = resolveIterableElementType(
+      iterableName!, node, scopeEnv, declarationTypeNodes, scope,
+      extractGoElementTypeFromTypeNode, findGoParamElementType,
+      typeArgPos,
+    );
+  }
   if (!elementType) return;
 
   // The loop variable(s) are in the `left` field.
@@ -339,8 +354,11 @@ const extractForLoopBinding: ForLoopExtractor = (
       // Two-var form: `_, user` or `i, user` — second variable gets element/value type
       loopVarNode = leftNode.namedChild(1);
     } else {
-      // Single-var in expression_list — yields INDEX for slices/maps, ELEMENT for channels
-      if (isChannelType(iterableName, scopeEnv, declarationTypeNodes, scope)) {
+      // Single-var in expression_list — yields INDEX for slices/maps, ELEMENT for channels.
+      // For call-expression iterables (iterableName undefined), conservative: treat as non-channel.
+      // Channels are rarely returned from function calls, and even if they were, skipping here
+      // just means we miss a binding rather than create an incorrect one.
+      if (iterableName && isChannelType(iterableName, scopeEnv, declarationTypeNodes, scope)) {
         loopVarNode = leftNode.namedChild(0);
       } else {
         return; // index-only range on slice/map — skip
@@ -348,7 +366,10 @@ const extractForLoopBinding: ForLoopExtractor = (
     }
   } else {
     // Plain identifier (single-var form without expression_list)
-    if (isChannelType(iterableName, scopeEnv, declarationTypeNodes, scope)) {
+    // For call-expression iterables (iterableName undefined), conservative: treat as non-channel.
+    // Channels are rarely returned from function calls, and even if they were, skipping here
+    // just means we miss a binding rather than create an incorrect one.
+    if (iterableName && isChannelType(iterableName, scopeEnv, declarationTypeNodes, scope)) {
       loopVarNode = leftNode;
     } else {
       return; // index-only range on slice/map — skip
@@ -375,7 +396,7 @@ const extractPendingAssignment: PendingAssignmentExtractor = (node, scopeEnv) =>
     if (lhsNode.type !== 'identifier') return undefined;
     const lhs = lhsNode.text;
     if (scopeEnv.has(lhs)) return undefined;
-    if (rhsNode.type === 'identifier') return { lhs, rhs: rhsNode.text };
+    if (rhsNode.type === 'identifier') return { kind: 'copy', lhs, rhs: rhsNode.text };
     return undefined;
   }
   if (node.type === 'var_spec' || node.type === 'var_declaration') {
@@ -400,7 +421,7 @@ const extractPendingAssignment: PendingAssignmentExtractor = (node, scopeEnv) =>
         if (spec.child(i)?.type === 'expression_list') { exprList = spec.child(i); break; }
       }
       const rhsNode = exprList?.firstNamedChild;
-      if (rhsNode?.type === 'identifier') return { lhs, rhs: rhsNode.text };
+      if (rhsNode?.type === 'identifier') return { kind: 'copy', lhs, rhs: rhsNode.text };
     }
   }
   return undefined;

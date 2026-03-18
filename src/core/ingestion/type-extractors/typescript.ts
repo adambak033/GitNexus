@@ -333,12 +333,7 @@ const findTsIterableElementType = (iterableName: string, startNode: SyntaxNode, 
  *   3. AST walk — walks up to the enclosing function's parameters to read User[] annotations directly
  * Only handles `for...of`; `for...in` produces string keys, not element types.
  */
-const extractForLoopBinding: ForLoopExtractor = (
-  node: SyntaxNode,
-  scopeEnv: Map<string, string>,
-  declarationTypeNodes: ReadonlyMap<string, SyntaxNode>,
-  scope: string,
-): void => {
+const extractForLoopBinding: ForLoopExtractor = (node, { scopeEnv, declarationTypeNodes, scope, returnTypeLookup }): void => {
   if (node.type !== 'for_in_statement') return;
 
   // Confirm this is `for...of`, not `for...in`, by scanning unnamed children for the keyword text.
@@ -352,10 +347,11 @@ const extractForLoopBinding: ForLoopExtractor = (
   }
   if (!isForOf) return;
 
-  // The iterable is the `right` field — may be identifier or call_expression.
+  // The iterable is the `right` field — may be identifier, member_expression, or call_expression.
   const rightNode = node.childForFieldName('right');
   let iterableName: string | undefined;
   let methodName: string | undefined;
+  let callExprElementType: string | undefined;
   if (rightNode?.type === 'identifier') {
     iterableName = rightNode.text;
   } else if (rightNode?.type === 'member_expression') {
@@ -364,6 +360,7 @@ const extractForLoopBinding: ForLoopExtractor = (
   } else if (rightNode?.type === 'call_expression') {
     // entries.values() → call_expression > function: member_expression > object + property
     // this.repos.values() → nested member_expression: extract property from inner member
+    // getUsers() → call_expression > function: identifier (Phase 7.3 — return-type path)
     const fn = rightNode.childForFieldName('function');
     if (fn?.type === 'member_expression') {
       const obj = fn.childForFieldName('object');
@@ -376,18 +373,27 @@ const extractForLoopBinding: ForLoopExtractor = (
         if (innerProp) iterableName = innerProp.text;
       }
       if (prop?.type === 'property_identifier') methodName = prop.text;
+    } else if (fn?.type === 'identifier') {
+      // Direct function call: for (const user of getUsers())
+      const rawReturn = returnTypeLookup.lookupRawReturnType(fn.text);
+      if (rawReturn) callExprElementType = extractElementTypeFromString(rawReturn);
     }
   }
-  if (!iterableName) return;
+  if (!iterableName && !callExprElementType) return;
 
-  // Look up the container's base type name for descriptor-aware resolution
-  const containerTypeName = scopeEnv.get(iterableName);
-  const typeArgPos = methodToTypeArgPosition(methodName, containerTypeName);
-  const elementType = resolveIterableElementType(
-    iterableName, node, scopeEnv, declarationTypeNodes, scope,
-    extractTsElementTypeFromAnnotation, findTsIterableElementType,
-    typeArgPos,
-  );
+  let elementType: string | undefined;
+  if (callExprElementType) {
+    elementType = callExprElementType;
+  } else {
+    // Look up the container's base type name for descriptor-aware resolution
+    const containerTypeName = scopeEnv.get(iterableName!);
+    const typeArgPos = methodToTypeArgPosition(methodName, containerTypeName);
+    elementType = resolveIterableElementType(
+      iterableName!, node, scopeEnv, declarationTypeNodes, scope,
+      extractTsElementTypeFromAnnotation, findTsIterableElementType,
+      typeArgPos,
+    );
+  }
   if (!elementType) return;
 
   // The loop variable is the `left` field.
@@ -433,7 +439,7 @@ const extractPendingAssignment: PendingAssignmentExtractor = (node, scopeEnv) =>
     if (!nameNode || !valueNode) continue;
     const lhs = nameNode.text;
     if (scopeEnv.has(lhs)) continue;
-    if (valueNode.type === 'identifier') return { lhs, rhs: valueNode.text };
+    if (valueNode.type === 'identifier') return { kind: 'copy', lhs, rhs: valueNode.text };
   }
   return undefined;
 };

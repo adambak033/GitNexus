@@ -1,9 +1,9 @@
 import type { SyntaxNode } from './utils.js';
-import { FUNCTION_NODE_TYPES, extractFunctionName, CLASS_CONTAINER_TYPES } from './utils.js';
+import { FUNCTION_NODE_TYPES, extractFunctionName, CLASS_CONTAINER_TYPES, isBuiltInOrNoise } from './utils.js';
 import { SupportedLanguages } from '../../config/supported-languages.js';
 import { typeConfigs, TYPED_PARAMETER_TYPES } from './type-extractors/index.js';
-import type { ClassNameLookup } from './type-extractors/types.js';
-import { extractSimpleTypeName, extractVarName, stripNullable } from './type-extractors/shared.js';
+import type { ClassNameLookup, ReturnTypeLookup, ForLoopExtractorContext } from './type-extractors/types.js';
+import { extractSimpleTypeName, extractVarName, stripNullable, extractReturnTypeName } from './type-extractors/shared.js';
 import type { SymbolTable } from './symbol-table.js';
 
 /**
@@ -376,13 +376,39 @@ export const buildTypeEnv = (
   const config = typeConfigs[language];
   const bindings: ConstructorBinding[] = [];
 
+  // Build ReturnTypeLookup from optional SymbolTable.
+  // Conservative: returns undefined when callee is ambiguous (0 or 2+ matches).
+  const returnTypeLookup: ReturnTypeLookup = {
+    lookupReturnType(callee: string): string | undefined {
+      if (!symbolTable) return undefined;
+      if (isBuiltInOrNoise(callee)) return undefined;
+      const callables = symbolTable.lookupFuzzyCallable(callee);
+      if (callables.length !== 1) return undefined;
+      const rawReturn = callables[0].returnType;
+      if (!rawReturn) return undefined;
+      return extractReturnTypeName(rawReturn);
+    },
+    lookupRawReturnType(callee: string): string | undefined {
+      if (!symbolTable) return undefined;
+      if (isBuiltInOrNoise(callee)) return undefined;
+      const callables = symbolTable.lookupFuzzyCallable(callee);
+      if (callables.length !== 1) return undefined;
+      return callables[0].returnType;
+    }
+  };
+
   // Pre-compute combined set of node types that need extractTypeBinding.
   // Single Set.has() replaces 3 separate checks per node in walk().
   const interestingNodeTypes = new Set<string>();
   TYPED_PARAMETER_TYPES.forEach(t => interestingNodeTypes.add(t));
   config.declarationNodeTypes.forEach(t => interestingNodeTypes.add(t));
   config.forLoopNodeTypes?.forEach(t => interestingNodeTypes.add(t));
-  const pendingAssignments: Array<{ scope: string; lhs: string; rhs: string }> = [];
+  // Tier 2: copy-propagation (`const b = a`) and call-result propagation (`const b = foo()`)
+  const pendingCopies: Array<{ scope: string; lhs: string; rhs: string }> = [];
+  // NOTE: Infrastructure-ready — no language extractor currently returns { kind: 'callResult' }
+  // from extractPendingAssignment. When one does, this array will bind variables to their
+  // function return types at TypeEnv build time. See PendingAssignment in types.ts.
+  const pendingCallResults: Array<{ scope: string; lhs: string; callee: string }> = [];
   // Maps `scope\0varName` → the type annotation AST node from the original declaration.
   // Allows pattern extractors to navigate back to the declaration's generic type arguments
   // (e.g., to extract T from Result<T, E> for `if let Ok(x) = res`).
@@ -448,7 +474,10 @@ export const buildTypeEnv = (
     // For-each loop variable bindings (Java/C#/Kotlin): explicit element types in the AST.
     // Checked before declarationNodeTypes — loop variables are not declarations.
     if (config.forLoopNodeTypes?.has(node.type)) {
-      config.extractForLoopBinding?.(node, scopeEnv, declarationTypeNodes, scope);
+      if (config.extractForLoopBinding) {
+        const forLoopCtx: ForLoopExtractorContext = { scopeEnv, declarationTypeNodes, scope, returnTypeLookup };
+        config.extractForLoopBinding(node, forLoopCtx);
+      }
       return;
     }
     if (config.declarationNodeTypes.has(node.type)) {
@@ -580,7 +609,11 @@ export const buildTypeEnv = (
       if (scopeEnv) {
         const pending = config.extractPendingAssignment(node, scopeEnv);
         if (pending) {
-          pendingAssignments.push({ scope, ...pending });
+          if (pending.kind === 'copy') {
+            pendingCopies.push({ scope, lhs: pending.lhs, rhs: pending.rhs });
+          } else {
+            pendingCallResults.push({ scope, lhs: pending.lhs, callee: pending.callee });
+          }
         }
       }
     }
@@ -606,18 +639,28 @@ export const buildTypeEnv = (
 
   walk(tree.rootNode, FILE_SCOPE);
 
-  // Tier 2: single-pass assignment chain propagation in source order.
-  // Resolves `const b = a` where `a` has a known type from Tier 0/1.
+  // Tier 2a: copy-propagation — `const b = a` where `a` has a known type from Tier 0/1.
   // Multi-hop chains resolve when forward-declared (a→b→c in source order);
   // reverse-order assignments are depth-1 only. No fixpoint iteration —
   // this covers 95%+ of real-world patterns.
-  for (const { scope, lhs, rhs } of pendingAssignments) {
+  for (const { scope, lhs, rhs } of pendingCopies) {
     const scopeEnv = env.get(scope);
     if (!scopeEnv || scopeEnv.has(lhs)) continue;
     const rhsType = scopeEnv.get(rhs) ?? env.get(FILE_SCOPE)?.get(rhs);
-    if (rhsType) {
-      scopeEnv.set(lhs, rhsType);
-    }
+    if (rhsType) scopeEnv.set(lhs, rhsType);
+  }
+
+  // Tier 2b: call-result propagation — `const b = foo()` where `foo` has a declared return type.
+  // Uses ReturnTypeLookup which is backed by SymbolTable.lookupFuzzyCallable.
+  // Conservative: only binds when exactly one callable matches (avoids overload ambiguity).
+  // NOTE: Currently dormant — no extractPendingAssignment implementation emits 'callResult' yet.
+  // The loop is structurally complete and will activate when any language extractor starts
+  // returning { kind: 'callResult', lhs, callee } from extractPendingAssignment.
+  for (const { scope, lhs, callee } of pendingCallResults) {
+    const scopeEnv = env.get(scope);
+    if (!scopeEnv || scopeEnv.has(lhs)) continue;
+    const typeName = returnTypeLookup.lookupReturnType(callee);
+    if (typeName) scopeEnv.set(lhs, typeName);
   }
 
   return {

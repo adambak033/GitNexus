@@ -342,12 +342,7 @@ const findRubyParamElementType = (iterableName: string, startNode: SyntaxNode): 
  * Ruby has no static types on loop variables, so this mainly works when the
  * iterable has a YARD-annotated container type (e.g., `@param users [Array<User>]`).
  */
-const extractForLoopBinding: ForLoopExtractor = (
-  node: SyntaxNode,
-  scopeEnv: Map<string, string>,
-  declarationTypeNodes: ReadonlyMap<string, SyntaxNode>,
-  scope: string,
-): void => {
+const extractForLoopBinding: ForLoopExtractor = (node, { scopeEnv, declarationTypeNodes, scope }): void => {
   if (node.type !== 'for') return;
 
   // The loop variable is the `pattern` field (identifier).
@@ -395,7 +390,7 @@ const extractPendingAssignment: PendingAssignmentExtractor = (node, scopeEnv) =>
   if (scopeEnv.has(varName)) return undefined;
   const rhsNode = node.childForFieldName('right');
   if (!rhsNode || rhsNode.type !== 'identifier') return undefined;
-  return { lhs: varName, rhs: rhsNode.text };
+  return { kind: 'copy', lhs: varName, rhs: rhsNode.text };
 };
 
 export const typeConfig: LanguageTypeConfig = {
