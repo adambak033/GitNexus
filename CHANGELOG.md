@@ -2,6 +2,33 @@
 
 All notable changes to GitNexus will be documented in this file.
 
+## [1.4.6] - 2026-03-18
+
+### Added
+- **Phase 7 type resolution** — return-aware loop inference for call-expression iterables (#341)
+  - `ReturnTypeLookup` interface with `lookupReturnType` / `lookupRawReturnType` split
+  - `ForLoopExtractorContext` context object replacing positional `(node, env)` signature
+  - Call-expression iterable resolution across 8 languages (TS/JS, Java, Kotlin, C#, Go, Rust, Python, PHP)
+  - PHP `$this->property` foreach via `@var` class property scan (Strategy C)
+  - PHP `function_call_expression` and `member_call_expression` foreach paths
+  - `extractElementTypeFromString` as canonical raw-string container unwrapper in `shared.ts`
+  - `extractReturnTypeName` deduplicated from `call-processor.ts` into `shared.ts` (137 lines removed)
+  - `SKIP_SUBTREE_TYPES` performance optimization with documented `template_string` exclusion
+  - `pendingCallResults` infrastructure (dormant — Phase 9 work)
+
+### Fixed
+- **impact**: return structured error + partial results instead of crashing (#345)
+- **impact**: add `HAS_METHOD` and `OVERRIDES` to `VALID_RELATION_TYPES` (#350)
+- **cli**: write tool output to stdout via fd 1 instead of stderr (#346)
+- **postinstall**: add permission fix for CLI and hook scripts (#348)
+- **workflow**: use prefixed temporary branch name for fork PRs to prevent overwriting real branches
+- **test**: add `--repo` to CLI e2e tool tests for multi-repo environment
+- **php**: add `declaration_list` type guard on `findClassPropertyElementType` fallback
+- **docs**: correct `pendingCallResults` description in roadmap and system docs
+
+### Chore
+- Add `.worktrees/` to `.gitignore`
+
 ## [1.4.5] - 2026-03-17
 
 ### Added
