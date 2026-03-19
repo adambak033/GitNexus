@@ -1336,3 +1336,26 @@ describe('Write access tracking (PHP)', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Call-result variable binding (Phase 9): $user = getUser(); $user->save()
+// ---------------------------------------------------------------------------
+
+describe('PHP call-result variable binding (Tier 2b)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'php-call-result-binding'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves $user->save() to User#save via call-result binding', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'processUser' && c.targetFilePath.includes('App')
+    );
+    expect(saveCall).toBeDefined();
+  });
+});

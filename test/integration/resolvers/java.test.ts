@@ -1232,3 +1232,26 @@ describe('Write access tracking (Java)', () => {
     expect(addressWrite!.source).toBe('updateUser');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Call-result variable binding (Phase 9): var user = getUser(); user.save()
+// ---------------------------------------------------------------------------
+
+describe('Java call-result variable binding (Tier 2b)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'java-call-result-binding'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves user.save() to User#save via call-result binding', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'processUser' && c.targetFilePath.includes('User')
+    );
+    expect(saveCall).toBeDefined();
+  });
+});

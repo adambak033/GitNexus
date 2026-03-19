@@ -641,7 +641,21 @@ export const buildTypeEnv = (
 
   walk(tree.rootNode, FILE_SCOPE);
 
-  // Tier 2a: copy-propagation — `const b = a` where `a` has a known type from Tier 0/1.
+  // Tier 2b: call-result propagation — `const b = foo()` where `foo` has a declared return type.
+  // Runs BEFORE Tier 2a so that call-result types are available for copy-propagation chains:
+  //   const user = getUser();  // Tier 2b: user → User (from SymbolTable return type)
+  //   const alias = user;      // Tier 2a: alias → User (from user's now-resolved type)
+  // Data flow: SymbolTable (immutable) → Tier 2b → scopeEnv → Tier 2a → scopeEnv.
+  // No circular dependency: 2b reads SymbolTable only, 2a reads scopeEnv only.
+  // Conservative: only binds when exactly one callable matches (avoids overload ambiguity).
+  for (const { scope, lhs, callee } of pendingCallResults) {
+    const scopeEnv = env.get(scope);
+    if (!scopeEnv || scopeEnv.has(lhs)) continue;
+    const typeName = returnTypeLookup.lookupReturnType(callee);
+    if (typeName) scopeEnv.set(lhs, typeName);
+  }
+
+  // Tier 2a: copy-propagation — `const b = a` where `a` has a known type from Tier 0/1/2b.
   // Multi-hop chains resolve when forward-declared (a→b→c in source order);
   // reverse-order assignments are depth-1 only. No fixpoint iteration —
   // this covers 95%+ of real-world patterns.
@@ -650,19 +664,6 @@ export const buildTypeEnv = (
     if (!scopeEnv || scopeEnv.has(lhs)) continue;
     const rhsType = scopeEnv.get(rhs) ?? env.get(FILE_SCOPE)?.get(rhs);
     if (rhsType) scopeEnv.set(lhs, rhsType);
-  }
-
-  // Tier 2b: call-result propagation — `const b = foo()` where `foo` has a declared return type.
-  // Uses ReturnTypeLookup which is backed by SymbolTable.lookupFuzzyCallable.
-  // Conservative: only binds when exactly one callable matches (avoids overload ambiguity).
-  // NOTE: Currently dormant — no extractPendingAssignment implementation emits 'callResult' yet.
-  // The loop is structurally complete and will activate when any language extractor starts
-  // returning { kind: 'callResult', lhs, callee } from extractPendingAssignment.
-  for (const { scope, lhs, callee } of pendingCallResults) {
-    const scopeEnv = env.get(scope);
-    if (!scopeEnv || scopeEnv.has(lhs)) continue;
-    const typeName = returnTypeLookup.lookupReturnType(callee);
-    if (typeName) scopeEnv.set(lhs, typeName);
   }
 
   return {

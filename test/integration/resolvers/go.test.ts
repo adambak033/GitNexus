@@ -1099,3 +1099,26 @@ describe('Write access tracking (Go)', () => {
     expect(addressWrite!.source).toBe('updateUser');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Call-result variable binding (Phase 9): user := GetUser(); user.Save()
+// ---------------------------------------------------------------------------
+
+describe('Go call-result variable binding (Tier 2b)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'go-call-result-binding'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves user.Save() to User#Save via call-result binding', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'Save' && c.source === 'processUser' && c.targetFilePath.includes('models')
+    );
+    expect(saveCall).toBeDefined();
+  });
+});

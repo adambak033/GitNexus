@@ -397,6 +397,13 @@ const extractPendingAssignment: PendingAssignmentExtractor = (node, scopeEnv) =>
     const lhs = lhsNode.text;
     if (scopeEnv.has(lhs)) return undefined;
     if (rhsNode.type === 'identifier') return { kind: 'copy', lhs, rhs: rhsNode.text };
+    // call_expression RHS → callResult (simple calls only)
+    if (rhsNode.type === 'call_expression') {
+      const funcNode = rhsNode.childForFieldName('function');
+      if (funcNode?.type === 'identifier') {
+        return { kind: 'callResult', lhs, callee: funcNode.text };
+      }
+    }
     return undefined;
   }
   if (node.type === 'var_spec' || node.type === 'var_declaration') {
@@ -422,6 +429,13 @@ const extractPendingAssignment: PendingAssignmentExtractor = (node, scopeEnv) =>
       }
       const rhsNode = exprList?.firstNamedChild;
       if (rhsNode?.type === 'identifier') return { kind: 'copy', lhs, rhs: rhsNode.text };
+      // call_expression RHS → callResult (simple calls only)
+      if (rhsNode?.type === 'call_expression') {
+        const funcNode = rhsNode.childForFieldName('function');
+        if (funcNode?.type === 'identifier') {
+          return { kind: 'callResult', lhs, callee: funcNode.text };
+        }
+      }
     }
   }
   return undefined;

@@ -1395,3 +1395,26 @@ describe('Write access tracking (Kotlin)', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Call-result variable binding (Phase 9): val user = getUser(); user.save()
+// ---------------------------------------------------------------------------
+
+describe('Kotlin call-result variable binding (Tier 2b)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'kotlin-call-result-binding'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves user.save() to User#save via call-result binding', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'processUser' && c.targetFilePath.includes('User')
+    );
+    expect(saveCall).toBeDefined();
+  });
+});

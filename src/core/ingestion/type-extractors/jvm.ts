@@ -199,6 +199,16 @@ const extractJavaPendingAssignment: PendingAssignmentExtractor = (node, scopeEnv
     const lhs = nameNode.text;
     if (scopeEnv.has(lhs)) continue;
     if (valueNode.type === 'identifier' || valueNode.type === 'simple_identifier') return { kind: 'copy', lhs, rhs: valueNode.text };
+    // method_invocation RHS → callResult (no-receiver calls only)
+    if (valueNode.type === 'method_invocation') {
+      const objField = valueNode.childForFieldName('object');
+      if (!objField) {
+        const nameField = valueNode.childForFieldName('name');
+        if (nameField?.type === 'identifier') {
+          return { kind: 'callResult', lhs, callee: nameField.text };
+        }
+      }
+    }
   }
   return undefined;
 };
@@ -541,7 +551,7 @@ const extractKotlinPendingAssignment: PendingAssignmentExtractor = (node, scopeE
     if (!nameNode || nameNode.type !== 'simple_identifier') return undefined;
     const lhs = nameNode.text;
     if (scopeEnv.has(lhs)) return undefined;
-    // Find the RHS: a simple_identifier sibling after the "=" token
+    // Find the RHS after the "=" token
     let foundEq = false;
     for (let i = 0; i < node.childCount; i++) {
       const child = node.child(i);
@@ -549,6 +559,13 @@ const extractKotlinPendingAssignment: PendingAssignmentExtractor = (node, scopeE
       if (child.type === '=') { foundEq = true; continue; }
       if (foundEq && child.type === 'simple_identifier') {
         return { kind: 'copy', lhs, rhs: child.text };
+      }
+      // call_expression RHS → callResult (simple callee only)
+      if (foundEq && child.type === 'call_expression') {
+        const calleeNode = child.firstNamedChild;
+        if (calleeNode?.type === 'simple_identifier') {
+          return { kind: 'callResult', lhs, callee: calleeNode.text };
+        }
       }
     }
     return undefined;
@@ -560,7 +577,7 @@ const extractKotlinPendingAssignment: PendingAssignmentExtractor = (node, scopeE
     if (!nameNode) return undefined;
     const lhs = nameNode.text;
     if (scopeEnv.has(lhs)) return undefined;
-    // Look for RHS simple_identifier after "=" in the parent (property_declaration)
+    // Look for RHS after "=" in the parent (property_declaration)
     // variable_declaration itself doesn't contain "=" — it's in the parent
     const parent = node.parent;
     if (!parent) return undefined;
@@ -571,6 +588,13 @@ const extractKotlinPendingAssignment: PendingAssignmentExtractor = (node, scopeE
       if (child.type === '=') { foundEq = true; continue; }
       if (foundEq && child.type === 'simple_identifier') {
         return { kind: 'copy', lhs, rhs: child.text };
+      }
+      // call_expression RHS → callResult (simple callee only)
+      if (foundEq && child.type === 'call_expression') {
+        const calleeNode = child.firstNamedChild;
+        if (calleeNode?.type === 'simple_identifier') {
+          return { kind: 'callResult', lhs, callee: calleeNode.text };
+        }
       }
     }
     return undefined;

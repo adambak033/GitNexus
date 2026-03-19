@@ -389,8 +389,17 @@ const extractPendingAssignment: PendingAssignmentExtractor = (node, scopeEnv) =>
   const varName = lhsNode.text;
   if (scopeEnv.has(varName)) return undefined;
   const rhsNode = node.childForFieldName('right');
-  if (!rhsNode || rhsNode.type !== 'identifier') return undefined;
-  return { kind: 'copy', lhs: varName, rhs: rhsNode.text };
+  if (!rhsNode) return undefined;
+  if (rhsNode.type === 'identifier') return { kind: 'copy', lhs: varName, rhs: rhsNode.text };
+  // call/method_call RHS → callResult (calls with explicit parens, no receiver)
+  if (rhsNode.type === 'call' || rhsNode.type === 'method_call') {
+    const methodNode = rhsNode.childForFieldName('method');
+    const receiverNode = rhsNode.childForFieldName('receiver');
+    if (!receiverNode && methodNode?.type === 'identifier') {
+      return { kind: 'callResult', lhs: varName, callee: methodNode.text };
+    }
+  }
+  return undefined;
 };
 
 export const typeConfig: LanguageTypeConfig = {

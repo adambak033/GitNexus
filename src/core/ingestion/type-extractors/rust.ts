@@ -198,6 +198,13 @@ const extractPendingAssignment: PendingAssignmentExtractor = (node, scopeEnv) =>
   const lhs = extractVarName(pattern);
   if (!lhs || scopeEnv.has(lhs)) return undefined;
   if (value.type === 'identifier') return { kind: 'copy', lhs, rhs: value.text };
+  // call_expression RHS → callResult (simple calls only, not method_call_expression)
+  if (value.type === 'call_expression') {
+    const funcNode = value.childForFieldName('function');
+    if (funcNode?.type === 'identifier') {
+      return { kind: 'callResult', lhs, callee: funcNode.text };
+    }
+  }
   return undefined;
 };
 

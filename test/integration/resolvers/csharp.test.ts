@@ -1316,3 +1316,26 @@ describe('Write access tracking (C#)', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Call-result variable binding (Phase 9): var user = GetUser(); user.Save()
+// ---------------------------------------------------------------------------
+
+describe('C# call-result variable binding (Tier 2b)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'csharp-call-result-binding'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves user.Save() to User#Save via call-result binding', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'Save' && c.source === 'ProcessUser' && c.targetFilePath.includes('App')
+    );
+    expect(saveCall).toBeDefined();
+  });
+});

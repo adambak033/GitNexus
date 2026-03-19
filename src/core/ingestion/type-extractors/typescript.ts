@@ -440,6 +440,16 @@ const extractPendingAssignment: PendingAssignmentExtractor = (node, scopeEnv) =>
     const lhs = nameNode.text;
     if (scopeEnv.has(lhs)) continue;
     if (valueNode.type === 'identifier') return { kind: 'copy', lhs, rhs: valueNode.text };
+    // call_expression RHS → callResult (simple calls only)
+    // Unwrap await: `const user = await fetchUser()` → call_expression
+    const callNode = unwrapAwait(valueNode);
+    if (!callNode || callNode.type !== 'call_expression') continue;
+    // CRITICAL: Check funcNode.type === 'identifier', NOT extractCalleeName().
+    // extractCalleeName returns last segment of member_expression ('getUser' from 'repo.getUser'),
+    // which would false-match method calls. Direct type check is the correct guard.
+    const funcNode = callNode.childForFieldName('function');
+    if (!funcNode || funcNode.type !== 'identifier') continue;
+    return { kind: 'callResult', lhs, callee: funcNode.text };
   }
   return undefined;
 };

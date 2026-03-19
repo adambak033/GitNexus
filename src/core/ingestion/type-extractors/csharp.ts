@@ -327,6 +327,23 @@ const extractPendingAssignment: PendingAssignmentExtractor = (node, scopeEnv) =>
     if (valueNode && valueNode !== nameNode && (valueNode.type === 'identifier' || valueNode.type === 'simple_identifier')) {
       return { kind: 'copy', lhs, rhs: valueNode.text };
     }
+    // invocation_expression RHS → callResult (simple calls only)
+    if (valueNode?.type === 'invocation_expression') {
+      const funcNode = valueNode.firstNamedChild;
+      if (funcNode?.type === 'identifier_name' || funcNode?.type === 'identifier') {
+        return { kind: 'callResult', lhs, callee: funcNode.text };
+      }
+    }
+    // await_expression → invocation_expression RHS → callResult
+    if (valueNode?.type === 'await_expression') {
+      const inner = valueNode.firstNamedChild;
+      if (inner?.type === 'invocation_expression') {
+        const funcNode = inner.firstNamedChild;
+        if (funcNode?.type === 'identifier_name' || funcNode?.type === 'identifier') {
+          return { kind: 'callResult', lhs, callee: funcNode.text };
+        }
+      }
+    }
   }
   return undefined;
 };

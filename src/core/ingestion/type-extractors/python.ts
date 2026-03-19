@@ -358,6 +358,13 @@ const extractPendingAssignment: PendingAssignmentExtractor = (node, scopeEnv) =>
   const lhs = left.type === 'identifier' ? left.text : undefined;
   if (!lhs || scopeEnv.has(lhs)) return undefined;
   if (right.type === 'identifier') return { kind: 'copy', lhs, rhs: right.text };
+  // call RHS → callResult (simple calls only)
+  if (right.type === 'call') {
+    const funcNode = right.childForFieldName('function');
+    if (funcNode?.type === 'identifier') {
+      return { kind: 'callResult', lhs, callee: funcNode.text };
+    }
+  }
   return undefined;
 };
 

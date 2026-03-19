@@ -966,3 +966,26 @@ describe('Write access tracking (Ruby)', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Call-result variable binding (Phase 9): user = get_user(); user.save
+// ---------------------------------------------------------------------------
+
+describe('Ruby call-result variable binding (Tier 2b)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'ruby-call-result-binding'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves user.save to User#save via call-result binding', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'process_user' && c.targetFilePath.includes('app')
+    );
+    expect(saveCall).toBeDefined();
+  });
+});
