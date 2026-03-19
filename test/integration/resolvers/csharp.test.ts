@@ -1452,4 +1452,20 @@ describe('C# null-check narrowing resolution (Phase C)', () => {
     );
     expect(wrongCall).toBeUndefined();
   });
+
+  it('resolves x.Save() inside constructor via null-check narrowing', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'Save' && c.source === 'App' && c.targetFilePath.includes('User'),
+    );
+    expect(saveCall).toBeDefined();
+  });
+
+  it('resolves x.Save() inside lambda via null-check narrowing', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'Save' && c.source === 'ProcessInLambda' && c.targetFilePath.includes('User'),
+    );
+    expect(saveCall).toBeDefined();
+  });
 });

@@ -296,18 +296,19 @@ const findCSharpIfConsequenceBlock = (expr: SyntaxNode): SyntaxNode | undefined 
       }
       return undefined;
     }
-    if (current.type === 'block' || current.type === 'method_declaration') return undefined;
+    if (current.type === 'block' || current.type === 'method_declaration'
+      || current.type === 'constructor_declaration' || current.type === 'local_function_statement'
+      || current.type === 'lambda_expression') return undefined;
     current = current.parent;
   }
   return undefined;
 };
 
 /** Check if a C# declaration type node represents a nullable type.
- *  Checks for nullable_type node or text containing '?' or 'null'. */
+ *  Checks for nullable_type AST node or '?' in the type text (e.g., User?). */
 const isCSharpNullableDecl = (declTypeNode: SyntaxNode): boolean => {
   if (declTypeNode.type === 'nullable_type') return true;
-  const text = declTypeNode.text;
-  return text.includes('?') || text.includes('null');
+  return declTypeNode.text.includes('?');
 };
 
 const extractPatternBinding: PatternBindingExtractor = (node, scopeEnv, declarationTypeNodes, scope) => {

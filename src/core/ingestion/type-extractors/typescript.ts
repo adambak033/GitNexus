@@ -529,8 +529,8 @@ const findIfConsequenceBlock = (binaryExpr: SyntaxNode): SyntaxNode | undefined 
       return undefined;
     }
     // Stop climbing at function/block boundaries — don't cross scope
-    if (current.type === 'function_declaration' || current.type === 'arrow_function'
-      || current.type === 'method_definition') return undefined;
+    if (current.type === 'function_declaration' || current.type === 'function_expression'
+      || current.type === 'arrow_function' || current.type === 'method_definition') return undefined;
     current = current.parent;
   }
   return undefined;

@@ -2213,4 +2213,12 @@ describe('TypeScript null-check narrowing resolution (Phase C)', () => {
     );
     expect(saveCall).toBeDefined();
   });
+
+  it('resolves x.save() inside function expression null-check (processFuncExpr)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'processFuncExpr' && c.targetFilePath.includes('models'),
+    );
+    expect(saveCall).toBeDefined();
+  });
 });

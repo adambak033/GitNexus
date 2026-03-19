@@ -1523,4 +1523,12 @@ describe('Kotlin null-check narrowing resolution (Phase C)', () => {
     );
     expect(wrongCall).toBeUndefined();
   });
+
+  it('resolves x.save() from local variable val x: User? via null-check narrowing', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'processLocalNullable' && c.targetFilePath.includes('User'),
+    );
+    expect(saveCall).toBeDefined();
+  });
 });

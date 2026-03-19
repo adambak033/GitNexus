@@ -295,7 +295,8 @@ const extractKotlinDeclaration: TypeBindingExtractor = (node: SyntaxNode, env: M
     const varDecl = findChildByType(node, 'variable_declaration');
     if (varDecl) {
       const nameNode = findChildByType(varDecl, 'simple_identifier');
-      const typeNode = findChildByType(varDecl, 'user_type');
+      const typeNode = findChildByType(varDecl, 'user_type')
+        ?? findChildByType(varDecl, 'nullable_type');
       if (!nameNode || !typeNode) return;
       const varName = extractVarName(nameNode);
       const typeName = extractSimpleTypeName(typeNode);

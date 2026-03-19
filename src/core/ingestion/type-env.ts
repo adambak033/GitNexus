@@ -894,20 +894,12 @@ export const buildTypeEnv = (
   //   - fixpoint: users → User[]
   //   - replay: users now typed → u → User
   if (pendingForLoops.length > 0 && config.extractForLoopBinding) {
-    const replayPendingItems: Array<{ scope: string } & PendingAssignment> = [];
     for (const { node, scope } of pendingForLoops) {
       if (!env.has(scope)) env.set(scope, new Map());
       const scopeEnv = env.get(scope)!;
       config.extractForLoopBinding(node, { scopeEnv, declarationTypeNodes, scope, returnTypeLookup });
     }
-    // Collect any new pending items from replay-produced variables.
-    // Re-walk the for-loop bodies to pick up field/method chains on the now-typed loop vars.
-    // For simplicity, run a mini-fixpoint on any pending items that were already collected
-    // but couldn't resolve because they depended on the loop variable.
-    if (replayPendingItems.length > 0) {
-      resolveFixpointBindings(replayPendingItems, env, returnTypeLookup, symbolTable);
-    }
-    // Also re-run the main fixpoint to resolve items that depended on loop variables.
+    // Re-run the main fixpoint to resolve items that depended on loop variables.
     // Only needed if replay actually produced new bindings.
     const unresolvedBefore = pendingItems.filter((item) => {
       const scopeEnv = env.get(item.scope);
