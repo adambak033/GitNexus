@@ -46,6 +46,10 @@ export interface TypeEnvironment {
   readonly constructorBindings: readonly ConstructorBinding[];
   /** Raw per-scope type bindings — for testing and debugging. */
   readonly env: TypeEnv;
+  /** Maps `scope\0varName` → constructor type for virtual dispatch override.
+   *  Populated when a variable has BOTH a declared base type AND a more specific
+   *  constructor type (e.g., `Animal a = new Dog()` → key maps to 'Dog'). */
+  readonly constructorTypeMap: ReadonlyMap<string, string>;
 }
 
 /**
@@ -405,6 +409,63 @@ const createClassDefCache = (symbolTable?: SymbolTable) => {
   };
 };
 
+/** AST node types representing constructor expressions across languages. */
+const CONSTRUCTOR_EXPR_TYPES = new Set([
+  'new_expression',               // TS/JS: new Dog()
+  'object_creation_expression',   // Java/C#: new Dog()
+]);
+
+/** Extract the constructor class name from a declaration node's initializer.
+ *  Searches for new_expression / object_creation_expression in the node's subtree.
+ *  Returns the class name or undefined if no constructor is found.
+ *  Depth-limited to 5 to avoid expensive traversals. */
+const extractConstructorTypeName = (node: SyntaxNode, depth = 0): string | undefined => {
+  if (depth > 5) return undefined;
+  if (CONSTRUCTOR_EXPR_TYPES.has(node.type)) {
+    // Java/C#: object_creation_expression has 'type' field
+    const typeField = node.childForFieldName('type');
+    if (typeField) return extractSimpleTypeName(typeField);
+    // TS/JS: new_expression has 'constructor' field (but tree-sitter often just has identifier child)
+    const ctorField = node.childForFieldName('constructor');
+    if (ctorField) return extractSimpleTypeName(ctorField);
+    // Fallback: first named child is often the class identifier
+    if (node.firstNamedChild) return extractSimpleTypeName(node.firstNamedChild);
+  }
+  for (let i = 0; i < node.namedChildCount; i++) {
+    const child = node.namedChild(i);
+    if (!child) continue;
+    // Don't descend into nested functions/classes
+    if (FUNCTION_NODE_TYPES.has(child.type) || CLASS_CONTAINER_TYPES.has(child.type)) continue;
+    const result = extractConstructorTypeName(child, depth + 1);
+    if (result) return result;
+  }
+  return undefined;
+};
+
+/** Check if `child` is a subclass of `parent` using the parentMap.
+ *  BFS up from child, depth-limited (5), cycle-safe. */
+export const isSubclassOf = (
+  child: string, parent: string,
+  parentMap: ReadonlyMap<string, readonly string[]> | undefined,
+): boolean => {
+  if (!parentMap || child === parent) return false;
+  const visited = new Set<string>([child]);
+  let current = [child];
+  for (let depth = 0; depth < MAX_MRO_DEPTH && current.length > 0; depth++) {
+    const next: string[] = [];
+    for (const cls of current) {
+      const parents = parentMap.get(cls);
+      if (!parents) continue;
+      for (const p of parents) {
+        if (p === parent) return true;
+        if (!visited.has(p)) { visited.add(p); next.push(p); }
+      }
+    }
+    current = next;
+  }
+  return false;
+};
+
 /** Max depth for MRO parent chain walking. Real-world inheritance rarely exceeds 3-4 levels. */
 const MAX_MRO_DEPTH = 5;
 
@@ -592,6 +653,10 @@ export const buildTypeEnv = (
   const parentMap = options?.parentMap;
   const env: TypeEnv = new Map();
   const patternOverrides: PatternOverrides = new Map();
+  // Phase P: maps `scope\0varName` → constructor type when a declaration has BOTH
+  // a base type annotation AND a more specific constructor initializer.
+  // e.g., `Animal a = new Dog()` → constructorTypeMap.set('func@42\0a', 'Dog')
+  const constructorTypeMap = new Map<string, string>();
   const localClassNames = new Set<string>();
   const classNames = createClassNameLookup(localClassNames, symbolTable);
   const config = typeConfigs[language];
@@ -762,6 +827,22 @@ export const buildTypeEnv = (
       if (config.extractInitializer) {
         config.extractInitializer(node, scopeEnv, classNames);
       }
+
+      // Phase P: detect constructor-visible virtual dispatch.
+      // When a declaration has BOTH a type annotation AND a constructor initializer,
+      // record the constructor type for receiver override at call resolution time.
+      // e.g., `Animal a = new Dog()` → constructorTypeMap.set('scope\0a', 'Dog')
+      if (keysBefore) {
+        for (const varName of scopeEnv.keys()) {
+          if (keysBefore.has(varName)) continue;
+          const declaredType = scopeEnv.get(varName);
+          if (!declaredType) continue;
+          const ctorType = extractConstructorTypeName(node);
+          if (ctorType && ctorType !== declaredType) {
+            constructorTypeMap.set(`${scope}\0${varName}`, ctorType);
+          }
+        }
+      }
     }
   };
 
@@ -914,6 +995,7 @@ export const buildTypeEnv = (
     lookup: (varName, callNode) => lookupInEnv(env, varName, callNode, patternOverrides),
     constructorBindings: bindings,
     env,
+    constructorTypeMap,
   };
 };
 

@@ -23,7 +23,7 @@ import {
   extractMixedChain,
   type MixedChainStep,
 } from './utils.js';
-import { buildTypeEnv } from './type-env.js';
+import { buildTypeEnv, isSubclassOf } from './type-env.js';
 import type { ConstructorBinding } from './type-env.js';
 import { getTreeSitterBufferSize } from './constants.js';
 import type { ExtractedCall, ExtractedAssignment, ExtractedHeritage, ExtractedRoute, FileConstructorBindings } from './workers/parse-worker.js';
@@ -327,6 +327,28 @@ export const processCalls = async (
       const callForm = inferCallForm(callNode, nameNode);
       const receiverName = callForm === 'member' ? extractReceiverName(nameNode) : undefined;
       let receiverTypeName = receiverName && typeEnv ? typeEnv.lookup(receiverName, callNode) : undefined;
+      // Phase P: virtual dispatch override — when the declared type is a base class but
+      // the constructor created a known subclass, prefer the more specific type.
+      // Same-file only (parentMap is per-file from heritage pre-pass).
+      // Scans constructorTypeMap for entries matching `*\0receiverName` since
+      // reconstructing the exact scope key from call-processor context is fragile.
+      if (receiverTypeName && receiverName && typeEnv && typeEnv.constructorTypeMap.size > 0) {
+        // Quick scan for matching receiver name in constructorTypeMap
+        let ctorType: string | undefined;
+        for (const [key, val] of typeEnv.constructorTypeMap) {
+          const nul = key.indexOf('\0');
+          if (nul >= 0 && key.slice(nul + 1) === receiverName) {
+            ctorType = val;
+            break;
+          }
+        }
+        if (ctorType && ctorType !== receiverTypeName) {
+          // Verify subclass relationship via same-file parentMap
+          if (isSubclassOf(ctorType, receiverTypeName, parentMap)) {
+            receiverTypeName = ctorType;
+          }
+        }
+      }
       // Fall back to verified constructor bindings for return type inference
       if (!receiverTypeName && receiverName && receiverIndex.size > 0) {
         const enclosingFunc = findEnclosingFunction(callNode, file.path, ctx);
