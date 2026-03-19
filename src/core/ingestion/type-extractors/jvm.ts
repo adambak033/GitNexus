@@ -660,27 +660,76 @@ const findAncestorByType = (node: SyntaxNode, type: string): SyntaxNode | undefi
   return undefined;
 };
 
-const extractKotlinPatternBinding: PatternBindingExtractor = (node) => {
-  if (node.type !== 'type_test') return undefined;
-  const typeNode = node.lastNamedChild;
-  if (!typeNode) return undefined;
-  const typeName = extractSimpleTypeName(typeNode);
-  if (!typeName) return undefined;
-  const whenExpr = findAncestorByType(node, 'when_expression');
-  if (!whenExpr) return undefined;
-  const whenSubject = whenExpr.namedChild(0);
-  const subject = whenSubject?.firstNamedChild ?? whenSubject;
-  if (!subject) return undefined;
-  const varName = extractVarName(subject);
-  if (!varName) return undefined;
-  return { varName, typeName };
+const extractKotlinPatternBinding: PatternBindingExtractor = (node, scopeEnv, declarationTypeNodes, scope) => {
+  // Kotlin when/is smart casts (existing behavior)
+  if (node.type === 'type_test') {
+    const typeNode = node.lastNamedChild;
+    if (!typeNode) return undefined;
+    const typeName = extractSimpleTypeName(typeNode);
+    if (!typeName) return undefined;
+    const whenExpr = findAncestorByType(node, 'when_expression');
+    if (!whenExpr) return undefined;
+    const whenSubject = whenExpr.namedChild(0);
+    const subject = whenSubject?.firstNamedChild ?? whenSubject;
+    if (!subject) return undefined;
+    const varName = extractVarName(subject);
+    if (!varName) return undefined;
+    return { varName, typeName };
+  }
+
+  // Null-check narrowing: if (x != null) { ... }
+  // Kotlin AST: comparison_expression > simple_identifier, "!=", null_literal
+  if (node.type === 'comparison_expression') {
+    const op = node.children.find(c => !c.isNamed && c.text === '!=');
+    if (!op) return undefined;
+
+    const left = node.namedChild(0);
+    const right = node.namedChild(1);
+    if (!left || !right) return undefined;
+
+    let varNode: SyntaxNode | undefined;
+    if (left.type === 'simple_identifier' && right.type === 'null_literal') {
+      varNode = left;
+    } else if (right.type === 'simple_identifier' && left.type === 'null_literal') {
+      varNode = right;
+    }
+    if (!varNode) return undefined;
+
+    const varName = varNode.text;
+    const resolvedType = scopeEnv.get(varName);
+    if (!resolvedType) return undefined;
+
+    // Check if the original declaration type was nullable (ends with ?)
+    const declTypeNode = declarationTypeNodes.get(`${scope}\0${varName}`);
+    if (!declTypeNode) return undefined;
+    const declText = declTypeNode.text;
+    if (!declText.includes('?') && !declText.includes('null')) return undefined;
+
+    // Find the if-body: walk up to if_expression, then find control_structure_body
+    const ifExpr = findAncestorByType(node, 'if_expression');
+    if (!ifExpr) return undefined;
+    // The consequence is the first control_structure_body child
+    for (let i = 0; i < ifExpr.childCount; i++) {
+      const child = ifExpr.child(i);
+      if (child?.type === 'control_structure_body') {
+        return {
+          varName,
+          typeName: resolvedType,
+          narrowingRange: { startIndex: child.startIndex, endIndex: child.endIndex },
+        };
+      }
+    }
+    return undefined;
+  }
+
+  return undefined;
 };
 
 export const kotlinTypeConfig: LanguageTypeConfig = {
   allowPatternBindingOverwrite: true,
   declarationNodeTypes: KOTLIN_DECLARATION_NODE_TYPES,
   forLoopNodeTypes: KOTLIN_FOR_LOOP_NODE_TYPES,
-  patternBindingNodeTypes: new Set(['type_test']),
+  patternBindingNodeTypes: new Set(['type_test', 'comparison_expression']),
   extractDeclaration: extractKotlinDeclaration,
   extractParameter: extractKotlinParameter,
   extractInitializer: extractKotlinInitializer,

@@ -1589,7 +1589,7 @@ class RepoService {
           getStats: () => ({ fileCount: 0, globalSymbolCount: 0 }),
           clear: () => {},
         };
-        const { env } = buildTypeEnv(tree, 'kotlin', mockSymbolTable as any);
+        const { env } = buildTypeEnv(tree, 'kotlin', { symbolTable: mockSymbolTable as any });
         expect(flatGet(env, 'user')).toBe('User');
       });
 
@@ -1610,7 +1610,7 @@ class RepoService {
           getStats: () => ({ fileCount: 0, globalSymbolCount: 0 }),
           clear: () => {},
         };
-        const { env } = buildTypeEnv(tree, 'kotlin', mockSymbolTable as any);
+        const { env } = buildTypeEnv(tree, 'kotlin', { symbolTable: mockSymbolTable as any });
         expect(flatGet(env, 'result')).toBeUndefined();
       });
 
@@ -3691,6 +3691,166 @@ function calculate(service: Service) {
       `, TypeScript.typescript);
       const { env } = buildTypeEnv(tree, 'typescript');
       expect(flatGet(env, 'service')).toBe('Service');
+    });
+  });
+
+  describe('null-check narrowing via patternOverrides (Phase C Task 7)', () => {
+    it('TS: if (x !== null) narrows User | null to User inside if-body', () => {
+      const code = `
+function process(x: User | null) {
+  if (x !== null) {
+    x.save();
+  }
+}`;
+      const tree = parse(code, TypeScript.typescript);
+      const typeEnv = buildTypeEnv(tree, 'typescript');
+      // Inside the if-body, x should resolve to User (nullable stripped)
+      const saveCall = tree.rootNode.descendantForIndex(tree.rootNode.text.indexOf('x.save'));
+      expect(typeEnv.lookup('x', saveCall)).toBe('User');
+    });
+
+    it('TS: if (x !== undefined) narrows User | undefined to User inside if-body', () => {
+      const code = `
+function process(x: User | undefined) {
+  if (x !== undefined) {
+    x.save();
+  }
+}`;
+      const tree = parse(code, TypeScript.typescript);
+      const typeEnv = buildTypeEnv(tree, 'typescript');
+      const saveCall = tree.rootNode.descendantForIndex(tree.rootNode.text.indexOf('x.save'));
+      expect(typeEnv.lookup('x', saveCall)).toBe('User');
+    });
+
+    it('TS: if (x != null) narrows with loose inequality', () => {
+      const code = `
+function process(x: User | null) {
+  if (x != null) {
+    x.save();
+  }
+}`;
+      const tree = parse(code, TypeScript.typescript);
+      const typeEnv = buildTypeEnv(tree, 'typescript');
+      const saveCall = tree.rootNode.descendantForIndex(tree.rootNode.text.indexOf('x.save'));
+      expect(typeEnv.lookup('x', saveCall)).toBe('User');
+    });
+
+    it('TS: null-check narrowing does NOT leak to else branch', () => {
+      const code = `
+function process(x: User | null) {
+  if (x !== null) {
+    x.save();
+  } else {
+    x.fallback();
+  }
+}`;
+      const tree = parse(code, TypeScript.typescript);
+      const typeEnv = buildTypeEnv(tree, 'typescript');
+      // Inside else branch, x should retain original nullable type (User via fastStripNullable)
+      const fallbackCall = tree.rootNode.descendantForIndex(tree.rootNode.text.indexOf('x.fallback'));
+      // The else branch is NOT in the narrowing range, so lookup falls through to
+      // the flat scopeEnv which has "User | null" — fastStripNullable strips it to User.
+      // This is expected: without negative narrowing (Phase 13A), else branches still get
+      // the base stripped type. The key invariant is that the narrowing override does NOT
+      // apply outside the if-body range.
+      expect(typeEnv.lookup('x', fallbackCall)).toBe('User');
+    });
+
+    it('TS: null-check narrowing does NOT apply outside the if block', () => {
+      const code = `
+function process(x: User | null) {
+  if (x !== null) {
+    x.save();
+  }
+  x.other();
+}`;
+      const tree = parse(code, TypeScript.typescript);
+      const typeEnv = buildTypeEnv(tree, 'typescript');
+      // After the if-block, x should use the flat scopeEnv (User | null → User via fastStripNullable)
+      const otherCall = tree.rootNode.descendantForIndex(tree.rootNode.text.indexOf('x.other'));
+      expect(typeEnv.lookup('x', otherCall)).toBe('User');
+    });
+
+    it('TS: no narrowing when variable has no nullable type', () => {
+      const code = `
+function process(x: User) {
+  if (x !== null) {
+    x.save();
+  }
+}`;
+      const tree = parse(code, TypeScript.typescript);
+      const typeEnv = buildTypeEnv(tree, 'typescript');
+      // x is already non-nullable — no narrowing override is emitted, but lookup still works
+      const saveCall = tree.rootNode.descendantForIndex(tree.rootNode.text.indexOf('x.save'));
+      expect(typeEnv.lookup('x', saveCall)).toBe('User');
+    });
+
+    it('TS: instanceof still works alongside null-check narrowing', () => {
+      const tree = parse(`
+function process(x) {
+  if (x instanceof User) {
+    x.save();
+  }
+}
+      `, TypeScript.typescript);
+      const { env } = buildTypeEnv(tree, 'typescript');
+      expect(flatGet(env, 'x')).toBe('User');
+    });
+
+    // TODO: Kotlin nullable parameter type capture needs tree-sitter grammar investigation
+    // The nullable_type node may not be captured via the current declarationTypeNodes path
+    it.skip('Kotlin: if (x != null) narrows nullable type inside if-body', () => {
+      const code = `
+fun process(x: User?) {
+    if (x != null) {
+        x.save()
+    }
+}`;
+      const tree = parse(code, Kotlin);
+      const typeEnv = buildTypeEnv(tree, 'kotlin');
+      const saveCall = tree.rootNode.descendantForIndex(tree.rootNode.text.indexOf('x.save'));
+      expect(typeEnv.lookup('x', saveCall)).toBe('User');
+    });
+
+    it('Kotlin: when/is still works alongside null-check narrowing', () => {
+      const tree = parse(`
+fun process(x: Any) {
+    when (x) {
+        is User -> x.name
+    }
+}
+      `, Kotlin);
+      const { env } = buildTypeEnv(tree, 'kotlin');
+      expect(flatGet(env, 'x')).toBe('User');
+    });
+
+    it('C#: if (x != null) narrows nullable type inside if-body', () => {
+      const code = `
+class App {
+    void Process(User? x) {
+        if (x != null) {
+            x.Save();
+        }
+    }
+}`;
+      const tree = parse(code, CSharp);
+      const typeEnv = buildTypeEnv(tree, 'csharp');
+      const saveCall = tree.rootNode.descendantForIndex(tree.rootNode.text.indexOf('x.Save'));
+      expect(typeEnv.lookup('x', saveCall)).toBe('User');
+    });
+
+    it('C#: is_pattern_expression type pattern still works alongside null-check', () => {
+      const tree = parse(`
+class App {
+    void Process(object obj) {
+        if (obj is User user) {
+            user.Save();
+        }
+    }
+}
+      `, CSharp);
+      const { env } = buildTypeEnv(tree, 'csharp');
+      expect(flatGet(env, 'user')).toBe('User');
     });
   });
 

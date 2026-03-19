@@ -61,17 +61,22 @@ interface PatternOverride {
 /** scope → varName → overrides (checked in order, first range match wins) */
 type PatternOverrides = Map<string, Map<string, PatternOverride[]>>;
 
-/** AST node types that represent mutually exclusive branch containers for pattern bindings. */
-const PATTERN_BRANCH_TYPES = new Set([
+/** AST node types that represent mutually exclusive branch containers for pattern bindings.
+ *  Includes both multi-arm pattern-match branches AND if-statement bodies for null-check narrowing. */
+const NARROWING_BRANCH_TYPES = new Set([
   'when_entry',          // Kotlin when
   'switch_block_label',  // Java switch (enhanced)
+  'if_statement',        // TS/JS, Java, C/C++
+  'if_expression',       // Kotlin (if is an expression)
+  'statement_block',     // TS/JS: { ... } body of if
+  'control_structure_body', // Kotlin: body of if
 ]);
 
 /** Walk up the AST from a pattern node to find the enclosing branch container. */
-const findPatternBranchScope = (node: SyntaxNode): SyntaxNode | undefined => {
+const findNarrowingBranchScope = (node: SyntaxNode): SyntaxNode | undefined => {
   let current = node.parent;
   while (current) {
-    if (PATTERN_BRANCH_TYPES.has(current.type)) return current;
+    if (NARROWING_BRANCH_TYPES.has(current.type)) return current;
     if (FUNCTION_NODE_TYPES.has(current.type)) return undefined;
     current = current.parent;
   }
@@ -159,6 +164,23 @@ const findEnclosingClassName = (node: SyntaxNode): string | undefined => {
     current = current.parent;
   }
   return undefined;
+};
+
+/** Keywords that refer to the current instance across languages. */
+const THIS_RECEIVERS = new Set(['this', 'self', '$this', 'Me']);
+
+/**
+ * If a pending assignment's receiver is this/self/$this/Me, substitute the
+ * enclosing class name. Returns the item unchanged for non-receiver kinds
+ * or when the receiver is not a this-keyword. Properties are readonly in the
+ * discriminated union, so a new object is returned when substitution occurs.
+ */
+const substituteThisReceiver = (item: PendingAssignment, node: SyntaxNode): PendingAssignment => {
+  if (item.kind !== 'fieldAccess' && item.kind !== 'methodCallResult') return item;
+  if (!THIS_RECEIVERS.has(item.receiver)) return item;
+  const className = findEnclosingClassName(node);
+  if (!className) return item;
+  return { ...item, receiver: className };
 };
 
 /**
@@ -366,50 +388,208 @@ const SKIP_SUBTREE_TYPES = new Set([
 
 const CLASS_LIKE_TYPES = new Set(['Class', 'Struct', 'Interface']);
 
+/** Memoize class definition lookups during fixpoint iteration.
+ *  SymbolTable is immutable during type resolution, so results never change.
+ *  Eliminates redundant array allocations + filter scans across iterations. */
+const createClassDefCache = (symbolTable?: SymbolTable) => {
+  const cache = new Map<string, Array<{ nodeId: string; type: string }>>();
+  return (typeName: string) => {
+    let result = cache.get(typeName);
+    if (result === undefined) {
+      result = symbolTable
+        ? symbolTable.lookupFuzzy(typeName).filter(d => CLASS_LIKE_TYPES.has(d.type))
+        : [];
+      cache.set(typeName, result);
+    }
+    return result;
+  };
+};
+
+/** Max depth for MRO parent chain walking. Real-world inheritance rarely exceeds 3-4 levels. */
+const MAX_MRO_DEPTH = 5;
+
+/** Walk up the parent class chain to find a field or method on an ancestor.
+ *  BFS-like traversal with depth limit and cycle detection. First match wins.
+ *  Used by resolveFieldType and resolveMethodReturnType when direct lookup fails. */
+const walkParentChain = <T>(
+  typeName: string,
+  parentMap: ReadonlyMap<string, readonly string[]> | undefined,
+  getClassDefs: (name: string) => Array<{ nodeId: string; type: string }>,
+  lookupOnClass: (nodeId: string) => T | undefined,
+): T | undefined => {
+  if (!parentMap) return undefined;
+  const visited = new Set<string>([typeName]);
+  let current = [typeName];
+  for (let depth = 0; depth < MAX_MRO_DEPTH && current.length > 0; depth++) {
+    const next: string[] = [];
+    for (const cls of current) {
+      const parents = parentMap.get(cls);
+      if (!parents) continue;
+      for (const parent of parents) {
+        if (visited.has(parent)) continue;
+        visited.add(parent);
+        const parentDefs = getClassDefs(parent);
+        if (parentDefs.length === 1) {
+          const result = lookupOnClass(parentDefs[0].nodeId);
+          if (result !== undefined) return result;
+        }
+        next.push(parent);
+      }
+    }
+    current = next;
+  }
+  return undefined;
+};
+
 /** Resolve a field's declared type given a receiver variable and field name.
  *  Uses SymbolTable to find the class nodeId for the receiver's type, then
- *  looks up the field via the eagerly-populated fieldByOwner index. */
+ *  looks up the field via the eagerly-populated fieldByOwner index.
+ *  Falls back to MRO parent chain walking if direct lookup fails (Phase 11A). */
 const resolveFieldType = (
   receiver: string, field: string,
   scopeEnv: ReadonlyMap<string, string>, symbolTable?: SymbolTable,
+  getClassDefs?: (typeName: string) => Array<{ nodeId: string; type: string }>,
+  parentMap?: ReadonlyMap<string, readonly string[]>,
 ): string | undefined => {
   if (!symbolTable) return undefined;
   const receiverType = scopeEnv.get(receiver);
   if (!receiverType) return undefined;
-  const classDefs = symbolTable.lookupFuzzy(receiverType)
-    .filter(d => CLASS_LIKE_TYPES.has(d.type));
+  const lookup = getClassDefs
+    ?? ((name: string) => symbolTable.lookupFuzzy(name).filter(d => CLASS_LIKE_TYPES.has(d.type)));
+  const classDefs = lookup(receiverType);
   if (classDefs.length !== 1) return undefined;
+  // Direct lookup first
   const fieldDef = symbolTable.lookupFieldByOwner(classDefs[0].nodeId, field);
-  if (!fieldDef?.declaredType) return undefined;
-  return extractReturnTypeName(fieldDef.declaredType);
+  if (fieldDef?.declaredType) return extractReturnTypeName(fieldDef.declaredType);
+  // MRO parent chain walking on miss
+  const inherited = walkParentChain(receiverType, parentMap, lookup, (nodeId) => {
+    const f = symbolTable.lookupFieldByOwner(nodeId, field);
+    return f?.declaredType ? extractReturnTypeName(f.declaredType) : undefined;
+  });
+  return inherited;
 };
 
 /** Resolve a method's return type given a receiver variable and method name.
  *  Uses SymbolTable to find class nodeIds for the receiver's type, then
- *  looks up the method via lookupFuzzyCallable filtered by ownerId. */
+ *  looks up the method via lookupFuzzyCallable filtered by ownerId.
+ *  Falls back to MRO parent chain walking if direct lookup fails (Phase 11A). */
 const resolveMethodReturnType = (
   receiver: string, method: string,
   scopeEnv: ReadonlyMap<string, string>, symbolTable?: SymbolTable,
+  getClassDefs?: (typeName: string) => Array<{ nodeId: string; type: string }>,
+  parentMap?: ReadonlyMap<string, readonly string[]>,
 ): string | undefined => {
   if (!symbolTable) return undefined;
   const receiverType = scopeEnv.get(receiver);
   if (!receiverType) return undefined;
-  const classDefs = symbolTable.lookupFuzzy(receiverType)
-    .filter(d => CLASS_LIKE_TYPES.has(d.type));
+  const lookup = getClassDefs
+    ?? ((name: string) => symbolTable.lookupFuzzy(name).filter(d => CLASS_LIKE_TYPES.has(d.type)));
+  const classDefs = lookup(receiverType);
   if (classDefs.length === 0) return undefined;
+  // Direct lookup first
   const classNodeIds = new Set(classDefs.map(d => d.nodeId));
   const methods = symbolTable.lookupFuzzyCallable(method)
     .filter(d => d.ownerId && classNodeIds.has(d.ownerId));
-  if (methods.length !== 1) return undefined;
-  if (!methods[0].returnType) return undefined;
-  return extractReturnTypeName(methods[0].returnType);
+  if (methods.length === 1 && methods[0].returnType) {
+    return extractReturnTypeName(methods[0].returnType);
+  }
+  // MRO parent chain walking on miss
+  if (methods.length === 0) {
+    const inherited = walkParentChain(receiverType, parentMap, lookup, (nodeId) => {
+      const parentMethods = symbolTable.lookupFuzzyCallable(method)
+        .filter(d => d.ownerId === nodeId);
+      if (parentMethods.length !== 1 || !parentMethods[0].returnType) return undefined;
+      return extractReturnTypeName(parentMethods[0].returnType);
+    });
+    return inherited;
+  }
+  return undefined;
 };
+
+/**
+ * Unified fixpoint propagation: iterate over ALL pending items (copy, callResult,
+ * fieldAccess, methodCallResult) until no new bindings are produced.
+ * Handles arbitrary-depth mixed chains:
+ *   const user = getUser();      // callResult → User
+ *   const addr = user.address;   // fieldAccess → Address (depends on user)
+ *   const city = addr.getCity(); // methodCallResult → City (depends on addr)
+ *   const alias = city;          // copy → City (depends on city)
+ * Data flow: SymbolTable (immutable) + scopeEnv → resolve → scopeEnv.
+ * Termination: finite entries, each bound at most once (first-writer-wins), max 10 iterations.
+ */
+const MAX_FIXPOINT_ITERATIONS = 10;
+
+const resolveFixpointBindings = (
+  pendingItems: Array<{ scope: string } & PendingAssignment>,
+  env: TypeEnv,
+  returnTypeLookup: ReturnTypeLookup,
+  symbolTable?: SymbolTable,
+  parentMap?: ReadonlyMap<string, readonly string[]>,
+): void => {
+  if (pendingItems.length === 0) return;
+  const getClassDefs = createClassDefCache(symbolTable);
+  const resolved = new Set<number>();
+  for (let iter = 0; iter < MAX_FIXPOINT_ITERATIONS; iter++) {
+    let changed = false;
+    for (let i = 0; i < pendingItems.length; i++) {
+      if (resolved.has(i)) continue;
+      const item = pendingItems[i];
+      const scopeEnv = env.get(item.scope);
+      if (!scopeEnv || scopeEnv.has(item.lhs)) { resolved.add(i); continue; }
+
+      let typeName: string | undefined;
+      switch (item.kind) {
+        case 'callResult':
+          typeName = returnTypeLookup.lookupReturnType(item.callee);
+          break;
+        case 'copy':
+          typeName = scopeEnv.get(item.rhs) ?? env.get(FILE_SCOPE)?.get(item.rhs);
+          break;
+        case 'fieldAccess':
+          typeName = resolveFieldType(item.receiver, item.field, scopeEnv, symbolTable, getClassDefs, parentMap);
+          break;
+        case 'methodCallResult':
+          typeName = resolveMethodReturnType(item.receiver, item.method, scopeEnv, symbolTable, getClassDefs, parentMap);
+          break;
+        default: {
+          // Exhaustive check: TypeScript will error here if a new PendingAssignment
+          // kind is added without handling it in the switch.
+          const _exhaustive: never = item;
+          break;
+        }
+      }
+      if (typeName) {
+        scopeEnv.set(item.lhs, typeName);
+        resolved.add(i);
+        changed = true;
+      }
+    }
+    if (!changed) break;
+    if (iter === MAX_FIXPOINT_ITERATIONS - 1 && process.env.GITNEXUS_DEBUG) {
+      const unresolved = pendingItems.length - resolved.size;
+      if (unresolved > 0) {
+        console.warn(`[type-env] fixpoint hit iteration cap (${MAX_FIXPOINT_ITERATIONS}), ${unresolved} items unresolved`);
+      }
+    }
+  }
+};
+
+/**
+ * Options for buildTypeEnv.
+ * Uses an options object to allow future extensions without positional parameter sprawl.
+ */
+export interface BuildTypeEnvOptions {
+  symbolTable?: SymbolTable;
+  parentMap?: ReadonlyMap<string, readonly string[]>;
+}
 
 export const buildTypeEnv = (
   tree: { rootNode: SyntaxNode },
   language: SupportedLanguages,
-  symbolTable?: SymbolTable,
+  options?: BuildTypeEnvOptions,
 ): TypeEnvironment => {
+  const symbolTable = options?.symbolTable;
+  const parentMap = options?.parentMap;
   const env: TypeEnv = new Map();
   const patternOverrides: PatternOverrides = new Map();
   const localClassNames = new Set<string>();
@@ -448,6 +628,9 @@ export const buildTypeEnv = (
   // methodCallResult items during walk(), then iterates until no new bindings are produced.
   // Handles arbitrary-depth mixed chains: callResult → fieldAccess → methodCallResult → copy.
   const pendingItems: Array<{ scope: string } & PendingAssignment> = [];
+  // For-loop nodes whose iterable was unresolved at walk-time. Replayed after the fixpoint
+  // resolves the iterable's type, bridging the walk-time/fixpoint gap (Phase 10 / ex-9B).
+  const pendingForLoops: Array<{ node: SyntaxNode; scope: string }> = [];
   // Maps `scope\0varName` → the type annotation AST node from the original declaration.
   // Allows pattern extractors to navigate back to the declaration's generic type arguments
   // (e.g., to extract T from Result<T, E> for `if let Ok(x) = res`).
@@ -498,7 +681,8 @@ export const buildTypeEnv = (
             fallbackName = child;
           }
           if (!fallbackType && (child.type === 'user_type' || child.type === 'type_identifier'
-            || child.type === 'generic_type' || child.type === 'parameterized_type')) {
+            || child.type === 'generic_type' || child.type === 'parameterized_type'
+            || child.type === 'nullable_type')) {
             fallbackType = child;
           }
         }
@@ -516,8 +700,14 @@ export const buildTypeEnv = (
     // Checked before declarationNodeTypes — loop variables are not declarations.
     if (config.forLoopNodeTypes?.has(node.type)) {
       if (config.extractForLoopBinding) {
+        const sizeBefore = scopeEnv.size;
         const forLoopCtx: ForLoopExtractorContext = { scopeEnv, declarationTypeNodes, scope, returnTypeLookup };
         config.extractForLoopBinding(node, forLoopCtx);
+        // If no new binding was produced, the iterable's type may not yet be resolved.
+        // Store for post-fixpoint replay (Phase 10 / ex-9B loop-fixpoint bridge).
+        if (scopeEnv.size === sizeBefore) {
+          pendingForLoops.push({ node, scope });
+        }
       }
       return;
     }
@@ -605,7 +795,8 @@ export const buildTypeEnv = (
     }
 
     // Pattern binding extraction: handles constructs that introduce NEW typed variables
-    // via pattern matching (e.g. `if let Some(x) = opt`, `x instanceof T t`).
+    // via pattern matching (e.g. `if let Some(x) = opt`, `x instanceof T t`)
+    // or narrow existing variables within a branch (null-check narrowing).
     // Runs after Tier 0/1 so scopeEnv already contains the source variable's type.
     // Conservative: extractor returns undefined when source type is unknown.
     if (config.extractPatternBinding && (!config.patternBindingNodeTypes || config.patternBindingNodeTypes.has(node.type))) {
@@ -614,11 +805,22 @@ export const buildTypeEnv = (
       const scopeEnv = env.get(scope)!;
       const patternBinding = config.extractPatternBinding(node, scopeEnv, declarationTypeNodes, scope);
       if (patternBinding) {
-        if (config.allowPatternBindingOverwrite) {
+        if (patternBinding.narrowingRange) {
+          // Explicit narrowing range (null-check narrowing): always store in patternOverrides
+          // using the extractor-provided range (typically the if-body block).
+          if (!patternOverrides.has(scope)) patternOverrides.set(scope, new Map());
+          const varMap = patternOverrides.get(scope)!;
+          if (!varMap.has(patternBinding.varName)) varMap.set(patternBinding.varName, []);
+          varMap.get(patternBinding.varName)!.push({
+            rangeStart: patternBinding.narrowingRange.startIndex,
+            rangeEnd: patternBinding.narrowingRange.endIndex,
+            typeName: patternBinding.typeName,
+          });
+        } else if (config.allowPatternBindingOverwrite) {
           // Position-indexed: store per-branch binding for smart-cast narrowing.
           // Each when arm / switch case gets its own type for the variable,
           // preventing cross-arm contamination (e.g., Kotlin when/is).
-          const branchNode = findPatternBranchScope(node);
+          const branchNode = findNarrowingBranchScope(node);
           if (branchNode) {
             if (!patternOverrides.has(scope)) patternOverrides.set(scope, new Map());
             const varMap = patternOverrides.get(scope)!;
@@ -643,6 +845,7 @@ export const buildTypeEnv = (
     // Delegates to per-language extractPendingAssignment — AST shapes differ widely
     // (JS uses variable_declarator/name/value, Rust uses let_declaration/pattern/value,
     // Python uses assignment/left/right, Go uses short_var_declaration/expression_list).
+    // May return a single item or an array (for destructuring: N fieldAccess items).
     if (config.extractPendingAssignment && config.declarationNodeTypes.has(node.type)) {
       // scopeEnv is guaranteed to exist here because declarationNodeTypes is a subset
       // of interestingNodeTypes, so extractTypeBinding already created the scope map above.
@@ -650,7 +853,12 @@ export const buildTypeEnv = (
       if (scopeEnv) {
         const pending = config.extractPendingAssignment(node, scopeEnv);
         if (pending) {
-          pendingItems.push({ scope, ...pending });
+          const items = Array.isArray(pending) ? pending : [pending];
+          for (const item of items) {
+            // Substitute this/self/$this/Me receivers with enclosing class name
+            const resolved = substituteThisReceiver(item, node);
+            pendingItems.push({ scope, ...resolved });
+          }
         }
       }
     }
@@ -676,47 +884,38 @@ export const buildTypeEnv = (
 
   walk(tree.rootNode, FILE_SCOPE);
 
-  // Unified fixpoint propagation: iterate over ALL pending items (copy, callResult,
-  // fieldAccess, methodCallResult) until no new bindings are produced.
-  // Handles arbitrary-depth mixed chains:
-  //   const user = getUser();      // callResult → User
-  //   const addr = user.address;   // fieldAccess → Address (depends on user)
-  //   const city = addr.getCity(); // methodCallResult → City (depends on addr)
-  //   const alias = city;          // copy → City (depends on city)
-  // Data flow: SymbolTable (immutable) + scopeEnv → resolve → scopeEnv.
-  // Termination: finite entries, each bound at most once (first-writer-wins), max 10 iterations.
-  const MAX_FIXPOINT_ITERATIONS = 10;
-  const resolved = new Set<number>();
-  for (let iter = 0; iter < MAX_FIXPOINT_ITERATIONS; iter++) {
-    let changed = false;
-    for (let i = 0; i < pendingItems.length; i++) {
-      if (resolved.has(i)) continue;
-      const item = pendingItems[i];
-      const scopeEnv = env.get(item.scope);
-      if (!scopeEnv || scopeEnv.has(item.lhs)) { resolved.add(i); continue; }
+  resolveFixpointBindings(pendingItems, env, returnTypeLookup, symbolTable, parentMap);
 
-      let typeName: string | undefined;
-      switch (item.kind) {
-        case 'callResult':
-          typeName = returnTypeLookup.lookupReturnType(item.callee);
-          break;
-        case 'copy':
-          typeName = scopeEnv.get(item.rhs) ?? env.get(FILE_SCOPE)?.get(item.rhs);
-          break;
-        case 'fieldAccess':
-          typeName = resolveFieldType(item.receiver, item.field, scopeEnv, symbolTable);
-          break;
-        case 'methodCallResult':
-          typeName = resolveMethodReturnType(item.receiver, item.method, scopeEnv, symbolTable);
-          break;
-      }
-      if (typeName) {
-        scopeEnv.set(item.lhs, typeName);
-        resolved.add(i);
-        changed = true;
-      }
+  // Post-fixpoint for-loop replay (Phase 10 / ex-9B loop-fixpoint bridge):
+  // For-loop nodes whose iterables were unresolved at walk-time may now be
+  // resolvable because the fixpoint bound the iterable's type.
+  // Example: `const users = getUsers(); for (const u of users) { u.save(); }`
+  //   - walk-time: users untyped → u unresolved
+  //   - fixpoint: users → User[]
+  //   - replay: users now typed → u → User
+  if (pendingForLoops.length > 0 && config.extractForLoopBinding) {
+    const replayPendingItems: Array<{ scope: string } & PendingAssignment> = [];
+    for (const { node, scope } of pendingForLoops) {
+      if (!env.has(scope)) env.set(scope, new Map());
+      const scopeEnv = env.get(scope)!;
+      config.extractForLoopBinding(node, { scopeEnv, declarationTypeNodes, scope, returnTypeLookup });
     }
-    if (!changed) break;
+    // Collect any new pending items from replay-produced variables.
+    // Re-walk the for-loop bodies to pick up field/method chains on the now-typed loop vars.
+    // For simplicity, run a mini-fixpoint on any pending items that were already collected
+    // but couldn't resolve because they depended on the loop variable.
+    if (replayPendingItems.length > 0) {
+      resolveFixpointBindings(replayPendingItems, env, returnTypeLookup, symbolTable);
+    }
+    // Also re-run the main fixpoint to resolve items that depended on loop variables.
+    // Only needed if replay actually produced new bindings.
+    const unresolvedBefore = pendingItems.filter((item) => {
+      const scopeEnv = env.get(item.scope);
+      return scopeEnv && !scopeEnv.has(item.lhs);
+    });
+    if (unresolvedBefore.length > 0) {
+      resolveFixpointBindings(unresolvedBefore, env, returnTypeLookup, symbolTable);
+    }
   }
 
   return {

@@ -890,21 +890,45 @@ const processFileGroup = (
     result.fileCount++;
     onFileProcessed?.();
 
-    // Build per-file type environment + constructor bindings in a single AST walk.
-    // Constructor bindings are verified against the SymbolTable in processCallsFromExtracted.
-    const typeEnv = buildTypeEnv(tree, language);
-    const callRouter = callRouters[language];
-
-    if (typeEnv.constructorBindings.length > 0) {
-      result.constructorBindings.push({ filePath: file.path, bindings: [...typeEnv.constructorBindings] });
-    }
-
     let matches;
     try {
       matches = query.matches(tree.rootNode);
     } catch (err) {
       console.warn(`Query execution failed for ${file.path}: ${err instanceof Error ? err.message : String(err)}`);
       continue;
+    }
+
+    // Pre-pass: extract heritage from query matches to build parentMap for buildTypeEnv.
+    // Heritage edges (EXTENDS/IMPLEMENTS) are created by heritage-processor which runs
+    // in PARALLEL with call-processor, so the graph edges don't exist when buildTypeEnv
+    // runs. This pre-pass makes parent class information available for type resolution.
+    const fileParentMap = new Map<string, string[]>();
+    for (const match of matches) {
+      const captureMap: Record<string, any> = {};
+      for (const c of match.captures) {
+        captureMap[c.name] = c.node;
+      }
+      if (captureMap['heritage.class'] && captureMap['heritage.extends']) {
+        const className: string = captureMap['heritage.class'].text;
+        const parentName: string = captureMap['heritage.extends'].text;
+        // Skip Go named fields (only anonymous fields are struct embedding)
+        const extendsNode = captureMap['heritage.extends'];
+        const fieldDecl = extendsNode.parent;
+        if (fieldDecl?.type === 'field_declaration' && fieldDecl.childForFieldName('name')) continue;
+        let parents = fileParentMap.get(className);
+        if (!parents) { parents = []; fileParentMap.set(className, parents); }
+        if (!parents.includes(parentName)) parents.push(parentName);
+      }
+    }
+
+    // Build per-file type environment + constructor bindings in a single AST walk.
+    // Constructor bindings are verified against the SymbolTable in processCallsFromExtracted.
+    const parentMap: ReadonlyMap<string, readonly string[]> = fileParentMap;
+    const typeEnv = buildTypeEnv(tree, language, { parentMap });
+    const callRouter = callRouters[language];
+
+    if (typeEnv.constructorBindings.length > 0) {
+      result.constructorBindings.push({ filePath: file.path, bindings: [...typeEnv.constructorBindings] });
     }
 
     for (const match of matches) {

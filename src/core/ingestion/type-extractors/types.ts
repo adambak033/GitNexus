@@ -67,15 +67,29 @@ export type PendingAssignment =
  *  Returns a PendingAssignment when the RHS is a bare identifier (`copy`), a
  *  call expression (`callResult`), a field access (`fieldAccess`), or a
  *  method call with receiver (`methodCallResult`) and the LHS has no resolved type yet.
+ *  May return an array of PendingAssignment items for destructuring patterns
+ *  (e.g., `const { a, b } = obj` emits N fieldAccess items).
  *  Returns undefined if the node is not a matching assignment. */
 export type PendingAssignmentExtractor = (
   node: SyntaxNode,
   scopeEnv: ReadonlyMap<string, string>,
-) => PendingAssignment | undefined;
+) => PendingAssignment | PendingAssignment[] | undefined;
+
+/** Result of a pattern binding extraction. */
+export interface PatternBindingResult {
+  varName: string;
+  typeName: string;
+  /** Optional: AST node whose position range should be used for the patternOverride.
+   *  When present, the override uses this node's range instead of the auto-detected
+   *  branch scope. Used by null-check narrowing to target the if-body specifically. */
+  narrowingRange?: { startIndex: number; endIndex: number };
+}
 
 /** Extracts a typed variable binding from a pattern-matching construct.
- *  Returns { varName, typeName } for patterns that introduce NEW variables.
- *  Examples: `if let Some(user) = opt` (Rust), `x instanceof User user` (Java).
+ *  Returns { varName, typeName } for patterns that introduce NEW variables
+ *  or narrow existing variables (null-check narrowing).
+ *  Examples: `if let Some(user) = opt` (Rust), `x instanceof User user` (Java),
+ *  `if (x != null)` (null-check narrowing in TS/Kotlin/C#).
  *  Conservative: returns undefined when the source variable's type is unknown.
  *
  *  @param scopeEnv   Read-only view of already-resolved type bindings in the current scope.
@@ -88,7 +102,7 @@ export type PatternBindingExtractor = (
   scopeEnv: ReadonlyMap<string, string>,
   declarationTypeNodes: ReadonlyMap<string, SyntaxNode>,
   scope: string,
-) => { varName: string; typeName: string } | undefined;
+) => PatternBindingResult | undefined;
 
 /** Per-language type extraction configuration */
 export interface LanguageTypeConfig {

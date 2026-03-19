@@ -183,7 +183,27 @@ export const processCalls = async (
     }
 
     const lang = getLanguageFromFilename(file.path);
-    const typeEnv = lang ? buildTypeEnv(tree, lang, ctx.symbols) : null;
+
+    // Pre-pass: extract heritage from query matches to build parentMap for buildTypeEnv.
+    // Heritage-processor runs in PARALLEL, so graph edges don't exist when buildTypeEnv runs.
+    const fileParentMap = new Map<string, string[]>();
+    for (const match of matches) {
+      const captureMap: Record<string, any> = {};
+      match.captures.forEach(c => captureMap[c.name] = c.node);
+      if (captureMap['heritage.class'] && captureMap['heritage.extends']) {
+        const className: string = captureMap['heritage.class'].text;
+        const parentName: string = captureMap['heritage.extends'].text;
+        const extendsNode = captureMap['heritage.extends'];
+        const fieldDecl = extendsNode.parent;
+        if (fieldDecl?.type === 'field_declaration' && fieldDecl.childForFieldName('name')) continue;
+        let parents = fileParentMap.get(className);
+        if (!parents) { parents = []; fileParentMap.set(className, parents); }
+        if (!parents.includes(parentName)) parents.push(parentName);
+      }
+    }
+    const parentMap: ReadonlyMap<string, readonly string[]> = fileParentMap;
+
+    const typeEnv = lang ? buildTypeEnv(tree, lang, { symbolTable: ctx.symbols, parentMap }) : null;
     const callRouter = callRouters[language];
 
     const verifiedReceivers = typeEnv && typeEnv.constructorBindings.length > 0

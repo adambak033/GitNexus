@@ -350,6 +350,16 @@ export const GO_QUERIES = `
       operand: (_) @assignment.receiver
       field: (field_identifier) @assignment.property))
   right: (_)) @assignment
+
+; Write access: obj.field++ / obj.field--
+(inc_statement
+  (selector_expression
+    operand: (_) @assignment.receiver
+    field: (field_identifier) @assignment.property)) @assignment
+(dec_statement
+  (selector_expression
+    operand: (_) @assignment.receiver
+    field: (field_identifier) @assignment.property)) @assignment
 `;
 
 // C++ queries - works with tree-sitter-cpp
