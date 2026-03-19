@@ -95,7 +95,7 @@ EXAMPLES:
   MATCH (c:Class {name: "UserService"})-[r:CodeRelation {type: 'HAS_METHOD'}]->(m:Method) RETURN m.name, m.parameterCount, m.returnType
 
 • Find all properties of a class:
-  MATCH (c:Class {name: "User"})-[r:CodeRelation {type: 'HAS_PROPERTY'}]->(p:Property) RETURN p.name, p.description
+  MATCH (c:Class {name: "User"})-[r:CodeRelation {type: 'HAS_PROPERTY'}]->(p:Property) RETURN p.name, p.declaredType
 
 • Find all writers of a field:
   MATCH (f:Function)-[r:CodeRelation {type: 'ACCESSES', reason: 'write'}]->(p:Property) WHERE p.name = "address" RETURN f.name, f.filePath
@@ -132,7 +132,7 @@ AFTER THIS: Use impact() if planning changes, or READ gitnexus://repo/{name}/pro
 
 Handles disambiguation: if multiple symbols share the same name, returns candidates for you to pick from. Use uid param for zero-ambiguity lookup from prior results.
 
-NOTE: ACCESSES edges (field read/write tracking) are included in context results. Coverage: reads detected during call chain resolution (e.g., user.address.save() emits a read on 'address'). Standalone reads and writes require Phase 2.`,
+NOTE: ACCESSES edges (field read/write tracking) are included in context results with reason 'read' or 'write'. CALLS edges resolve through field access chains and method-call chains (e.g., user.address.getCity().save() produces CALLS edges at each step).`,
     inputSchema: {
       type: 'object',
       properties: {
