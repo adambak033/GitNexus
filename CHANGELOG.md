@@ -2,6 +2,33 @@
 
 All notable changes to GitNexus will be documented in this file.
 
+## [1.4.7] - 2026-03-19
+
+### Added
+- **Phase 8 field/property type resolution** — ACCESSES edges with `declaredType` for field reads/writes (#354)
+- **Phase 9 return-type variable binding** — call-result variable binding across 11 languages (#379)
+  - `extractPendingAssignment` in per-language type extractors captures `let x = getUser()` patterns
+  - Unified fixpoint loop resolves variable types from function return types after initial walk
+  - Field access on call-result variables: `user.name` resolves `name` via return type's class definition
+  - Method-call-result chaining: `user.getProfile().bio` resolves through intermediate return types
+  - 22 new test fixtures covering call-result and method-chain binding across all supported languages
+  - Integration tests added for all 10 language resolver suites
+- **ACCESSES edge type** with read/write field access tracking (#372)
+- **Python `enumerate()` for-loop support** with nested tuple patterns (#356)
+- **MCP tool/resource descriptions** updated to reflect Phase 9 ACCESSES edge semantics and `declaredType` property
+
+### Fixed
+- **mcp**: server crashes under parallel tool calls (#326, #349)
+- **parsing**: undefined error on languages missing from call routers (#364)
+- **web**: add missing Kotlin entries to `Record<SupportedLanguages>` maps
+- **rust**: `await` expression unwrapping in `extractPendingAssignment` for async call-result binding
+- **tests**: update property edge and write access expectations across multiple language tests
+- **docs**: corrected stale "single-pass" claims in type-resolution-system.md to reflect walk+fixpoint architecture
+
+### Changed
+- **Upgrade `@ladybugdb/core` to 0.15.2** and remove segfault workarounds (#374)
+- **type-resolution-roadmap.md** overhauled — completed phases condensed to summaries, Phases 10–14 added with full engineering specs
+
 ## [1.4.6] - 2026-03-18
 
 ### Added
