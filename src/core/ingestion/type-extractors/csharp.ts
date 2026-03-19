@@ -463,6 +463,32 @@ const extractPendingAssignment: PendingAssignmentExtractor = (node, scopeEnv) =>
   return undefined;
 };
 
+/** Infer the type of a literal AST node for C# overload disambiguation. */
+const inferLiteralType = (node: SyntaxNode): string | undefined => {
+  switch (node.type) {
+    case 'integer_literal':
+      if (node.text.endsWith('L') || node.text.endsWith('l')) return 'long';
+      return 'int';
+    case 'real_literal':
+      if (node.text.endsWith('f') || node.text.endsWith('F')) return 'float';
+      if (node.text.endsWith('m') || node.text.endsWith('M')) return 'decimal';
+      return 'double';
+    case 'string_literal':
+    case 'verbatim_string_literal':
+    case 'raw_string_literal':
+    case 'interpolated_string_expression':
+      return 'string';
+    case 'character_literal':
+      return 'char';
+    case 'boolean_literal':
+      return 'bool';
+    case 'null_literal':
+      return 'null';
+    default:
+      return undefined;
+  }
+};
+
 export const typeConfig: LanguageTypeConfig = {
   declarationNodeTypes: DECLARATION_NODE_TYPES,
   forLoopNodeTypes: FOR_LOOP_NODE_TYPES,
@@ -473,4 +499,5 @@ export const typeConfig: LanguageTypeConfig = {
   extractForLoopBinding,
   extractPendingAssignment,
   extractPatternBinding,
+  inferLiteralType,
 };

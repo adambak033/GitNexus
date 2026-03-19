@@ -29,6 +29,8 @@ import { getTreeSitterBufferSize } from './constants.js';
 import type { ExtractedCall, ExtractedAssignment, ExtractedHeritage, ExtractedRoute, FileConstructorBindings } from './workers/parse-worker.js';
 import { callRouters } from './call-routing.js';
 import { extractReturnTypeName, stripNullable } from './type-extractors/shared.js';
+import { typeConfigs } from './type-extractors/index.js';
+import type { SyntaxNode } from './utils.js';
 
 // Stdlib methods that preserve the receiver's type identity. When TypeEnv already
 // strips nullable wrappers (Option<User> → User), these chain steps are no-ops
@@ -379,12 +381,19 @@ export const processCalls = async (
         }
       }
 
+      // Build overload hints for languages with inferLiteralType (Java/Kotlin/C#/C++).
+      // Only used when multiple candidates survive arity filtering — ~1-3% of calls.
+      const langConfig = lang ? typeConfigs[lang as keyof typeof typeConfigs] : undefined;
+      const hints: OverloadHints | undefined = langConfig?.inferLiteralType
+        ? { callNode, inferLiteralType: langConfig.inferLiteralType }
+        : undefined;
+
       const resolved = resolveCallTarget({
         calledName,
         argCount: countCallArguments(callNode),
         callForm,
         receiverTypeName,
-      }, file.path, ctx);
+      }, file.path, ctx, hints);
 
       if (!resolved) return;
       const relId = generateId('CALLS', `${sourceId}:${calledName}->${resolved.nodeId}`);
@@ -490,12 +499,59 @@ const toResolveResult = (
 });
 
 
+/** Optional hints for overload disambiguation via argument literal types.
+ *  Only available on the sequential path (has AST); worker path passes undefined. */
+interface OverloadHints {
+  callNode: SyntaxNode;
+  inferLiteralType: (node: SyntaxNode) => string | undefined;
+}
+
+/**
+ * Try to disambiguate overloaded candidates using argument literal types.
+ * Only invoked when filteredCandidates.length > 1 and at least one has parameterTypes.
+ * Returns the single matching candidate, or null if ambiguous/inconclusive.
+ */
+const tryOverloadDisambiguation = (
+  candidates: SymbolDefinition[],
+  hints: OverloadHints,
+): SymbolDefinition | null => {
+  if (!candidates.some(c => c.parameterTypes)) return null;
+
+  // Find the argument list node in the call expression
+  const argList = hints.callNode.childForFieldName?.('arguments')
+    ?? hints.callNode.children.find(c =>
+      c.type === 'arguments' || c.type === 'argument_list' || c.type === 'value_arguments'
+    );
+  if (!argList) return null;
+
+  const argTypes: (string | undefined)[] = [];
+  for (const arg of argList.namedChildren) {
+    if (arg.type === 'comment') continue;
+    // For named arguments (Kotlin), extract the value expression
+    const valueNode = arg.childForFieldName?.('value') ?? arg;
+    argTypes.push(hints.inferLiteralType(valueNode));
+  }
+
+  // If no literal types could be inferred, can't disambiguate
+  if (argTypes.every(t => t === undefined)) return null;
+
+  const matched = candidates.filter(c => {
+    if (!c.parameterTypes) return true; // Keep candidates without type info
+    return c.parameterTypes.every((pType, i) =>
+      i >= argTypes.length || !argTypes[i] || pType === argTypes[i]
+    );
+  });
+
+  return matched.length === 1 ? matched[0] : null;
+};
+
 /**
  * Resolve a function call to its target node ID using priority strategy:
  * A. Narrow candidates by scope tier via ctx.resolve()
  * B. Filter to callable symbol kinds (constructor-aware when callForm is set)
  * C. Apply arity filtering when parameter metadata is available
  * D. Apply receiver-type filtering for member calls with typed receivers
+ * E. Apply overload disambiguation via argument literal types (when available)
  *
  * If filtering still leaves multiple candidates, refuse to emit a CALLS edge.
  */
@@ -503,6 +559,7 @@ const resolveCallTarget = (
   call: Pick<ExtractedCall, 'calledName' | 'argCount' | 'callForm' | 'receiverTypeName'>,
   currentFile: string,
   ctx: ResolutionContext,
+  overloadHints?: OverloadHints,
 ): ResolveResult | null => {
   const tiered = ctx.resolve(call.calledName, currentFile);
   if (!tiered) return null;
@@ -543,8 +600,22 @@ const resolveCallTarget = (
       if (ownerFiltered.length === 1) {
         return toResolveResult(ownerFiltered[0], tiered.tier);
       }
+      // E. Try overload disambiguation on the narrowed pool
+      if ((fileFiltered.length > 1 || ownerFiltered.length > 1) && overloadHints) {
+        const pool = ownerFiltered.length > 1 ? ownerFiltered : fileFiltered;
+        const disambiguated = tryOverloadDisambiguation(pool, overloadHints);
+        if (disambiguated) return toResolveResult(disambiguated, tiered.tier);
+      }
       if (fileFiltered.length > 1 || ownerFiltered.length > 1) return null;
     }
+  }
+
+  // E. Overload disambiguation: when multiple candidates survive arity + receiver filtering,
+  // try matching argument literal types against parameter types (Phase P).
+  // Only available on sequential path (has AST); worker path falls through gracefully.
+  if (filteredCandidates.length > 1 && overloadHints) {
+    const disambiguated = tryOverloadDisambiguation(filteredCandidates, overloadHints);
+    if (disambiguated) return toResolveResult(disambiguated, tiered.tier);
   }
 
   if (filteredCandidates.length !== 1) return null;

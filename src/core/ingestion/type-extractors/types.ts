@@ -149,4 +149,9 @@ export interface LanguageTypeConfig {
    *  The extractor receives the current scope's resolved bindings (read-only) to look up the
    *  source variable's type. Returns undefined for non-matching nodes or unknown source types. */
   extractPatternBinding?: PatternBindingExtractor;
+  /** Infer the type name of a literal AST node for overload disambiguation.
+   *  Returns the canonical type name (e.g. 'int', 'String', 'boolean') or undefined
+   *  for non-literal nodes. Only used when resolveCallTarget has multiple candidates
+   *  with parameterTypes — ~1-3% of call sites. */
+  inferLiteralType?: (node: SyntaxNode) => string | undefined;
 }

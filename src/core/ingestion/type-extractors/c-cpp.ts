@@ -371,6 +371,35 @@ const extractForLoopBinding: ForLoopExtractor = (node, { scopeEnv, declarationTy
   if (elementType) scopeEnv.set(varName, elementType);
 };
 
+/** Infer the type of a literal AST node for C++ overload disambiguation. */
+const inferLiteralType = (node: SyntaxNode): string | undefined => {
+  switch (node.type) {
+    case 'number_literal': {
+      const t = node.text;
+      // Float suffixes
+      if (t.endsWith('f') || t.endsWith('F')) return 'float';
+      if (t.includes('.') || t.includes('e') || t.includes('E')) return 'double';
+      // Long suffix
+      if (t.endsWith('L') || t.endsWith('l') || t.endsWith('LL') || t.endsWith('ll')) return 'long';
+      return 'int';
+    }
+    case 'string_literal':
+    case 'raw_string_literal':
+    case 'concatenated_string':
+      return 'string';
+    case 'char_literal':
+      return 'char';
+    case 'true':
+    case 'false':
+      return 'bool';
+    case 'null':
+    case 'nullptr':
+      return 'null';
+    default:
+      return undefined;
+  }
+};
+
 export const typeConfig: LanguageTypeConfig = {
   declarationNodeTypes: DECLARATION_NODE_TYPES,
   forLoopNodeTypes: FOR_LOOP_NODE_TYPES,
@@ -380,4 +409,5 @@ export const typeConfig: LanguageTypeConfig = {
   scanConstructorBinding,
   extractForLoopBinding,
   extractPendingAssignment,
+  inferLiteralType,
 };
