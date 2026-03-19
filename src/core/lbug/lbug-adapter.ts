@@ -18,6 +18,9 @@ let conn: lbug.Connection | null = null;
 let currentDbPath: string | null = null;
 let ftsLoaded = false;
 
+/** Expose the current Database for pool adapter reuse in tests. */
+export const getDatabase = (): lbug.Database | null => db;
+
 // Global session lock for operations that touch module-level lbug globals.
 // This guarantees no DB switch can happen while an operation is running.
 let sessionLock: Promise<void> = Promise.resolve();

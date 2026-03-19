@@ -10,12 +10,11 @@
  */
 import { describe, it, expect } from 'vitest';
 import {
-  CYPHER_WRITE_RE,
   VALID_RELATION_TYPES,
   VALID_NODE_LABELS,
-  isWriteQuery,
   isTestFilePath,
 } from '../../src/mcp/local/local-backend.js';
+import { CYPHER_WRITE_RE, isWriteQuery } from '../../src/mcp/core/lbug-adapter.js';
 
 // ─── Write-operation blocking (CYPHER_WRITE_RE) ──────────────────────
 

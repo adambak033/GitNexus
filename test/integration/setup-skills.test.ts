@@ -8,6 +8,7 @@ import { setupCommand } from '../../src/cli/setup.js';
 describe('setupCommand skills integration', () => {
   let tempHome: string;
   const originalHome = process.env.HOME;
+  const originalUserProfile = process.env.USERPROFILE;
   const testId = `${Date.now()}-${process.pid}`;
   const flatSkillName = `test-flat-skill-${testId}`;
   const dirSkillName = `test-dir-skill-${testId}`;
@@ -17,6 +18,7 @@ describe('setupCommand skills integration', () => {
   beforeAll(async () => {
     tempHome = await fs.mkdtemp(path.join(os.tmpdir(), 'gn-setup-home-'));
     process.env.HOME = tempHome;
+    process.env.USERPROFILE = tempHome;  // os.homedir() checks USERPROFILE on Windows
     await fs.mkdir(path.join(tempHome, '.cursor'), { recursive: true });
 
     // Create temporary source skills to verify both supported source layouts:
@@ -44,6 +46,7 @@ describe('setupCommand skills integration', () => {
     await fs.rm(path.join(packageSkillsRoot, `${flatSkillName}.md`), { force: true });
     await fs.rm(path.join(packageSkillsRoot, dirSkillName), { recursive: true, force: true });
     process.env.HOME = originalHome;
+    process.env.USERPROFILE = originalUserProfile;
     await fs.rm(tempHome, { recursive: true, force: true });
   });
 
