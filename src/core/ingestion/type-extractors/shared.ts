@@ -275,7 +275,11 @@ export const extractSimpleTypeName = (typeNode: SyntaxNode, depth = 0): string |
 
   // Primitive/predefined types: string, int, float, bool, number, unknown, any
   // PHP: primitive_type; TS/JS: predefined_type
-  if (typeNode.type === 'primitive_type' || typeNode.type === 'predefined_type') {
+  // Java: integral_type (int/long/short/byte), floating_point_type (float/double),
+  //       boolean_type (boolean), void_type (void)
+  if (typeNode.type === 'primitive_type' || typeNode.type === 'predefined_type'
+    || typeNode.type === 'integral_type' || typeNode.type === 'floating_point_type'
+    || typeNode.type === 'boolean_type' || typeNode.type === 'void_type') {
     return typeNode.text;
   }
 

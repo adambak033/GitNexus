@@ -1375,7 +1375,7 @@ class RepoService {
         expect(flatGet(env, 'user')).toBe('User');
       });
 
-      it('does NOT extract binding from plain instanceof without variable', () => {
+      it('extracts boolean type from plain instanceof (no pattern variable)', () => {
         const tree = parse(`
           class App {
             void process(Object obj) {
@@ -1384,8 +1384,8 @@ class RepoService {
           }
         `, Java);
         const { env } = buildTypeEnv(tree, 'java');
-        // No pattern variable declared — no binding
-        expect(flatGet(env, 'b')).toBeUndefined();
+        // No pattern variable — b gets its declared type 'boolean', not 'User'
+        expect(flatGet(env, 'b')).toBe('boolean');
       });
 
       it('extracts correct type when multiple instanceof patterns exist', () => {

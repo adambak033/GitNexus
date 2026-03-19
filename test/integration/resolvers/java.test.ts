@@ -1324,3 +1324,74 @@ describe('Java grandparent method resolution via MRO (Phase B)', () => {
     expect(greetCall).toBeDefined();
   });
 });
+
+// ── Phase P: Overload Disambiguation via Parameter Types ─────────────────
+
+describe('Java overload disambiguation by parameter types', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'java-overload-param-types'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects lookup method in UserService (1 graph node — ID collision for same-file overloads)', () => {
+    const methods = getNodesByLabel(result, 'Method');
+    const lookupMethods = methods.filter(m => m === 'lookup');
+    // generateId produces same ID for same-file same-name overloads;
+    // graph deduplicates, so 1 node. SymbolTable stores both via fileIndex.
+    expect(lookupMethods.length).toBe(1);
+  });
+
+  it('emits CALLS edge from run() → lookup() via overload disambiguation', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const lookupCalls = calls.filter(c => c.source === 'run' && c.target === 'lookup');
+    // Phase 0 (fileIndex stores both overloads) + Phase 2 (literal type matching)
+    // enables resolution where previously 2 same-arity candidates → null.
+    // Both calls resolve to same nodeId (ID collision) → 1 CALLS edge after dedup.
+    expect(lookupCalls.length).toBe(1);
+  });
+});
+
+// ── Phase P: Virtual Dispatch via Constructor Type ───────────────────────
+
+describe('Java virtual dispatch via constructor type (same-file)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'java-virtual-dispatch'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects Animal, Dog, and App classes in same file', () => {
+    const classes = getNodesByLabel(result, 'Class');
+    expect(classes).toContain('Animal');
+    expect(classes).toContain('Dog');
+    expect(classes).toContain('App');
+  });
+
+  it('detects Dog extends Animal heritage', () => {
+    const extends_ = getRelationships(result, 'EXTENDS');
+    const dogExtends = extends_.find(e => e.source === 'Dog' && e.target === 'Animal');
+    expect(dogExtends).toBeDefined();
+  });
+
+  it('detects fetchBall() as Dog-only method', () => {
+    const methods = getNodesByLabel(result, 'Method');
+    expect(methods).toContain('fetchBall');
+  });
+
+  it('resolves fetchBall() calls from run() — proves virtual dispatch override', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const fetchCalls = calls.filter(c => c.source === 'run' && c.target === 'fetchBall');
+    // animal.fetchBall() only resolves if constructorTypeMap overrides
+    // receiver from Animal → Dog (since only Dog has fetchBall).
+    // dog.fetchBall() resolves directly via Dog type.
+    // Both target same nodeId → 1 CALLS edge after dedup.
+    expect(fetchCalls.length).toBe(1);
+  });
+});

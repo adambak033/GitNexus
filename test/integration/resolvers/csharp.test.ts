@@ -1469,3 +1469,29 @@ describe('C# null-check narrowing resolution (Phase C)', () => {
     expect(saveCall).toBeDefined();
   });
 });
+
+// ── Phase P: Overload Disambiguation via Parameter Types ─────────────────
+
+describe('C# overload disambiguation by parameter types', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'csharp-overload-param-types'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects Lookup method in UserService (1 graph node — ID collision for same-file overloads)', () => {
+    const methods = getNodesByLabel(result, 'Method');
+    const lookupMethods = methods.filter(m => m === 'Lookup');
+    expect(lookupMethods.length).toBe(1);
+  });
+
+  it('emits CALLS edge from Run() → Lookup() via overload disambiguation', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const lookupCalls = calls.filter(c => c.source === 'Run' && c.target === 'Lookup');
+    // Both Lookup(42) and Lookup("alice") resolve to same nodeId → 1 CALLS edge
+    expect(lookupCalls.length).toBe(1);
+  });
+});

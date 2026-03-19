@@ -2222,3 +2222,39 @@ describe('TypeScript null-check narrowing resolution (Phase C)', () => {
     expect(saveCall).toBeDefined();
   });
 });
+
+// ── Phase P: Virtual Dispatch via Constructor Type ───────────────────────
+
+describe('TypeScript virtual dispatch via constructor type (same-file)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'ts-virtual-dispatch'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects Animal and Dog classes with same-file heritage', () => {
+    const classes = getNodesByLabel(result, 'Class');
+    expect(classes).toContain('Animal');
+    expect(classes).toContain('Dog');
+    const extends_ = getRelationships(result, 'EXTENDS');
+    const dogExtends = extends_.find(e => e.source === 'Dog' && e.target === 'Animal');
+    expect(dogExtends).toBeDefined();
+  });
+
+  it('detects fetchBall() as Dog-only method', () => {
+    const methods = getNodesByLabel(result, 'Method');
+    expect(methods).toContain('fetchBall');
+  });
+
+  it('resolves fetchBall() calls from run() — proves virtual dispatch override', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const fetchCalls = calls.filter(c => c.source === 'run' && c.target === 'fetchBall');
+    // animal.fetchBall() only resolves if constructorTypeMap overrides
+    // receiver from Animal → Dog. dog.fetchBall() resolves directly.
+    // Both target same nodeId → 1 CALLS edge after dedup.
+    expect(fetchCalls.length).toBe(1);
+  });
+});

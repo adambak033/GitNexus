@@ -1532,3 +1532,29 @@ describe('Kotlin null-check narrowing resolution (Phase C)', () => {
     expect(saveCall).toBeDefined();
   });
 });
+
+// ── Phase P: Overload Disambiguation via Parameter Types ─────────────────
+
+describe('Kotlin overload disambiguation by parameter types', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'kotlin-overload-param-types'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects lookup function (1 graph node — ID collision for same-file overloads)', () => {
+    const methods = getNodesByLabel(result, 'Function');
+    const lookupFuncs = methods.filter(m => m === 'lookup');
+    expect(lookupFuncs.length).toBe(1);
+  });
+
+  it('emits CALLS edge from run() → lookup() via overload disambiguation', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const lookupCalls = calls.filter(c => c.source === 'run' && c.target === 'lookup');
+    // Both lookup(42) and lookup("alice") resolve to same nodeId → 1 CALLS edge
+    expect(lookupCalls.length).toBe(1);
+  });
+});

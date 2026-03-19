@@ -406,7 +406,8 @@ export const extractFunctionName = (node: SyntaxNode): { funcName: string | null
       if (!innerDeclarator) {
         for (let i = 0; i < declarator.childCount; i++) {
           const c = declarator.child(i);
-          if (c?.type === 'qualified_identifier' || c?.type === 'identifier' || c?.type === 'parenthesized_declarator') { innerDeclarator = c; break; }
+          if (c?.type === 'qualified_identifier' || c?.type === 'identifier'
+            || c?.type === 'field_identifier' || c?.type === 'parenthesized_declarator') { innerDeclarator = c; break; }
         }
       }
 
@@ -422,8 +423,10 @@ export const extractFunctionName = (node: SyntaxNode): { funcName: string | null
           funcName = nameNode.text;
           label = 'Method';
         }
-      } else if (innerDeclarator?.type === 'identifier') {
+      } else if (innerDeclarator?.type === 'identifier' || innerDeclarator?.type === 'field_identifier') {
+        // field_identifier is used for method names inside C++ class bodies
         funcName = innerDeclarator.text;
+        if (innerDeclarator.type === 'field_identifier') label = 'Method';
       } else if (innerDeclarator?.type === 'parenthesized_declarator') {
         let nestedId: SyntaxNode | null = null;
         for (let i = 0; i < innerDeclarator.childCount; i++) {

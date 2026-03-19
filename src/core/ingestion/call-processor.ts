@@ -529,6 +529,29 @@ interface OverloadHints {
 }
 
 /**
+ * Kotlin (and JVM in general) uses boxed type names in parameter declarations
+ * (e.g. `Int`, `Long`, `Boolean`) while inferJvmLiteralType returns unboxed
+ * primitives (`int`, `long`, `boolean`). Normalise both sides to lowercase so
+ * that the comparison `'Int' === 'int'` does not fail.
+ *
+ * Only applied to single-word identifiers that look like a JVM primitive alias;
+ * multi-word or qualified names are left untouched.
+ */
+const KOTLIN_BOXED_TO_PRIMITIVE: Readonly<Record<string, string>> = {
+  Int: 'int',
+  Long: 'long',
+  Short: 'short',
+  Byte: 'byte',
+  Float: 'float',
+  Double: 'double',
+  Boolean: 'boolean',
+  Char: 'char',
+};
+
+const normalizeJvmTypeName = (name: string): string =>
+  KOTLIN_BOXED_TO_PRIMITIVE[name] ?? name;
+
+/**
  * Try to disambiguate overloaded candidates using argument literal types.
  * Only invoked when filteredCandidates.length > 1 and at least one has parameterTypes.
  * Returns the single matching candidate, or null if ambiguous/inconclusive.
@@ -539,18 +562,33 @@ const tryOverloadDisambiguation = (
 ): SymbolDefinition | null => {
   if (!candidates.some(c => c.parameterTypes)) return null;
 
-  // Find the argument list node in the call expression
-  const argList = hints.callNode.childForFieldName?.('arguments')
-    ?? hints.callNode.children.find(c =>
+  // Find the argument list node in the call expression.
+  // Kotlin wraps value_arguments inside a call_suffix child, so we must also
+  // search one level deeper when a direct match is not found.
+  let argList: any = hints.callNode.childForFieldName?.('arguments')
+    ?? hints.callNode.children.find((c: any) =>
       c.type === 'arguments' || c.type === 'argument_list' || c.type === 'value_arguments'
     );
+  if (!argList) {
+    // Kotlin: call_expression → call_suffix → value_arguments
+    const callSuffix = hints.callNode.children.find((c: any) => c.type === 'call_suffix');
+    if (callSuffix) {
+      argList = callSuffix.children.find((c: any) => c.type === 'value_arguments');
+    }
+  }
   if (!argList) return null;
 
   const argTypes: (string | undefined)[] = [];
   for (const arg of argList.namedChildren) {
     if (arg.type === 'comment') continue;
-    // For named arguments (Kotlin), extract the value expression
-    const valueNode = arg.childForFieldName?.('value') ?? arg;
+    // Unwrap argument wrapper nodes before passing to inferLiteralType:
+    //   - Kotlin value_argument: literal is the first (and only) named child
+    //   - C# argument: no named fields — the literal is the only named child
+    //   - Java/others: arg IS the literal directly (no unwrapping needed)
+    const valueNode = arg.childForFieldName?.('value')
+      ?? (arg.type === 'argument' || arg.type === 'value_argument'
+        ? arg.firstNamedChild ?? arg
+        : arg);
     argTypes.push(hints.inferLiteralType(valueNode));
   }
 
@@ -559,9 +597,12 @@ const tryOverloadDisambiguation = (
 
   const matched = candidates.filter(c => {
     if (!c.parameterTypes) return true; // Keep candidates without type info
-    return c.parameterTypes.every((pType, i) =>
-      i >= argTypes.length || !argTypes[i] || pType === argTypes[i]
-    );
+    return c.parameterTypes.every((pType, i) => {
+      if (i >= argTypes.length || !argTypes[i]) return true;
+      // Normalise Kotlin boxed type names (Int→int, Boolean→boolean, etc.) so
+      // that the stored declaration type matches the inferred literal type.
+      return normalizeJvmTypeName(pType) === argTypes[i];
+    });
   });
 
   return matched.length === 1 ? matched[0] : null;
