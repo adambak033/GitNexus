@@ -88,6 +88,7 @@ interface ParsedSymbol {
   nodeId: string;
   type: NodeLabel;
   parameterCount?: number;
+  parameterTypes?: string[];
   returnType?: string;
   declaredType?: string;
   ownerId?: string;
@@ -1183,11 +1184,13 @@ const processFileGroup = (
         : null;
 
       let parameterCount: number | undefined;
+      let parameterTypes: string[] | undefined;
       let returnType: string | undefined;
       let declaredType: string | undefined;
       if (nodeLabel === 'Function' || nodeLabel === 'Method' || nodeLabel === 'Constructor') {
         const sig = extractMethodSignature(definitionNode);
         parameterCount = sig.parameterCount;
+        parameterTypes = sig.parameterTypes;
         returnType = sig.returnType;
 
         // Language-specific return type fallback (e.g. Ruby YARD @return [Type])
@@ -1236,6 +1239,7 @@ const processFileGroup = (
         nodeId,
         type: nodeLabel,
         ...(parameterCount !== undefined ? { parameterCount } : {}),
+        ...(parameterTypes !== undefined ? { parameterTypes } : {}),
         ...(returnType !== undefined ? { returnType } : {}),
         ...(declaredType !== undefined ? { declaredType } : {}),
         ...(enclosingClassId ? { ownerId: enclosingClassId } : {}),

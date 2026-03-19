@@ -1,6 +1,7 @@
 import type Parser from 'tree-sitter';
 import { SupportedLanguages } from '../../config/supported-languages.js';
 import { generateId } from '../../lib/utils.js';
+import { extractSimpleTypeName } from './type-extractors/shared.js';
 
 /** Tree-sitter AST node. Re-exported for use across ingestion modules. */
 export type SyntaxNode = Parser.SyntaxNode;
@@ -599,6 +600,10 @@ export const getLanguageFromFilename = (filename: string): SupportedLanguages | 
 
 export interface MethodSignature {
   parameterCount: number | undefined;
+  /** Per-parameter type names extracted via extractSimpleTypeName.
+   *  Only populated for languages with method overloading (Java, Kotlin, C#, C++).
+   *  undefined (not []) when no types are extractable — avoids empty array allocations. */
+  parameterTypes: string[] | undefined;
   returnType: string | undefined;
 }
 
@@ -616,8 +621,9 @@ export const extractMethodSignature = (node: SyntaxNode | null | undefined): Met
   let parameterCount: number | undefined = 0;
   let returnType: string | undefined;
   let isVariadic = false;
+  const paramTypes: string[] = [];
 
-  if (!node) return { parameterCount, returnType };
+  if (!node) return { parameterCount, parameterTypes: undefined, returnType };
 
   const paramListTypes = new Set([
     'formal_parameters', 'parameters', 'parameter_list',
@@ -678,6 +684,30 @@ export const extractMethodSignature = (node: SyntaxNode | null | undefined): Met
         if (prev?.type === 'parameter_modifiers' && prev.text.includes('vararg')) {
           isVariadic = true;
         }
+      }
+      // Extract parameter type name for overload disambiguation.
+      // Works for Java (formal_parameter), Kotlin (parameter), C# (parameter),
+      // C++ (parameter_declaration). Uses childForFieldName('type') which is the
+      // standard tree-sitter field for typed parameters across these languages.
+      // Kotlin uses positional children instead of 'type' field — fall back to
+      // searching for user_type/nullable_type/predefined_type children.
+      const paramTypeNode = param.childForFieldName('type');
+      if (paramTypeNode) {
+        const typeName = extractSimpleTypeName(paramTypeNode);
+        paramTypes.push(typeName ?? 'unknown');
+      } else {
+        // Kotlin: parameter → [simple_identifier, user_type|nullable_type]
+        let found = false;
+        for (const child of param.namedChildren) {
+          if (child.type === 'user_type' || child.type === 'nullable_type'
+            || child.type === 'type_identifier' || child.type === 'predefined_type') {
+            const typeName = extractSimpleTypeName(child);
+            paramTypes.push(typeName ?? 'unknown');
+            found = true;
+            break;
+          }
+        }
+        if (!found) paramTypes.push('unknown');
       }
       parameterCount++;
     }
@@ -767,7 +797,10 @@ export const extractMethodSignature = (node: SyntaxNode | null | undefined): Met
 
   if (isVariadic) parameterCount = undefined;
 
-  return { parameterCount, returnType };
+  // Only include parameterTypes when at least one type was successfully extracted.
+  // Use undefined (not []) to avoid empty array allocations for untyped parameters.
+  const hasTypes = paramTypes.length > 0 && paramTypes.some(t => t !== 'unknown');
+  return { parameterCount, parameterTypes: hasTypes ? paramTypes : undefined, returnType };
 };
 
 /**

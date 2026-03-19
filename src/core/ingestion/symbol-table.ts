@@ -5,6 +5,9 @@ export interface SymbolDefinition {
   filePath: string;
   type: NodeLabel;
   parameterCount?: number;
+  /** Per-parameter type names for overload disambiguation (e.g. ['int', 'String']).
+   *  Only populated for overloading languages (Java, Kotlin, C#, C++). */
+  parameterTypes?: string[];
   /** Raw return type text extracted from AST (e.g. 'User', 'Promise<User>') */
   returnType?: string;
   /** Declared type for non-callable symbols — fields/properties (e.g. 'Address', 'List<User>') */
@@ -22,7 +25,7 @@ export interface SymbolTable {
     name: string,
     nodeId: string,
     type: NodeLabel,
-    metadata?: { parameterCount?: number; returnType?: string; declaredType?: string; ownerId?: string }
+    metadata?: { parameterCount?: number; parameterTypes?: string[]; returnType?: string; declaredType?: string; ownerId?: string }
   ) => void;
   
   /**
@@ -102,13 +105,14 @@ export const createSymbolTable = (): SymbolTable => {
     name: string,
     nodeId: string,
     type: NodeLabel,
-    metadata?: { parameterCount?: number; returnType?: string; declaredType?: string; ownerId?: string }
+    metadata?: { parameterCount?: number; parameterTypes?: string[]; returnType?: string; declaredType?: string; ownerId?: string }
   ) => {
     const def: SymbolDefinition = {
       nodeId,
       filePath,
       type,
       ...(metadata?.parameterCount !== undefined ? { parameterCount: metadata.parameterCount } : {}),
+      ...(metadata?.parameterTypes !== undefined ? { parameterTypes: metadata.parameterTypes } : {}),
       ...(metadata?.returnType !== undefined ? { returnType: metadata.returnType } : {}),
       ...(metadata?.declaredType !== undefined ? { declaredType: metadata.declaredType } : {}),
       ...(metadata?.ownerId !== undefined ? { ownerId: metadata.ownerId } : {}),
