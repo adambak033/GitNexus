@@ -2,7 +2,7 @@ import type { SyntaxNode } from './utils.js';
 import { FUNCTION_NODE_TYPES, extractFunctionName, CLASS_CONTAINER_TYPES, isBuiltInOrNoise } from './utils.js';
 import { SupportedLanguages } from '../../config/supported-languages.js';
 import { typeConfigs, TYPED_PARAMETER_TYPES } from './type-extractors/index.js';
-import type { ClassNameLookup, ReturnTypeLookup, ForLoopExtractorContext } from './type-extractors/types.js';
+import type { ClassNameLookup, ReturnTypeLookup, ForLoopExtractorContext, PendingAssignment } from './type-extractors/types.js';
 import { extractSimpleTypeName, extractVarName, stripNullable, extractReturnTypeName } from './type-extractors/shared.js';
 import type { SymbolTable } from './symbol-table.js';
 
@@ -364,6 +364,47 @@ const SKIP_SUBTREE_TYPES = new Set([
   'regex',               'regex_pattern',
 ]);
 
+const CLASS_LIKE_TYPES = new Set(['Class', 'Struct', 'Interface']);
+
+/** Resolve a field's declared type given a receiver variable and field name.
+ *  Uses SymbolTable to find the class nodeId for the receiver's type, then
+ *  looks up the field via the eagerly-populated fieldByOwner index. */
+const resolveFieldType = (
+  receiver: string, field: string,
+  scopeEnv: ReadonlyMap<string, string>, symbolTable?: SymbolTable,
+): string | undefined => {
+  if (!symbolTable) return undefined;
+  const receiverType = scopeEnv.get(receiver);
+  if (!receiverType) return undefined;
+  const classDefs = symbolTable.lookupFuzzy(receiverType)
+    .filter(d => CLASS_LIKE_TYPES.has(d.type));
+  if (classDefs.length !== 1) return undefined;
+  const fieldDef = symbolTable.lookupFieldByOwner(classDefs[0].nodeId, field);
+  if (!fieldDef?.declaredType) return undefined;
+  return extractReturnTypeName(fieldDef.declaredType);
+};
+
+/** Resolve a method's return type given a receiver variable and method name.
+ *  Uses SymbolTable to find class nodeIds for the receiver's type, then
+ *  looks up the method via lookupFuzzyCallable filtered by ownerId. */
+const resolveMethodReturnType = (
+  receiver: string, method: string,
+  scopeEnv: ReadonlyMap<string, string>, symbolTable?: SymbolTable,
+): string | undefined => {
+  if (!symbolTable) return undefined;
+  const receiverType = scopeEnv.get(receiver);
+  if (!receiverType) return undefined;
+  const classDefs = symbolTable.lookupFuzzy(receiverType)
+    .filter(d => CLASS_LIKE_TYPES.has(d.type));
+  if (classDefs.length === 0) return undefined;
+  const classNodeIds = new Set(classDefs.map(d => d.nodeId));
+  const methods = symbolTable.lookupFuzzyCallable(method)
+    .filter(d => d.ownerId && classNodeIds.has(d.ownerId));
+  if (methods.length !== 1) return undefined;
+  if (!methods[0].returnType) return undefined;
+  return extractReturnTypeName(methods[0].returnType);
+};
+
 export const buildTypeEnv = (
   tree: { rootNode: SyntaxNode },
   language: SupportedLanguages,
@@ -403,12 +444,10 @@ export const buildTypeEnv = (
   TYPED_PARAMETER_TYPES.forEach(t => interestingNodeTypes.add(t));
   config.declarationNodeTypes.forEach(t => interestingNodeTypes.add(t));
   config.forLoopNodeTypes?.forEach(t => interestingNodeTypes.add(t));
-  // Tier 2: copy-propagation (`const b = a`) and call-result propagation (`const b = foo()`)
-  const pendingCopies: Array<{ scope: string; lhs: string; rhs: string }> = [];
-  // NOTE: Infrastructure-ready — no language extractor currently returns { kind: 'callResult' }
-  // from extractPendingAssignment. When one does, this array will bind variables to their
-  // function return types at TypeEnv build time. See PendingAssignment in types.ts.
-  const pendingCallResults: Array<{ scope: string; lhs: string; callee: string }> = [];
+  // Tier 2: unified fixpoint propagation — collects copy, callResult, fieldAccess, and
+  // methodCallResult items during walk(), then iterates until no new bindings are produced.
+  // Handles arbitrary-depth mixed chains: callResult → fieldAccess → methodCallResult → copy.
+  const pendingItems: Array<{ scope: string } & PendingAssignment> = [];
   // Maps `scope\0varName` → the type annotation AST node from the original declaration.
   // Allows pattern extractors to navigate back to the declaration's generic type arguments
   // (e.g., to extract T from Result<T, E> for `if let Ok(x) = res`).
@@ -611,11 +650,7 @@ export const buildTypeEnv = (
       if (scopeEnv) {
         const pending = config.extractPendingAssignment(node, scopeEnv);
         if (pending) {
-          if (pending.kind === 'copy') {
-            pendingCopies.push({ scope, lhs: pending.lhs, rhs: pending.rhs });
-          } else {
-            pendingCallResults.push({ scope, lhs: pending.lhs, callee: pending.callee });
-          }
+          pendingItems.push({ scope, ...pending });
         }
       }
     }
@@ -641,29 +676,47 @@ export const buildTypeEnv = (
 
   walk(tree.rootNode, FILE_SCOPE);
 
-  // Tier 2b: call-result propagation — `const b = foo()` where `foo` has a declared return type.
-  // Runs BEFORE Tier 2a so that call-result types are available for copy-propagation chains:
-  //   const user = getUser();  // Tier 2b: user → User (from SymbolTable return type)
-  //   const alias = user;      // Tier 2a: alias → User (from user's now-resolved type)
-  // Data flow: SymbolTable (immutable) → Tier 2b → scopeEnv → Tier 2a → scopeEnv.
-  // No circular dependency: 2b reads SymbolTable only, 2a reads scopeEnv only.
-  // Conservative: only binds when exactly one callable matches (avoids overload ambiguity).
-  for (const { scope, lhs, callee } of pendingCallResults) {
-    const scopeEnv = env.get(scope);
-    if (!scopeEnv || scopeEnv.has(lhs)) continue;
-    const typeName = returnTypeLookup.lookupReturnType(callee);
-    if (typeName) scopeEnv.set(lhs, typeName);
-  }
+  // Unified fixpoint propagation: iterate over ALL pending items (copy, callResult,
+  // fieldAccess, methodCallResult) until no new bindings are produced.
+  // Handles arbitrary-depth mixed chains:
+  //   const user = getUser();      // callResult → User
+  //   const addr = user.address;   // fieldAccess → Address (depends on user)
+  //   const city = addr.getCity(); // methodCallResult → City (depends on addr)
+  //   const alias = city;          // copy → City (depends on city)
+  // Data flow: SymbolTable (immutable) + scopeEnv → resolve → scopeEnv.
+  // Termination: finite entries, each bound at most once (first-writer-wins), max 10 iterations.
+  const MAX_FIXPOINT_ITERATIONS = 10;
+  const resolved = new Set<number>();
+  for (let iter = 0; iter < MAX_FIXPOINT_ITERATIONS; iter++) {
+    let changed = false;
+    for (let i = 0; i < pendingItems.length; i++) {
+      if (resolved.has(i)) continue;
+      const item = pendingItems[i];
+      const scopeEnv = env.get(item.scope);
+      if (!scopeEnv || scopeEnv.has(item.lhs)) { resolved.add(i); continue; }
 
-  // Tier 2a: copy-propagation — `const b = a` where `a` has a known type from Tier 0/1/2b.
-  // Multi-hop chains resolve when forward-declared (a→b→c in source order);
-  // reverse-order assignments are depth-1 only. No fixpoint iteration —
-  // this covers 95%+ of real-world patterns.
-  for (const { scope, lhs, rhs } of pendingCopies) {
-    const scopeEnv = env.get(scope);
-    if (!scopeEnv || scopeEnv.has(lhs)) continue;
-    const rhsType = scopeEnv.get(rhs) ?? env.get(FILE_SCOPE)?.get(rhs);
-    if (rhsType) scopeEnv.set(lhs, rhsType);
+      let typeName: string | undefined;
+      switch (item.kind) {
+        case 'callResult':
+          typeName = returnTypeLookup.lookupReturnType(item.callee);
+          break;
+        case 'copy':
+          typeName = scopeEnv.get(item.rhs) ?? env.get(FILE_SCOPE)?.get(item.rhs);
+          break;
+        case 'fieldAccess':
+          typeName = resolveFieldType(item.receiver, item.field, scopeEnv, symbolTable);
+          break;
+        case 'methodCallResult':
+          typeName = resolveMethodReturnType(item.receiver, item.method, scopeEnv, symbolTable);
+          break;
+      }
+      if (typeName) {
+        scopeEnv.set(item.lhs, typeName);
+        resolved.add(i);
+        changed = true;
+      }
+    }
+    if (!changed) break;
   }
 
   return {

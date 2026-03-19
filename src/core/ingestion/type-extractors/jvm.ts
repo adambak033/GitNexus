@@ -199,13 +199,28 @@ const extractJavaPendingAssignment: PendingAssignmentExtractor = (node, scopeEnv
     const lhs = nameNode.text;
     if (scopeEnv.has(lhs)) continue;
     if (valueNode.type === 'identifier' || valueNode.type === 'simple_identifier') return { kind: 'copy', lhs, rhs: valueNode.text };
-    // method_invocation RHS → callResult (no-receiver calls only)
+    // field_access RHS → fieldAccess (a.field)
+    if (valueNode.type === 'field_access') {
+      const obj = valueNode.childForFieldName('object');
+      const field = valueNode.childForFieldName('field');
+      if (obj?.type === 'identifier' && field) {
+        return { kind: 'fieldAccess', lhs, receiver: obj.text, field: field.text };
+      }
+    }
+    // method_invocation RHS
     if (valueNode.type === 'method_invocation') {
       const objField = valueNode.childForFieldName('object');
       if (!objField) {
+        // No receiver → callResult
         const nameField = valueNode.childForFieldName('name');
         if (nameField?.type === 'identifier') {
           return { kind: 'callResult', lhs, callee: nameField.text };
+        }
+      } else if (objField.type === 'identifier') {
+        // With receiver → methodCallResult
+        const nameField = valueNode.childForFieldName('name');
+        if (nameField?.type === 'identifier') {
+          return { kind: 'methodCallResult', lhs, receiver: objField.text, method: nameField.text };
         }
       }
     }
@@ -560,11 +575,29 @@ const extractKotlinPendingAssignment: PendingAssignmentExtractor = (node, scopeE
       if (foundEq && child.type === 'simple_identifier') {
         return { kind: 'copy', lhs, rhs: child.text };
       }
-      // call_expression RHS → callResult (simple callee only)
+      // navigation_expression RHS → fieldAccess (a.field)
+      if (foundEq && child.type === 'navigation_expression') {
+        const recv = child.firstNamedChild;
+        const suffix = child.lastNamedChild;
+        const fieldNode = suffix?.type === 'navigation_suffix' ? suffix.lastNamedChild : suffix;
+        if (recv?.type === 'simple_identifier' && fieldNode?.type === 'simple_identifier') {
+          return { kind: 'fieldAccess', lhs, receiver: recv.text, field: fieldNode.text };
+        }
+      }
+      // call_expression RHS
       if (foundEq && child.type === 'call_expression') {
         const calleeNode = child.firstNamedChild;
         if (calleeNode?.type === 'simple_identifier') {
           return { kind: 'callResult', lhs, callee: calleeNode.text };
+        }
+        // navigation_expression callee → methodCallResult (a.method())
+        if (calleeNode?.type === 'navigation_expression') {
+          const recv = calleeNode.firstNamedChild;
+          const suffix = calleeNode.lastNamedChild;
+          const methodNode = suffix?.type === 'navigation_suffix' ? suffix.lastNamedChild : suffix;
+          if (recv?.type === 'simple_identifier' && methodNode?.type === 'simple_identifier') {
+            return { kind: 'methodCallResult', lhs, receiver: recv.text, method: methodNode.text };
+          }
         }
       }
     }
@@ -578,7 +611,6 @@ const extractKotlinPendingAssignment: PendingAssignmentExtractor = (node, scopeE
     const lhs = nameNode.text;
     if (scopeEnv.has(lhs)) return undefined;
     // Look for RHS after "=" in the parent (property_declaration)
-    // variable_declaration itself doesn't contain "=" — it's in the parent
     const parent = node.parent;
     if (!parent) return undefined;
     let foundEq = false;
@@ -589,11 +621,26 @@ const extractKotlinPendingAssignment: PendingAssignmentExtractor = (node, scopeE
       if (foundEq && child.type === 'simple_identifier') {
         return { kind: 'copy', lhs, rhs: child.text };
       }
-      // call_expression RHS → callResult (simple callee only)
+      if (foundEq && child.type === 'navigation_expression') {
+        const recv = child.firstNamedChild;
+        const suffix = child.lastNamedChild;
+        const fieldNode = suffix?.type === 'navigation_suffix' ? suffix.lastNamedChild : suffix;
+        if (recv?.type === 'simple_identifier' && fieldNode?.type === 'simple_identifier') {
+          return { kind: 'fieldAccess', lhs, receiver: recv.text, field: fieldNode.text };
+        }
+      }
       if (foundEq && child.type === 'call_expression') {
         const calleeNode = child.firstNamedChild;
         if (calleeNode?.type === 'simple_identifier') {
           return { kind: 'callResult', lhs, callee: calleeNode.text };
+        }
+        if (calleeNode?.type === 'navigation_expression') {
+          const recv = calleeNode.firstNamedChild;
+          const suffix = calleeNode.lastNamedChild;
+          const methodNode = suffix?.type === 'navigation_suffix' ? suffix.lastNamedChild : suffix;
+          if (recv?.type === 'simple_identifier' && methodNode?.type === 'simple_identifier') {
+            return { kind: 'methodCallResult', lhs, receiver: recv.text, method: methodNode.text };
+          }
         }
       }
     }

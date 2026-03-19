@@ -440,16 +440,34 @@ const extractPendingAssignment: PendingAssignmentExtractor = (node, scopeEnv) =>
     const lhs = nameNode.text;
     if (scopeEnv.has(lhs)) continue;
     if (valueNode.type === 'identifier') return { kind: 'copy', lhs, rhs: valueNode.text };
-    // call_expression RHS → callResult (simple calls only)
-    // Unwrap await: `const user = await fetchUser()` → call_expression
+    // member_expression RHS → fieldAccess (a.field, this.field)
+    if (valueNode.type === 'member_expression') {
+      const obj = valueNode.childForFieldName('object');
+      const prop = valueNode.childForFieldName('property');
+      if (obj && prop?.type === 'property_identifier' &&
+          (obj.type === 'identifier' || obj.type === 'this')) {
+        return { kind: 'fieldAccess', lhs, receiver: obj.text, field: prop.text };
+      }
+      continue;
+    }
+    // Unwrap await: `const user = await fetchUser()` or `await a.getC()`
     const callNode = unwrapAwait(valueNode);
     if (!callNode || callNode.type !== 'call_expression') continue;
-    // CRITICAL: Check funcNode.type === 'identifier', NOT extractCalleeName().
-    // extractCalleeName returns last segment of member_expression ('getUser' from 'repo.getUser'),
-    // which would false-match method calls. Direct type check is the correct guard.
     const funcNode = callNode.childForFieldName('function');
-    if (!funcNode || funcNode.type !== 'identifier') continue;
-    return { kind: 'callResult', lhs, callee: funcNode.text };
+    if (!funcNode) continue;
+    // Simple call → callResult: getUser()
+    if (funcNode.type === 'identifier') {
+      return { kind: 'callResult', lhs, callee: funcNode.text };
+    }
+    // Method call with receiver → methodCallResult: a.getC()
+    if (funcNode.type === 'member_expression') {
+      const obj = funcNode.childForFieldName('object');
+      const prop = funcNode.childForFieldName('property');
+      if (obj && prop?.type === 'property_identifier' &&
+          (obj.type === 'identifier' || obj.type === 'this')) {
+        return { kind: 'methodCallResult', lhs, receiver: obj.text, method: prop.text };
+      }
+    }
   }
   return undefined;
 };

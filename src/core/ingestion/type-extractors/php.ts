@@ -358,11 +358,27 @@ const extractPendingAssignment: PendingAssignmentExtractor = (node, scopeEnv) =>
     const rhs = right.text;
     if (rhs) return { kind: 'copy', lhs, rhs };
   }
+  // member_access_expression RHS → fieldAccess ($a->field)
+  if (right.type === 'member_access_expression') {
+    const obj = right.childForFieldName('object');
+    const name = right.childForFieldName('name');
+    if (obj?.type === 'variable_name' && name) {
+      return { kind: 'fieldAccess', lhs, receiver: obj.text, field: name.text };
+    }
+  }
   // function_call_expression RHS → callResult (bare function calls only)
   if (right.type === 'function_call_expression') {
     const funcNode = right.childForFieldName('function');
     if (funcNode?.type === 'name') {
       return { kind: 'callResult', lhs, callee: funcNode.text };
+    }
+  }
+  // member_call_expression RHS → methodCallResult ($a->method())
+  if (right.type === 'member_call_expression') {
+    const obj = right.childForFieldName('object');
+    const name = right.childForFieldName('name');
+    if (obj?.type === 'variable_name' && name) {
+      return { kind: 'methodCallResult', lhs, receiver: obj.text, method: name.text };
     }
   }
   return undefined;

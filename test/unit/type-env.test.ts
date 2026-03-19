@@ -1602,6 +1602,8 @@ class RepoService {
         const mockSymbolTable = {
           lookupFuzzy: (name: string) =>
             name === 'doStuff' ? [{ nodeId: 'n1', filePath: 'utils.kt', type: 'Function' }] : [],
+          lookupFuzzyCallable: () => [],
+          lookupFieldByOwner: () => undefined,
           lookupExact: () => undefined,
           lookupExactFull: () => undefined,
           add: () => {},
@@ -2241,10 +2243,11 @@ svc = App::Models::Service.new
       expect(env.get(scopeKey!)?.get('b')).toBe('User');
     });
 
-    it('does NOT resolve reverse-ordered Tier 2 chains (b = a, a = c, c: User)', () => {
+    it('resolves reverse-ordered Tier 2 chains via fixpoint (b = a, a = c, c: User)', () => {
       // Two chained Tier 2 assignments in reverse source order.
-      // Post-walk iterates source order: b = a (a not yet resolved) → fails,
-      // then a = c (c is Tier 0) → succeeds. b stays unresolved.
+      // The unified fixpoint loop resolves this in 2 iterations:
+      //   Iter 1: a = c (c is Tier 0 → a = User)
+      //   Iter 2: b = a (a now resolved → b = User)
       const tree = parse(`
         function process() {
           const b = a;
@@ -2257,8 +2260,8 @@ svc = App::Models::Service.new
       expect(scopeKey).toBeDefined();
       expect(env.get(scopeKey!)?.get('c')).toBe('User');
       expect(env.get(scopeKey!)?.get('a')).toBe('User');
-      // b should NOT resolve — reverse Tier 2 chain
-      expect(env.get(scopeKey!)?.get('b')).toBeUndefined();
+      // Fixpoint now resolves reverse-ordered chains
+      expect(env.get(scopeKey!)?.get('b')).toBe('User');
     });
   });
 

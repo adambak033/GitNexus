@@ -1339,3 +1339,26 @@ describe('C# call-result variable binding (Tier 2b)', () => {
     expect(saveCall).toBeDefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Method chain binding (Phase 9C): GetUser() → .Address → .GetCity() → .Save()
+// ---------------------------------------------------------------------------
+
+describe('C# method chain binding via unified fixpoint (Phase 9C)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'csharp-method-chain-binding'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves city.Save() to City#Save via method chain', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'Save' && c.source === 'ProcessChain' && c.targetFilePath.includes('App')
+    );
+    expect(saveCall).toBeDefined();
+  });
+});

@@ -198,11 +198,29 @@ const extractPendingAssignment: PendingAssignmentExtractor = (node, scopeEnv) =>
   const lhs = extractVarName(pattern);
   if (!lhs || scopeEnv.has(lhs)) return undefined;
   if (value.type === 'identifier') return { kind: 'copy', lhs, rhs: value.text };
-  // call_expression RHS → callResult (simple calls only, not method_call_expression)
+  // field_expression RHS → fieldAccess (a.field)
+  if (value.type === 'field_expression') {
+    const obj = value.firstNamedChild;
+    const field = value.lastNamedChild;
+    if (obj?.type === 'identifier' && field?.type === 'field_identifier') {
+      return { kind: 'fieldAccess', lhs, receiver: obj.text, field: field.text };
+    }
+  }
+  // call_expression RHS → callResult (simple calls only)
   if (value.type === 'call_expression') {
     const funcNode = value.childForFieldName('function');
     if (funcNode?.type === 'identifier') {
       return { kind: 'callResult', lhs, callee: funcNode.text };
+    }
+  }
+  // method_call_expression RHS → methodCallResult (receiver.method())
+  if (value.type === 'method_call_expression') {
+    const obj = value.firstNamedChild;
+    if (obj?.type === 'identifier') {
+      const methodNode = value.childForFieldName('name') ?? value.namedChild(1);
+      if (methodNode?.type === 'field_identifier') {
+        return { kind: 'methodCallResult', lhs, receiver: obj.text, method: methodNode.text };
+      }
     }
   }
   return undefined;

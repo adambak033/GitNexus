@@ -327,20 +327,43 @@ const extractPendingAssignment: PendingAssignmentExtractor = (node, scopeEnv) =>
     if (valueNode && valueNode !== nameNode && (valueNode.type === 'identifier' || valueNode.type === 'simple_identifier')) {
       return { kind: 'copy', lhs, rhs: valueNode.text };
     }
-    // invocation_expression RHS → callResult (simple calls only)
+    // member_access_expression RHS → fieldAccess (a.Field)
+    if (valueNode?.type === 'member_access_expression') {
+      const expr = valueNode.childForFieldName('expression');
+      const name = valueNode.childForFieldName('name');
+      if (expr?.type === 'identifier' && name?.type === 'identifier') {
+        return { kind: 'fieldAccess', lhs, receiver: expr.text, field: name.text };
+      }
+    }
+    // invocation_expression RHS
     if (valueNode?.type === 'invocation_expression') {
       const funcNode = valueNode.firstNamedChild;
       if (funcNode?.type === 'identifier_name' || funcNode?.type === 'identifier') {
         return { kind: 'callResult', lhs, callee: funcNode.text };
       }
+      // method call with receiver → methodCallResult: a.GetC()
+      if (funcNode?.type === 'member_access_expression') {
+        const expr = funcNode.childForFieldName('expression');
+        const name = funcNode.childForFieldName('name');
+        if (expr?.type === 'identifier' && name?.type === 'identifier') {
+          return { kind: 'methodCallResult', lhs, receiver: expr.text, method: name.text };
+        }
+      }
     }
-    // await_expression → invocation_expression RHS → callResult
+    // await_expression → unwrap and check inner
     if (valueNode?.type === 'await_expression') {
       const inner = valueNode.firstNamedChild;
       if (inner?.type === 'invocation_expression') {
         const funcNode = inner.firstNamedChild;
         if (funcNode?.type === 'identifier_name' || funcNode?.type === 'identifier') {
           return { kind: 'callResult', lhs, callee: funcNode.text };
+        }
+        if (funcNode?.type === 'member_access_expression') {
+          const expr = funcNode.childForFieldName('expression');
+          const name = funcNode.childForFieldName('name');
+          if (expr?.type === 'identifier' && name?.type === 'identifier') {
+            return { kind: 'methodCallResult', lhs, receiver: expr.text, method: name.text };
+          }
         }
       }
     }

@@ -2023,3 +2023,34 @@ describe('JavaScript call-result variable binding (Tier 2b)', () => {
     expect(saveCall).toBeDefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Method chain binding (Phase 9C): getUser() → .address → .getCity() → .save()
+// Unified fixpoint resolves field access + method-call-with-receiver at TypeEnv build time.
+// ---------------------------------------------------------------------------
+
+describe('TypeScript method chain binding via unified fixpoint (Phase 9C)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'ts-method-chain-binding'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User, Address, City classes', () => {
+    const classes = getNodesByLabel(result, 'Class');
+    expect(classes).toContain('User');
+    expect(classes).toContain('Address');
+    expect(classes).toContain('City');
+  });
+
+  it('resolves city.save() to City#save via 3-step chain (callResult → fieldAccess → methodCallResult)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'processChain' && c.targetFilePath.includes('models')
+    );
+    expect(saveCall).toBeDefined();
+  });
+});

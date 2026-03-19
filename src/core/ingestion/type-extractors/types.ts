@@ -53,15 +53,20 @@ export interface ForLoopExtractorContext {
 export type ForLoopExtractor = (node: SyntaxNode, ctx: ForLoopExtractorContext) => void;
 
 /** Discriminated union for pending Tier-2 propagation items.
- *  - `copy`       — `const b = a` (identifier alias, propagate a's type to b)
- *  - `callResult` — `const b = foo()` (bind b to foo's declared return type) */
+ *  - `copy`             — `const b = a` (identifier alias, propagate a's type to b)
+ *  - `callResult`       — `const b = foo()` (bind b to foo's declared return type)
+ *  - `fieldAccess`      — `const b = a.field` (bind b to field's declaredType on a's type)
+ *  - `methodCallResult` — `const b = a.method()` (bind b to method's returnType on a's type) */
 export type PendingAssignment =
   | { kind: 'copy'; lhs: string; rhs: string }
-  | { kind: 'callResult'; lhs: string; callee: string };
+  | { kind: 'callResult'; lhs: string; callee: string }
+  | { kind: 'fieldAccess'; lhs: string; receiver: string; field: string }
+  | { kind: 'methodCallResult'; lhs: string; receiver: string; method: string };
 
 /** Extracts a pending assignment for Tier 2 propagation.
- *  Returns a PendingAssignment when the RHS is a bare identifier (`copy`) or a
- *  call expression (`callResult`) and the LHS has no resolved type yet.
+ *  Returns a PendingAssignment when the RHS is a bare identifier (`copy`), a
+ *  call expression (`callResult`), a field access (`fieldAccess`), or a
+ *  method call with receiver (`methodCallResult`) and the LHS has no resolved type yet.
  *  Returns undefined if the node is not a matching assignment. */
 export type PendingAssignmentExtractor = (
   node: SyntaxNode,

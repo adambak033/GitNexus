@@ -391,12 +391,17 @@ const extractPendingAssignment: PendingAssignmentExtractor = (node, scopeEnv) =>
   const rhsNode = node.childForFieldName('right');
   if (!rhsNode) return undefined;
   if (rhsNode.type === 'identifier') return { kind: 'copy', lhs: varName, rhs: rhsNode.text };
-  // call/method_call RHS → callResult (calls with explicit parens, no receiver)
+  // call/method_call RHS — Ruby uses method calls for both field access and method calls
   if (rhsNode.type === 'call' || rhsNode.type === 'method_call') {
     const methodNode = rhsNode.childForFieldName('method');
     const receiverNode = rhsNode.childForFieldName('receiver');
     if (!receiverNode && methodNode?.type === 'identifier') {
+      // No receiver → callResult (bare function call)
       return { kind: 'callResult', lhs: varName, callee: methodNode.text };
+    }
+    if (receiverNode?.type === 'identifier' && methodNode?.type === 'identifier') {
+      // With receiver → methodCallResult (a.method)
+      return { kind: 'methodCallResult', lhs: varName, receiver: receiverNode.text, method: methodNode.text };
     }
   }
   return undefined;
