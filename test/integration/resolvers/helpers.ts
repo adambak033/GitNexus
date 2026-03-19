@@ -51,6 +51,15 @@ export function edgeSet(edges: Array<{ source: string; target: string }>): strin
   return edges.map(e => `${e.source} → ${e.target}`).sort();
 }
 
+/** Get graph nodes by label with full properties (for parameterTypes assertions). */
+export function getNodesByLabelFull(result: PipelineResult, label: string): Array<{ name: string; properties: Record<string, any> }> {
+  const nodes: Array<{ name: string; properties: Record<string, any> }> = [];
+  result.graph.forEachNode(n => {
+    if (n.label === label) nodes.push({ name: n.properties.name, properties: n.properties });
+  });
+  return nodes.sort((a, b) => a.name.localeCompare(b.name));
+}
+
 // Tests can pass { skipGraphPhases: true } as third arg for faster runs
 // (skips MRO, community detection, and process extraction).
 export { runPipelineFromRepo };

@@ -1224,6 +1224,7 @@ const processFileGroup = (
           } : {}),
           ...(description !== undefined ? { description } : {}),
           ...(parameterCount !== undefined ? { parameterCount } : {}),
+          ...(parameterTypes !== undefined ? { parameterTypes } : {}),
           ...(returnType !== undefined ? { returnType } : {}),
         },
       });

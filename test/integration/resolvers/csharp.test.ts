@@ -4,7 +4,7 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import path from 'path';
 import {
-  FIXTURES, getRelationships, getNodesByLabel, edgeSet,
+  FIXTURES, getRelationships, getNodesByLabel, getNodesByLabelFull, edgeSet,
   runPipelineFromRepo, type PipelineResult,
 } from './helpers.js';
 
@@ -1482,10 +1482,11 @@ describe('C# overload disambiguation by parameter types', () => {
     );
   }, 60000);
 
-  it('detects Lookup method in UserService (1 graph node — ID collision for same-file overloads)', () => {
-    const methods = getNodesByLabel(result, 'Method');
-    const lookupMethods = methods.filter(m => m === 'Lookup');
-    expect(lookupMethods.length).toBe(1);
+  it('detects Lookup method with parameterTypes on graph node', () => {
+    const methods = getNodesByLabelFull(result, 'Method');
+    const lookupNodes = methods.filter(m => m.name === 'Lookup');
+    expect(lookupNodes.length).toBe(1);
+    expect(lookupNodes[0].properties.parameterTypes).toEqual(['int']);
   });
 
   it('emits CALLS edge from Run() → Lookup() via overload disambiguation', () => {

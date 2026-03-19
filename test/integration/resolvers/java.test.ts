@@ -4,7 +4,7 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import path from 'path';
 import {
-  FIXTURES, getRelationships, getNodesByLabel, edgeSet,
+  FIXTURES, getRelationships, getNodesByLabel, getNodesByLabelFull, edgeSet,
   runPipelineFromRepo, type PipelineResult,
 } from './helpers.js';
 
@@ -1337,12 +1337,13 @@ describe('Java overload disambiguation by parameter types', () => {
     );
   }, 60000);
 
-  it('detects lookup method in UserService (1 graph node — ID collision for same-file overloads)', () => {
-    const methods = getNodesByLabel(result, 'Method');
-    const lookupMethods = methods.filter(m => m === 'lookup');
-    // generateId produces same ID for same-file same-name overloads;
-    // graph deduplicates, so 1 node. SymbolTable stores both via fileIndex.
-    expect(lookupMethods.length).toBe(1);
+  it('detects lookup method with parameterTypes on graph node', () => {
+    const methods = getNodesByLabelFull(result, 'Method');
+    const lookupNodes = methods.filter(m => m.name === 'lookup');
+    // generateId collision → 1 graph node, first overload's parameterTypes wins
+    expect(lookupNodes.length).toBe(1);
+    // The node has parameterTypes from whichever overload was registered first
+    expect(lookupNodes[0].properties.parameterTypes).toEqual(['int']);
   });
 
   it('emits CALLS edge from run() → lookup() via overload disambiguation', () => {

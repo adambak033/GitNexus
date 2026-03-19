@@ -285,6 +285,7 @@ const processParsingSequential = async (
           } : {}),
           ...(methodSig ? {
             parameterCount: methodSig.parameterCount,
+            ...(methodSig.parameterTypes ? { parameterTypes: methodSig.parameterTypes } : {}),
             returnType: methodSig.returnType,
           } : {}),
         },

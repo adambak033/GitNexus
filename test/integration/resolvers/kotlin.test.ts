@@ -4,7 +4,7 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import path from 'path';
 import {
-  FIXTURES, getRelationships, getNodesByLabel, edgeSet,
+  FIXTURES, getRelationships, getNodesByLabel, getNodesByLabelFull, edgeSet,
   runPipelineFromRepo, type PipelineResult,
 } from './helpers.js';
 
@@ -1545,10 +1545,11 @@ describe('Kotlin overload disambiguation by parameter types', () => {
     );
   }, 60000);
 
-  it('detects lookup function (1 graph node — ID collision for same-file overloads)', () => {
-    const methods = getNodesByLabel(result, 'Function');
-    const lookupFuncs = methods.filter(m => m === 'lookup');
-    expect(lookupFuncs.length).toBe(1);
+  it('detects lookup function with parameterTypes on graph node', () => {
+    const nodes = getNodesByLabelFull(result, 'Function');
+    const lookupNodes = nodes.filter(m => m.name === 'lookup');
+    expect(lookupNodes.length).toBe(1);
+    expect(lookupNodes[0].properties.parameterTypes).toEqual(['Int']);
   });
 
   it('emits CALLS edge from run() → lookup() via overload disambiguation', () => {
