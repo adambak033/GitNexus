@@ -302,3 +302,55 @@ describe('Write access tracking (JavaScript)', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Phase A: JS object destructuring — const { field } = receiver → fieldAccess PendingAssignment
+// ---------------------------------------------------------------------------
+
+describe('JavaScript object destructuring resolution (Phase A)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'js-object-destructuring'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User, Address classes', () => {
+    const classes = getNodesByLabel(result, 'Class');
+    expect(classes).toContain('User');
+    expect(classes).toContain('Address');
+  });
+
+  it('resolves address.save() to Address#save via object destructuring', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.targetFilePath.includes('models'),
+    );
+    expect(saveCall).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase A: Post-fixpoint for-loop replay — iterable resolved via callResult fixpoint
+// ---------------------------------------------------------------------------
+
+describe('JavaScript post-fixpoint for-loop replay (Phase A ex-9B)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'js-fixpoint-for-loop'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves u.save() to User#save via post-fixpoint for-loop replay', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'process' && c.targetFilePath.includes('models'),
+    );
+    expect(saveCall).toBeDefined();
+  });
+});

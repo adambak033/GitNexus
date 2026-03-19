@@ -2054,3 +2054,163 @@ describe('TypeScript method chain binding via unified fixpoint (Phase 9C)', () =
     expect(saveCall).toBeDefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Phase A: Object destructuring — const { field } = receiver → fieldAccess PendingAssignment
+// ---------------------------------------------------------------------------
+
+describe('TypeScript object destructuring resolution (Phase A)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'ts-object-destructuring'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User, Address classes', () => {
+    const classes = getNodesByLabel(result, 'Class');
+    expect(classes).toContain('User');
+    expect(classes).toContain('Address');
+  });
+
+  it('resolves address.save() to Address#save via object destructuring', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.targetFilePath.includes('models'),
+    );
+    expect(saveCall).toBeDefined();
+  });
+
+  it('does NOT resolve save() to a wrong target', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCalls = calls.filter(c => c.target === 'save');
+    for (const call of saveCalls) {
+      expect(call.targetFilePath).toContain('models');
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase A: Post-fixpoint for-loop replay — iterable resolved via callResult fixpoint
+// Differs from ts-for-of-call-expression: iterable is an identifier, not inline call
+// ---------------------------------------------------------------------------
+
+describe('TypeScript post-fixpoint for-loop replay (Phase A ex-9B)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'ts-fixpoint-for-loop'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves u.save() to User#save via post-fixpoint for-loop replay', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'process' && c.targetFilePath.includes('models'),
+    );
+    expect(saveCall).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase B: Deep MRO — walkParentChain() at depth 2 (C→B→A)
+// greet() is defined on A, accessed via C. Tests BFS depth-2 parent traversal.
+// ---------------------------------------------------------------------------
+
+describe('TypeScript grandparent method resolution via MRO (Phase B)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'ts-grandparent-resolution'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects 3 classes in inheritance chain (A, B, C) plus Greeting', () => {
+    const classes = getNodesByLabel(result, 'Class');
+    expect(classes).toContain('A');
+    expect(classes).toContain('B');
+    expect(classes).toContain('C');
+    expect(classes).toContain('Greeting');
+  });
+
+  it('emits EXTENDS edges: B→A, C→B', () => {
+    const extends_ = getRelationships(result, 'EXTENDS');
+    expect(edgeSet(extends_)).toContain('B → A');
+    expect(edgeSet(extends_)).toContain('C → B');
+  });
+
+  it('resolves c.greet().save() to Greeting#save via depth-2 MRO lookup', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.targetFilePath.includes('greeting'),
+    );
+    expect(saveCall).toBeDefined();
+  });
+
+  it('resolves c.greet() to A#greet (method found via MRO walk)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const greetCall = calls.find(c =>
+      c.target === 'greet' && c.targetFilePath.includes('base'),
+    );
+    expect(greetCall).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase C: TS null-check narrowing — if (x !== null) { x.save() }
+// patternOverrides stores narrowed type for the if-body position range
+// ---------------------------------------------------------------------------
+
+describe('TypeScript null-check narrowing resolution (Phase C)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'ts-null-check-narrowing'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo classes', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Class')).toContain('Repo');
+  });
+
+  it('resolves x.save() inside !== null guard to User#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'processStrict' && c.targetFilePath.includes('models'),
+    );
+    expect(saveCall).toBeDefined();
+  });
+
+  it('does NOT resolve to Repo#save (no cross-contamination)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const wrongCall = calls.find(c =>
+      c.target === 'save' && c.targetLabel === 'Repo',
+    );
+    expect(wrongCall).toBeUndefined();
+  });
+
+  it('resolves x.save() in loose != null check (processLoose)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'processLoose' && c.targetFilePath.includes('models'),
+    );
+    expect(saveCall).toBeDefined();
+  });
+
+  it('resolves x.save() in !== undefined check (processUndefined)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'processUndefined' && c.targetFilePath.includes('models'),
+    );
+    expect(saveCall).toBeDefined();
+  });
+});

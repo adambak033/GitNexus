@@ -1362,3 +1362,94 @@ describe('C# method chain binding via unified fixpoint (Phase 9C)', () => {
     expect(saveCall).toBeDefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Phase B: Deep MRO — walkParentChain() at depth 2 (C→B→A)
+// Greet() is defined on A, accessed via C. Tests BFS depth-2 parent traversal.
+// ---------------------------------------------------------------------------
+
+describe('C# grandparent method resolution via MRO (Phase B)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'csharp-grandparent-resolution'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects A, B, C, Greeting classes', () => {
+    const classes = getNodesByLabel(result, 'Class');
+    expect(classes).toContain('A');
+    expect(classes).toContain('B');
+    expect(classes).toContain('C');
+    expect(classes).toContain('Greeting');
+  });
+
+  it('emits EXTENDS edges: B→A, C→B', () => {
+    const extends_ = getRelationships(result, 'EXTENDS');
+    expect(edgeSet(extends_)).toContain('B → A');
+    expect(edgeSet(extends_)).toContain('C → B');
+  });
+
+  it('resolves c.Greet().Save() to Greeting#Save via depth-2 MRO lookup', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'Save' && c.targetFilePath.includes('Greeting'),
+    );
+    expect(saveCall).toBeDefined();
+  });
+
+  it('resolves c.Greet() to A#Greet (method found via MRO walk)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const greetCall = calls.find(c =>
+      c.target === 'Greet' && c.targetFilePath.includes('A.cs'),
+    );
+    expect(greetCall).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase C: C# null-check narrowing — if (x != null) and if (x is not null)
+// Both patterns emit patternOverrides for the if-body position range
+// ---------------------------------------------------------------------------
+
+describe('C# null-check narrowing resolution (Phase C)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'csharp-null-check-narrowing'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo classes', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Class')).toContain('Repo');
+  });
+
+  it('resolves x.Save() inside != null guard (ProcessInequality) to User#Save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'Save' && c.source === 'ProcessInequality' && c.targetFilePath.includes('User'),
+    );
+    expect(saveCall).toBeDefined();
+  });
+
+  it('resolves x.Save() inside is not null guard (ProcessIsNotNull) to User#Save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'Save' && c.source === 'ProcessIsNotNull' && c.targetFilePath.includes('User'),
+    );
+    expect(saveCall).toBeDefined();
+  });
+
+  it('does NOT cross-resolve to Repo#Save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const wrongCall = calls.find(c =>
+      c.target === 'Save' && c.targetFilePath.includes('Repo'),
+    );
+    expect(wrongCall).toBeUndefined();
+  });
+});

@@ -1145,3 +1145,40 @@ describe('Go method chain binding via unified fixpoint (Phase 9C)', () => {
     expect(saveCall).toBeDefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Phase B: Go inc_statement / dec_statement write access
+// obj.Field++ and obj.Field-- emit ACCESSES write edges
+// ---------------------------------------------------------------------------
+
+describe('Go inc/dec write access tracking (Phase B)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'go-inc-dec-write-access'),
+      () => {},
+    );
+  }, 60000);
+
+  it('emits ACCESSES write edge for Count++ in increment', () => {
+    const accesses = getRelationships(result, 'ACCESSES');
+    const writes = accesses.filter(e => e.rel.reason === 'write');
+    const countInc = writes.find(e => e.target === 'Count' && e.source === 'increment');
+    expect(countInc).toBeDefined();
+  });
+
+  it('emits ACCESSES write edge for Total++ in increment', () => {
+    const accesses = getRelationships(result, 'ACCESSES');
+    const writes = accesses.filter(e => e.rel.reason === 'write');
+    const totalInc = writes.find(e => e.target === 'Total' && e.source === 'increment');
+    expect(totalInc).toBeDefined();
+  });
+
+  it('emits ACCESSES write edge for Count-- in decrement', () => {
+    const accesses = getRelationships(result, 'ACCESSES');
+    const writes = accesses.filter(e => e.rel.reason === 'write');
+    const countDec = writes.find(e => e.target === 'Count' && e.source === 'decrement');
+    expect(countDec).toBeDefined();
+  });
+});

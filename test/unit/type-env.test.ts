@@ -3797,9 +3797,7 @@ function process(x) {
       expect(flatGet(env, 'x')).toBe('User');
     });
 
-    // TODO: Kotlin nullable parameter type capture needs tree-sitter grammar investigation
-    // The nullable_type node may not be captured via the current declarationTypeNodes path
-    it.skip('Kotlin: if (x != null) narrows nullable type inside if-body', () => {
+    it('Kotlin: if (x != null) narrows nullable type inside if-body', () => {
       const code = `
 fun process(x: User?) {
     if (x != null) {

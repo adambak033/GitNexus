@@ -341,7 +341,8 @@ const extractKotlinParameter: ParameterExtractor = (node: SyntaxNode, env: Map<s
 
   // Fallback: Kotlin `parameter` nodes use positional children, not named fields
   if (!nameNode) nameNode = findChildByType(node, 'simple_identifier');
-  if (!typeNode) typeNode = findChildByType(node, 'user_type');
+  if (!typeNode) typeNode = findChildByType(node, 'user_type')
+    ?? findChildByType(node, 'nullable_type');
 
   if (!nameNode || !typeNode) return;
   const varName = extractVarName(nameNode);
@@ -678,22 +679,22 @@ const extractKotlinPatternBinding: PatternBindingExtractor = (node, scopeEnv, de
   }
 
   // Null-check narrowing: if (x != null) { ... }
-  // Kotlin AST: comparison_expression > simple_identifier, "!=", null_literal
-  if (node.type === 'comparison_expression') {
+  // Kotlin AST: equality_expression > simple_identifier, "!=" [anon], "null" [anon]
+  // Note: `null` is an anonymous node in tree-sitter-kotlin, not `null_literal`.
+  if (node.type === 'equality_expression') {
     const op = node.children.find(c => !c.isNamed && c.text === '!=');
     if (!op) return undefined;
 
-    const left = node.namedChild(0);
-    const right = node.namedChild(1);
-    if (!left || !right) return undefined;
-
+    // `null` is anonymous in Kotlin grammar — use positional child scan
     let varNode: SyntaxNode | undefined;
-    if (left.type === 'simple_identifier' && right.type === 'null_literal') {
-      varNode = left;
-    } else if (right.type === 'simple_identifier' && left.type === 'null_literal') {
-      varNode = right;
+    let hasNull = false;
+    for (let i = 0; i < node.childCount; i++) {
+      const c = node.child(i);
+      if (!c) continue;
+      if (c.type === 'simple_identifier') varNode = c;
+      if (!c.isNamed && c.text === 'null') hasNull = true;
     }
-    if (!varNode) return undefined;
+    if (!varNode || !hasNull) return undefined;
 
     const varName = varNode.text;
     const resolvedType = scopeEnv.get(varName);
@@ -729,7 +730,7 @@ export const kotlinTypeConfig: LanguageTypeConfig = {
   allowPatternBindingOverwrite: true,
   declarationNodeTypes: KOTLIN_DECLARATION_NODE_TYPES,
   forLoopNodeTypes: KOTLIN_FOR_LOOP_NODE_TYPES,
-  patternBindingNodeTypes: new Set(['type_test', 'comparison_expression']),
+  patternBindingNodeTypes: new Set(['type_test', 'equality_expression']),
   extractDeclaration: extractKotlinDeclaration,
   extractParameter: extractKotlinParameter,
   extractInitializer: extractKotlinInitializer,

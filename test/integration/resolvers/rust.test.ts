@@ -1475,3 +1475,40 @@ describe('Rust method chain binding via unified fixpoint (Phase 9C)', () => {
     expect(saveCall).toBeDefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Phase A: Rust struct_pattern destructuring — let Point { x, y } = p
+// Each field emits a fieldAccess PendingAssignment; fixpoint resolves x/y → Vec2
+// ---------------------------------------------------------------------------
+
+describe('Rust struct_pattern destructuring resolution (Phase A)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'rust-struct-destructuring'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects Point and Vec2 structs', () => {
+    const classes = getNodesByLabel(result, 'Struct');
+    expect(classes).toContain('Point');
+    expect(classes).toContain('Vec2');
+  });
+
+  it('resolves x.save() to Vec2#save via struct destructuring', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'process' && c.targetFilePath.includes('vec2'),
+    );
+    expect(saveCall).toBeDefined();
+  });
+
+  it('resolves both x.save() and y.save() — emits at least 1 CALLS to Vec2#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCalls = calls.filter(c => c.target === 'save' && c.targetFilePath.includes('vec2'));
+    // Both x and y are Vec2 — the same function, so calls may deduplicate to 1
+    expect(saveCalls.length).toBeGreaterThanOrEqual(1);
+  });
+});
