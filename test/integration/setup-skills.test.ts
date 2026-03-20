@@ -9,6 +9,7 @@ describe('setupCommand skills integration', () => {
   let tempHome: string;
   const originalHome = process.env.HOME;
   const originalUserProfile = process.env.USERPROFILE;
+  const originalPath = process.env.PATH;
   const testId = `${Date.now()}-${process.pid}`;
   const flatSkillName = `test-flat-skill-${testId}`;
   const dirSkillName = `test-dir-skill-${testId}`;
@@ -47,6 +48,7 @@ describe('setupCommand skills integration', () => {
     await fs.rm(path.join(packageSkillsRoot, dirSkillName), { recursive: true, force: true });
     process.env.HOME = originalHome;
     process.env.USERPROFILE = originalUserProfile;
+    process.env.PATH = originalPath;
     await fs.rm(tempHome, { recursive: true, force: true });
   });
 
@@ -84,5 +86,41 @@ describe('setupCommand skills integration', () => {
       'utf-8',
     );
     expect(nestedInstalled).toContain('Directory Nested File');
+  });
+
+  it('falls back to Codex config.toml and installs skills into ~/.agents/skills when codex CLI is unavailable', async () => {
+    await fs.mkdir(path.join(tempHome, '.codex'), { recursive: true });
+    process.env.PATH = '';
+
+    await setupCommand();
+
+    const codexConfig = await fs.readFile(
+      path.join(tempHome, '.codex', 'config.toml'),
+      'utf-8',
+    );
+    expect(codexConfig).toContain('[mcp_servers.gitnexus]');
+    expect(codexConfig).toContain('gitnexus@latest');
+
+    const codexSkill = await fs.readFile(
+      path.join(tempHome, '.agents', 'skills', 'gitnexus-cli', 'SKILL.md'),
+      'utf-8',
+    );
+    expect(codexSkill).toContain('GitNexus CLI Commands');
+  });
+
+  it('does not duplicate the Codex MCP section on repeated fallback setup runs', async () => {
+    await fs.mkdir(path.join(tempHome, '.codex'), { recursive: true });
+    process.env.PATH = '';
+
+    await setupCommand();
+    await setupCommand();
+
+    const codexConfig = await fs.readFile(
+      path.join(tempHome, '.codex', 'config.toml'),
+      'utf-8',
+    );
+    const sectionMatches = codexConfig.match(/\[mcp_servers\.gitnexus\]/g) ?? [];
+
+    expect(sectionMatches).toHaveLength(1);
   });
 });
