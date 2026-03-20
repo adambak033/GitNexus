@@ -6,7 +6,7 @@ import {
   processImportsFromExtracted,
   buildImportResolutionContext
 } from './import-processor.js';
-import { processCalls, processCallsFromExtracted, processAssignmentsFromExtracted, processRoutesFromExtracted, type ExportedTypeMap } from './call-processor.js';
+import { processCalls, processCallsFromExtracted, processAssignmentsFromExtracted, processRoutesFromExtracted, type ExportedTypeMap, buildExportedTypeMapFromGraph } from './call-processor.js';
 import { processHeritage, processHeritageFromExtracted } from './heritage-processor.js';
 import { computeMRO } from './mro-processor.js';
 import { processCommunities } from './community-processor.js';
@@ -398,6 +398,14 @@ export const runPipelineFromRepo = async (
     // Uses namedImportMap (populated during import processing) to determine
     // which exported bindings each file needs. Files processed in topological
     // import order so upstream bindings are available when downstream runs.
+
+    // For the worker path, buildTypeEnv runs inside workers without SymbolTable,
+    // so exported bindings must be collected from graph + SymbolTable in main thread.
+    if (exportedTypeMap.size === 0 && graph.nodeCount > 0) {
+      const graphExports = buildExportedTypeMapFromGraph(graph, ctx.symbols);
+      for (const [fp, exports] of graphExports) exportedTypeMap.set(fp, exports);
+    }
+
     if (exportedTypeMap.size > 0 && ctx.namedImportMap.size > 0) {
       const allPathSet = new Set(allPaths);
       const levels = topologicalLevelSort(ctx.importMap);
@@ -414,13 +422,12 @@ export const runPipelineFromRepo = async (
         }
       }
 
-      const totalProcessed = exportedTypeMap.size + filesWithGaps;
-      const gapRatio = totalProcessed > 0 ? filesWithGaps / totalProcessed : 0;
       const CROSS_FILE_SKIP_THRESHOLD = 0.03;
+      const gapRatio = totalFiles > 0 ? filesWithGaps / totalFiles : 0;
 
       if (gapRatio < CROSS_FILE_SKIP_THRESHOLD) {
         if (isDev) {
-          console.log(`⏭️ Cross-file re-resolution skipped (${filesWithGaps} files, ${(gapRatio * 100).toFixed(1)}% < ${CROSS_FILE_SKIP_THRESHOLD * 100}% threshold)`);
+          console.log(`⏭️ Cross-file re-resolution skipped (${filesWithGaps}/${totalFiles} files, ${(gapRatio * 100).toFixed(1)}% < ${CROSS_FILE_SKIP_THRESHOLD * 100}% threshold)`);
         }
       } else {
         onProgress({
@@ -461,37 +468,16 @@ export const runPipelineFromRepo = async (
             const content = contentMap.get(filePath);
             if (!content) continue;
 
-            const parser = await loadParser();
-            await loadLanguage(lang, filePath);
-            const bufferSize = getTreeSitterBufferSize(content.length);
-            if (bufferSize) (parser as any).setBufferSize?.(bufferSize);
-            const tree = parser.parse(content);
-
-            const typeEnv = buildTypeEnv(tree, lang, {
-              symbolTable: ctx.symbols,
-              importedBindings: seeded,
-            });
-
-            // Collect updated exports for downstream propagation
-            const fileScope = typeEnv.env.get('');
-            if (fileScope) {
-              const updated = new Map<string, string>();
-              for (const [varName, typeName] of fileScope) {
-                if (updated.size >= 500) break;
-                if (!typeName || typeName.length > 256) continue;
-                const nodeId = ctx.symbols.lookupExact(filePath, varName);
-                if (!nodeId) continue;
-                const node = graph.getNode(nodeId);
-                if (node?.properties?.isExported) {
-                  updated.set(varName, typeName);
-                }
-              }
-              if (updated.size > 0) exportedTypeMap.set(filePath, updated);
-            }
+            // Re-parse and re-resolve calls with cross-file seeded type environment
+            const reFile = [{ path: filePath, content }];
+            const bindings = new Map<string, ReadonlyMap<string, string>>();
+            bindings.set(filePath, seeded);
+            astCache = createASTCache(1);
+            await processCalls(graph, reFile, astCache, ctx, undefined, exportedTypeMap, bindings);
+            astCache.clear();
 
             crossFileResolved++;
           }
-          astCache.clear();
         }
 
         if (isDev) {

@@ -1,6 +1,6 @@
 import { KnowledgeGraph } from '../graph/types.js';
 import { ASTCache } from './ast-cache.js';
-import type { SymbolDefinition } from './symbol-table.js';
+import type { SymbolDefinition, SymbolTable } from './symbol-table.js';
 import Parser from 'tree-sitter';
 import type { ResolutionContext } from './resolution-context.js';
 import { TIER_CONFIDENCE, type ResolutionTier } from './resolution-context.js';
@@ -63,6 +63,37 @@ function collectExportedBindings(
     }
   }
   return exported.size > 0 ? exported : null;
+}
+
+/** Build ExportedTypeMap from graph nodes — used for worker path where TypeEnv
+ *  is not available in the main thread. Collects returnType/declaredType from
+ *  exported symbols that have callables with known return types. */
+export function buildExportedTypeMapFromGraph(
+  graph: KnowledgeGraph,
+  symbolTable: SymbolTable,
+): ExportedTypeMap {
+  const result: ExportedTypeMap = new Map();
+  graph.forEachNode(node => {
+    if (!node.properties?.isExported) return;
+    if (!node.properties?.filePath || !node.properties?.name) return;
+    const filePath = node.properties.filePath as string;
+    const name = node.properties.name as string;
+    if (!name || name.length > MAX_TYPE_NAME_LENGTH) return;
+    // For callable symbols, use returnType; for properties/variables, use declaredType
+    const def = symbolTable.lookupExactFull(filePath, name);
+    if (!def) return;
+    const typeName = def.returnType ?? def.declaredType;
+    if (!typeName || typeName.length > MAX_TYPE_NAME_LENGTH) return;
+    // Extract simple type name (strip Promise<>, etc.)
+    const simpleType = typeName.replace(/^(?:Promise|Observable|Task|Future|CompletableFuture)\s*<\s*/, '').replace(/\s*>\s*$/, '') || typeName;
+    if (!simpleType) return;
+    let fileExports = result.get(filePath);
+    if (!fileExports) { fileExports = new Map(); result.set(filePath, fileExports); }
+    if (fileExports.size < MAX_EXPORTS_PER_FILE) {
+      fileExports.set(name, simpleType);
+    }
+  });
+  return result;
 }
 
 // Stdlib methods that preserve the receiver's type identity. When TypeEnv already
@@ -171,6 +202,8 @@ export const processCalls = async (
   ctx: ResolutionContext,
   onProgress?: (current: number, total: number) => void,
   exportedTypeMap?: ExportedTypeMap,
+  /** Phase 14: pre-resolved cross-file bindings to seed into buildTypeEnv. Keyed by filePath → Map<localName, typeName>. */
+  importedBindingsMap?: ReadonlyMap<string, ReadonlyMap<string, string>>,
 ): Promise<ExtractedHeritage[]> => {
   const parser = await loadParser();
   const collectedHeritage: ExtractedHeritage[] = [];
@@ -256,7 +289,8 @@ export const processCalls = async (
       }
     }
 
-    const typeEnv = lang ? buildTypeEnv(tree, lang, { symbolTable: ctx.symbols, parentMap }) : null;
+    const importedBindings = importedBindingsMap?.get(file.path);
+    const typeEnv = lang ? buildTypeEnv(tree, lang, { symbolTable: ctx.symbols, parentMap, importedBindings }) : null;
     if (typeEnv && exportedTypeMap) {
       const fileExports = collectExportedBindings(typeEnv, file.path, ctx.symbols, graph);
       if (fileExports) exportedTypeMap.set(file.path, fileExports);
