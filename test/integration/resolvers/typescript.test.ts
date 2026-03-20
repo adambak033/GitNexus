@@ -4,7 +4,7 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import path from 'path';
 import {
-  FIXTURES, getRelationships, getNodesByLabel, edgeSet,
+  FIXTURES, getRelationships, getNodesByLabel, getNodesByLabelFull, edgeSet,
   runPipelineFromRepo, type PipelineResult,
 } from './helpers.js';
 
@@ -2256,5 +2256,37 @@ describe('TypeScript virtual dispatch via constructor type (same-file)', () => {
     // receiver from Animal → Dog. dog.fetchBall() resolves directly.
     // Both target same nodeId → 1 CALLS edge after dedup.
     expect(fetchCalls.length).toBe(1);
+  });
+});
+
+// ── Phase P: Overload Disambiguation via inferLiteralType ────────────────
+
+describe('TypeScript overload disambiguation via inferLiteralType', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'ts-overload-disambiguation'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects lookup function with parameterTypes on graph node', () => {
+    const functions = getNodesByLabelFull(result, 'Function');
+    const lookupNodes = functions.filter(f => f.name === 'lookup');
+    // generateId collision → 1 graph node, first overload's parameterTypes wins
+    expect(lookupNodes.length).toBeGreaterThanOrEqual(1);
+    // At least one lookup node has parameterTypes set
+    const withParamTypes = lookupNodes.filter(n => n.properties.parameterTypes);
+    expect(withParamTypes.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('emits CALLS edges from process() → lookup() via overload disambiguation', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const lookupCalls = calls.filter(c => c.source === 'process' && c.target === 'lookup');
+    // Phase 0 (fileIndex stores both overloads) + Phase 2 (literal type matching)
+    // enables resolution where previously 2 same-arity candidates → null.
+    // Both calls resolve to same nodeId (ID collision) → 1 CALLS edge after dedup.
+    expect(lookupCalls.length).toBe(1);
   });
 });

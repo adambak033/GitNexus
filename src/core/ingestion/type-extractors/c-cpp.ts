@@ -1,10 +1,33 @@
 import type { SyntaxNode } from '../utils.js';
-import type { LanguageTypeConfig, ParameterExtractor, TypeBindingExtractor, InitializerExtractor, ClassNameLookup, ConstructorBindingScanner, PendingAssignmentExtractor, ForLoopExtractor } from './types.js';
+import type { LanguageTypeConfig, ParameterExtractor, TypeBindingExtractor, InitializerExtractor, ClassNameLookup, ConstructorBindingScanner, PendingAssignmentExtractor, ForLoopExtractor, LiteralTypeInferrer, ConstructorTypeDetector, DeclaredTypeUnwrapper } from './types.js';
 import { extractSimpleTypeName, extractVarName, resolveIterableElementType, methodToTypeArgPosition, type TypeArgPosition } from './shared.js';
 
 const DECLARATION_NODE_TYPES: ReadonlySet<string> = new Set([
   'declaration',
 ]);
+
+/** Smart pointer factory function names that create a typed object. */
+const SMART_PTR_FACTORIES = new Set([
+  'make_shared', 'make_unique', 'make_shared_for_overwrite',
+]);
+
+/** Smart pointer wrapper type names. When the declared type is a smart pointer,
+ *  the inner template type is extracted for virtual dispatch comparison. */
+const SMART_PTR_WRAPPERS = new Set(['shared_ptr', 'unique_ptr', 'weak_ptr']);
+
+/** Extract the first type name from a template_argument_list child.
+ *  Unwraps type_descriptor wrappers common in tree-sitter-cpp ASTs.
+ *  Returns undefined if no template arguments or no type found. */
+export const extractFirstTemplateTypeArg = (parentNode: SyntaxNode): string | undefined => {
+  const templateArgs = parentNode.children.find((c: any) => c.type === 'template_argument_list');
+  if (!templateArgs?.firstNamedChild) return undefined;
+  let argNode: any = templateArgs.firstNamedChild;
+  if (argNode.type === 'type_descriptor') {
+    const inner = argNode.childForFieldName('type');
+    if (inner) argNode = inner;
+  }
+  return extractSimpleTypeName(argNode) ?? undefined;
+};
 
 /** C++: Type x = ...; Type* x; Type& x; */
 const extractDeclaration: TypeBindingExtractor = (node: SyntaxNode, env: Map<string, string>): void => {
@@ -88,6 +111,27 @@ const extractInitializer: InitializerExtractor = (node: SyntaxNode, env: Map<str
     } else if (func.type === 'identifier') {
       const text = func.text;
       if (text && classNames.has(text)) env.set(varName, text);
+    } else {
+      // auto x = std::make_shared<Dog>() — smart pointer factory via template_function.
+      // AST: call_expression > function: qualified_identifier > template_function
+      //   or: call_expression > function: template_function (unqualified)
+      const templateFunc = func.type === 'template_function'
+        ? func
+        : (func.type === 'qualified_identifier' || func.type === 'scoped_identifier')
+          ? func.namedChildren.find((c: any) => c.type === 'template_function') ?? null
+          : null;
+      if (templateFunc) {
+        const nameNode = templateFunc.firstNamedChild;
+        if (nameNode) {
+          const funcName = (nameNode.type === 'qualified_identifier' || nameNode.type === 'scoped_identifier')
+            ? nameNode.lastNamedChild?.text ?? ''
+            : nameNode.text;
+          if (SMART_PTR_FACTORIES.has(funcName)) {
+            const typeName = extractFirstTemplateTypeArg(templateFunc);
+            if (typeName) env.set(varName, typeName);
+          }
+        }
+      }
     }
     return;
   }
@@ -372,7 +416,7 @@ const extractForLoopBinding: ForLoopExtractor = (node, { scopeEnv, declarationTy
 };
 
 /** Infer the type of a literal AST node for C++ overload disambiguation. */
-const inferLiteralType = (node: SyntaxNode): string | undefined => {
+const inferLiteralType: LiteralTypeInferrer = (node) => {
   switch (node.type) {
     case 'number_literal': {
       const t = node.text;
@@ -400,6 +444,43 @@ const inferLiteralType = (node: SyntaxNode): string | undefined => {
   }
 };
 
+/** C++: detect constructor type from smart pointer factory calls (make_shared<Dog>()).
+ *  Extracts the template type argument as the constructor type for virtual dispatch. */
+const detectCppConstructorType: ConstructorTypeDetector = (node, classNames) => {
+  // Navigate to the initializer value in the declaration
+  const declarator = node.childForFieldName('declarator');
+  const initDecl = declarator?.type === 'init_declarator' ? declarator : undefined;
+  if (!initDecl) return undefined;
+  const value = initDecl.childForFieldName('value');
+  if (!value || value.type !== 'call_expression') return undefined;
+
+  // Check for template_function pattern: make_shared<Dog>()
+  const func = value.childForFieldName('function');
+  if (!func || func.type !== 'template_function') return undefined;
+
+  // Extract function name (possibly qualified: std::make_shared)
+  const nameNode = func.firstNamedChild;
+  if (!nameNode) return undefined;
+  let funcName: string;
+  if (nameNode.type === 'qualified_identifier' || nameNode.type === 'scoped_identifier') {
+    funcName = nameNode.lastNamedChild?.text ?? '';
+  } else {
+    funcName = nameNode.text;
+  }
+  if (!SMART_PTR_FACTORIES.has(funcName)) return undefined;
+
+  // Extract template type argument
+  return extractFirstTemplateTypeArg(func);
+};
+
+/** Unwrap a C++ smart pointer declared type to its inner template type.
+ *  E.g., shared_ptr<Animal> → Animal. Returns the original name if not a smart pointer. */
+const unwrapCppDeclaredType: DeclaredTypeUnwrapper = (declaredType, typeNode) => {
+  if (!SMART_PTR_WRAPPERS.has(declaredType)) return declaredType;
+  if (typeNode.type !== 'template_type') return declaredType;
+  return extractFirstTemplateTypeArg(typeNode) ?? declaredType;
+};
+
 export const typeConfig: LanguageTypeConfig = {
   declarationNodeTypes: DECLARATION_NODE_TYPES,
   forLoopNodeTypes: FOR_LOOP_NODE_TYPES,
@@ -410,4 +491,6 @@ export const typeConfig: LanguageTypeConfig = {
   extractForLoopBinding,
   extractPendingAssignment,
   inferLiteralType,
+  detectConstructorType: detectCppConstructorType,
+  unwrapDeclaredType: unwrapCppDeclaredType,
 };

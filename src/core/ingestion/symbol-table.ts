@@ -6,7 +6,8 @@ export interface SymbolDefinition {
   type: NodeLabel;
   parameterCount?: number;
   /** Per-parameter type names for overload disambiguation (e.g. ['int', 'String']).
-   *  Only populated for overloading languages (Java, Kotlin, C#, C++). */
+   *  Populated when parameter types are resolvable from AST (any typed language).
+   *  Used for disambiguation in overloading languages (Java, Kotlin, C#, C++). */
   parameterTypes?: string[];
   /** Raw return type text extracted from AST (e.g. 'User', 'Promise<User>') */
   returnType?: string;

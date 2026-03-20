@@ -19,6 +19,10 @@ export const TYPESCRIPT_QUERIES = `
 (function_declaration
   name: (identifier) @name) @definition.function
 
+; TypeScript overload signatures (function_signature is a separate node type from function_declaration)
+(function_signature
+  name: (identifier) @name) @definition.function
+
 (method_definition
   name: (property_identifier) @name) @definition.method
 

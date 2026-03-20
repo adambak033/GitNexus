@@ -1,5 +1,5 @@
 import type { SyntaxNode } from '../utils.js';
-import type { ConstructorBindingScanner, ForLoopExtractor, LanguageTypeConfig, ParameterExtractor, TypeBindingExtractor, PendingAssignmentExtractor, PatternBindingExtractor } from './types.js';
+import type { ConstructorBindingScanner, ForLoopExtractor, LanguageTypeConfig, ParameterExtractor, TypeBindingExtractor, PendingAssignmentExtractor, PatternBindingExtractor, LiteralTypeInferrer } from './types.js';
 import { extractSimpleTypeName, extractVarName, findChildByType, unwrapAwait, extractGenericTypeArgs, resolveIterableElementType, methodToTypeArgPosition, extractElementTypeFromString, type TypeArgPosition } from './shared.js';
 
 /** Known container property accessors that operate on the container itself (e.g., dict.Keys, dict.Values) */
@@ -464,7 +464,7 @@ const extractPendingAssignment: PendingAssignmentExtractor = (node, scopeEnv) =>
 };
 
 /** Infer the type of a literal AST node for C# overload disambiguation. */
-const inferLiteralType = (node: SyntaxNode): string | undefined => {
+const inferLiteralType: LiteralTypeInferrer = (node) => {
   switch (node.type) {
     case 'integer_literal':
       if (node.text.endsWith('L') || node.text.endsWith('l')) return 'long';

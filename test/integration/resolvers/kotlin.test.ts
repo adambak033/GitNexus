@@ -1559,3 +1559,29 @@ describe('Kotlin overload disambiguation by parameter types', () => {
     expect(lookupCalls.length).toBe(1);
   });
 });
+
+// ── Phase P: Virtual Dispatch via Constructor Type (cross-file) ──────────
+
+describe('Kotlin virtual dispatch via constructor type (cross-file)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'kotlin-virtual-dispatch'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects Dog class', () => {
+    const classes = getNodesByLabel(result, 'Class');
+    expect(classes).toContain('Dog');
+  });
+
+  it('resolves animal.speak() to models/Dog.kt via constructor type override', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const speakCall = calls.find(c =>
+      c.source === 'process' && c.target === 'speak' && c.targetFilePath === 'models/Dog.kt',
+    );
+    expect(speakCall).toBeDefined();
+  });
+});

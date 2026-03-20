@@ -1,5 +1,5 @@
 import type { SyntaxNode } from '../utils.js';
-import type { LanguageTypeConfig, ParameterExtractor, TypeBindingExtractor, InitializerExtractor, ClassNameLookup, ConstructorBindingScanner, ReturnTypeExtractor, PendingAssignmentExtractor, PendingAssignment, ForLoopExtractor, PatternBindingExtractor } from './types.js';
+import type { LanguageTypeConfig, ParameterExtractor, TypeBindingExtractor, InitializerExtractor, ClassNameLookup, ConstructorBindingScanner, ReturnTypeExtractor, PendingAssignmentExtractor, PendingAssignment, ForLoopExtractor, PatternBindingExtractor, LiteralTypeInferrer } from './types.js';
 import { extractSimpleTypeName, extractVarName, hasTypeAnnotation, unwrapAwait, extractCalleeName, extractElementTypeFromString, extractGenericTypeArgs, resolveIterableElementType, methodToTypeArgPosition, type TypeArgPosition } from './shared.js';
 
 const DECLARATION_NODE_TYPES: ReadonlySet<string> = new Set([
@@ -597,6 +597,28 @@ const extractPatternBinding: PatternBindingExtractor = (node, scopeEnv, declarat
   };
 };
 
+/** Infer the type of a literal AST node for TypeScript overload disambiguation. */
+const inferTsLiteralType: LiteralTypeInferrer = (node) => {
+  switch (node.type) {
+    case 'number':
+      return 'number';
+    case 'string':
+    case 'template_string':
+      return 'string';
+    case 'true':
+    case 'false':
+      return 'boolean';
+    case 'null':
+      return 'null';
+    case 'undefined':
+      return 'undefined';
+    case 'regex':
+      return 'RegExp';
+    default:
+      return undefined;
+  }
+};
+
 export const typeConfig: LanguageTypeConfig = {
   declarationNodeTypes: DECLARATION_NODE_TYPES,
   forLoopNodeTypes: FOR_LOOP_NODE_TYPES,
@@ -609,4 +631,5 @@ export const typeConfig: LanguageTypeConfig = {
   extractForLoopBinding,
   extractPendingAssignment,
   extractPatternBinding,
+  inferLiteralType: inferTsLiteralType,
 };

@@ -1088,3 +1088,29 @@ describe('C++ overload disambiguation by parameter types', () => {
     expect(lookupCalls.length).toBe(1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// C++ smart pointer virtual dispatch via std::make_shared<T>()
+// ---------------------------------------------------------------------------
+
+describe('C++ smart pointer virtual dispatch via make_shared', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'cpp-smart-ptr-dispatch'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects Dog and Animal classes', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('Animal');
+    expect(getNodesByLabel(result, 'Class')).toContain('Dog');
+  });
+
+  it('emits CALLS edge from process → speak', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const speakCall = calls.find(c => c.source === 'process' && c.target === 'speak');
+    expect(speakCall).toBeDefined();
+  });
+});

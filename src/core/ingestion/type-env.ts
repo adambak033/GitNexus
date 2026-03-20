@@ -1,5 +1,5 @@
 import type { SyntaxNode } from './utils.js';
-import { FUNCTION_NODE_TYPES, extractFunctionName, CLASS_CONTAINER_TYPES, isBuiltInOrNoise } from './utils.js';
+import { FUNCTION_NODE_TYPES, extractFunctionName, CLASS_CONTAINER_TYPES, CALL_EXPRESSION_TYPES, isBuiltInOrNoise } from './utils.js';
 import { SupportedLanguages } from '../../config/supported-languages.js';
 import { typeConfigs, TYPED_PARAMETER_TYPES } from './type-extractors/index.js';
 import type { ClassNameLookup, ReturnTypeLookup, ForLoopExtractorContext, PendingAssignment } from './type-extractors/types.js';
@@ -409,9 +409,12 @@ const createClassDefCache = (symbolTable?: SymbolTable) => {
   };
 };
 
-/** AST node types representing constructor expressions across languages. */
+/** AST node types representing constructor expressions across languages.
+ *  Note: C# also has `implicit_object_creation_expression` (`new()` with type
+ *  inference) which is NOT captured — the type is inferred, not explicit.
+ *  Kotlin constructors use `call_expression` (no `new` keyword) — not detected. */
 const CONSTRUCTOR_EXPR_TYPES = new Set([
-  'new_expression',               // TS/JS: new Dog()
+  'new_expression',               // TS/JS/C++: new Dog()
   'object_creation_expression',   // Java/C#: new Dog()
 ]);
 
@@ -434,13 +437,18 @@ const extractConstructorTypeName = (node: SyntaxNode, depth = 0): string | undef
   for (let i = 0; i < node.namedChildCount; i++) {
     const child = node.namedChild(i);
     if (!child) continue;
-    // Don't descend into nested functions/classes
-    if (FUNCTION_NODE_TYPES.has(child.type) || CLASS_CONTAINER_TYPES.has(child.type)) continue;
+    // Don't descend into nested functions/classes or call expressions (prevents
+    // finding constructor args inside method calls, e.g. processAll(new Dog()))
+    if (FUNCTION_NODE_TYPES.has(child.type) || CLASS_CONTAINER_TYPES.has(child.type)
+      || CALL_EXPRESSION_TYPES.has(child.type)) continue;
     const result = extractConstructorTypeName(child, depth + 1);
     if (result) return result;
   }
   return undefined;
 };
+
+/** Max depth for MRO parent chain walking. Real-world inheritance rarely exceeds 3-4 levels. */
+const MAX_MRO_DEPTH = 5;
 
 /** Check if `child` is a subclass of `parent` using the parentMap.
  *  BFS up from child, depth-limited (5), cycle-safe. */
@@ -465,9 +473,6 @@ export const isSubclassOf = (
   }
   return false;
 };
-
-/** Max depth for MRO parent chain walking. Real-world inheritance rarely exceeds 3-4 levels. */
-const MAX_MRO_DEPTH = 5;
 
 /** Walk up the parent class chain to find a field or method on an ancestor.
  *  BFS-like traversal with depth limit and cycle detection. First match wins.
@@ -795,7 +800,20 @@ export const buildTypeEnv = (
             if (c?.type === 'variable_declaration') { wrapped = c; break; }
           }
         }
-        if (wrapped) typeNode = wrapped.childForFieldName('type');
+        if (wrapped) {
+          typeNode = wrapped.childForFieldName('type');
+          // Kotlin: variable_declaration stores the type as user_type / nullable_type
+          // child rather than a named 'type' field.
+          if (!typeNode) {
+            for (let i = 0; i < wrapped.namedChildCount; i++) {
+              const c = wrapped.namedChild(i);
+              if (c && (c.type === 'user_type' || c.type === 'nullable_type')) {
+                typeNode = c;
+                break;
+              }
+            }
+          }
+        }
       }
       if (typeNode) {
         const nameNode = node.childForFieldName('name')
@@ -837,8 +855,16 @@ export const buildTypeEnv = (
           if (keysBefore.has(varName)) continue;
           const declaredType = scopeEnv.get(varName);
           if (!declaredType) continue;
-          const ctorType = extractConstructorTypeName(node);
-          if (ctorType && ctorType !== declaredType) {
+          const ctorType = extractConstructorTypeName(node)
+            ?? config.detectConstructorType?.(node, classNames);
+          if (!ctorType || ctorType === declaredType) continue;
+          // Unwrap wrapper types (e.g., C++ shared_ptr<Animal> → Animal) for an
+          // accurate isSubclassOf comparison. Language-specific via config hook.
+          const declTypeNode = declarationTypeNodes.get(`${scope}\0${varName}`);
+          const effectiveDeclaredType = (declTypeNode && config.unwrapDeclaredType)
+            ? (config.unwrapDeclaredType(declaredType, declTypeNode) ?? declaredType)
+            : declaredType;
+          if (ctorType !== effectiveDeclaredType) {
             constructorTypeMap.set(`${scope}\0${varName}`, ctorType);
           }
         }
