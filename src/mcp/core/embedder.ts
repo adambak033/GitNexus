@@ -9,7 +9,13 @@ import { pipeline, env, type FeatureExtractionPipeline } from '@huggingface/tran
 
 // Model config
 const MODEL_ID = 'Snowflake/snowflake-arctic-embed-xs';
-const EMBEDDING_DIMS = 384;
+const EMBEDDING_DIMS = parseInt(process.env.GITNEXUS_EMBEDDING_DIMS ?? '384', 10);
+
+// HTTP embedding config
+const HTTP_URL = process.env.GITNEXUS_EMBEDDING_URL ?? '';
+const HTTP_MODEL = process.env.GITNEXUS_EMBEDDING_MODEL ?? '';
+const HTTP_KEY = process.env.GITNEXUS_EMBEDDING_API_KEY ?? 'unused';
+const USE_HTTP = !!(HTTP_URL && HTTP_MODEL);
 
 // Module-level state for singleton pattern
 let embedderInstance: FeatureExtractionPipeline | null = null;
@@ -20,6 +26,8 @@ let initPromise: Promise<FeatureExtractionPipeline> | null = null;
  * Initialize the embedding model (lazy, on first search)
  */
 export const initEmbedder = async (): Promise<FeatureExtractionPipeline> => {
+  if (USE_HTTP) return null as unknown as FeatureExtractionPipeline;
+
   if (embedderInstance) {
     return embedderInstance;
   }
@@ -87,12 +95,26 @@ export const initEmbedder = async (): Promise<FeatureExtractionPipeline> => {
 /**
  * Check if embedder is ready
  */
-export const isEmbedderReady = (): boolean => embedderInstance !== null;
+export const isEmbedderReady = (): boolean => USE_HTTP || embedderInstance !== null;
 
 /**
  * Embed a query text for semantic search
  */
 export const embedQuery = async (query: string): Promise<number[]> => {
+  if (USE_HTTP) {
+    const resp = await fetch(`${HTTP_URL.replace(/\/+$/, '')}/embeddings`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${HTTP_KEY}`,
+      },
+      body: JSON.stringify({ input: [query], model: HTTP_MODEL }),
+    });
+    if (!resp.ok) throw new Error(`Embedding endpoint ${resp.status}`);
+    const data = (await resp.json()) as { data: Array<{ embedding: number[] }> };
+    return data.data[0].embedding;
+  }
+
   const embedder = await initEmbedder();
   
   const result = await embedder(query, {

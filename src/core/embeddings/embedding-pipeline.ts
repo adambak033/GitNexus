@@ -326,7 +326,7 @@ export const semanticSearch = async (
   // Query the vector index on CodeEmbedding to get nodeIds and distances
   const vectorQuery = `
     CALL QUERY_VECTOR_INDEX('CodeEmbedding', 'code_embedding_idx', 
-      CAST(${queryVecStr} AS FLOAT[384]), ${k})
+      CAST(${queryVecStr} AS FLOAT[${queryVec.length}]), ${k})
     YIELD node AS emb, distance
     WITH emb, distance
     WHERE distance < ${maxDistance}

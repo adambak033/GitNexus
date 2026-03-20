@@ -398,10 +398,12 @@ CREATE REL TABLE ${REL_TABLE_NAME} (
 // Separate table for vector storage to avoid copy-on-write overhead
 // ============================================================================
 
+export const EMBEDDING_DIMS = parseInt(process.env.GITNEXUS_EMBEDDING_DIMS ?? '384', 10);
+
 export const EMBEDDING_SCHEMA = `
 CREATE NODE TABLE ${EMBEDDING_TABLE_NAME} (
   nodeId STRING,
-  embedding FLOAT[384],
+  embedding FLOAT[${EMBEDDING_DIMS}],
   PRIMARY KEY (nodeId)
 )`;
 
