@@ -537,8 +537,9 @@ export const runPipelineFromRepo = async (
           if (!imports) continue;
           let hasGap = false;
           for (const [, binding] of imports) {
-            // E1/E2: upstream file has variable bindings in exportedTypeMap
-            if (exportedTypeMap.has(binding.sourcePath)) { hasGap = true; break; }
+            // E1/E2: upstream file has a matching exported binding for this specific import
+            const upstream = exportedTypeMap.get(binding.sourcePath);
+            if (upstream?.has(binding.exportedName)) { hasGap = true; break; }
             // E3: upstream callable has a known return type in SymbolTable
             const def = ctx.symbols.lookupExactFull(binding.sourcePath, binding.exportedName);
             if (def?.returnType) { hasGap = true; break; }

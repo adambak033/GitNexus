@@ -104,8 +104,8 @@ export function buildExportedTypeMapFromGraph(
     if (!def) return;
     const typeName = def.returnType ?? def.declaredType;
     if (!typeName || typeName.length > MAX_TYPE_NAME_LENGTH) return;
-    // Extract simple type name (strip Promise<>, etc.)
-    const simpleType = typeName.replace(/^(?:Promise|Observable|Task|Future|CompletableFuture)\s*<\s*/, '').replace(/\s*>\s*$/, '') || typeName;
+    // Extract simple type name (strip Promise<>, etc.) — reuse shared utility
+    const simpleType = extractReturnTypeName(typeName) ?? typeName;
     if (!simpleType) return;
     let fileExports = result.get(filePath);
     if (!fileExports) { fileExports = new Map(); result.set(filePath, fileExports); }
