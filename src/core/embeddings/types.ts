@@ -66,17 +66,8 @@ export interface EmbeddingConfig {
 }
 
 /**
- * Configuration for HTTP embedding endpoint (OpenAI-compatible).
- * Set via environment variables:
- *   GITNEXUS_EMBEDDING_URL      - Base URL (e.g. http://localhost:8080/v1)
- *   GITNEXUS_EMBEDDING_MODEL    - Model name (e.g. BAAI/bge-large-en-v1.5)
- *   GITNEXUS_EMBEDDING_API_KEY  - API key (default: "unused")
- *   GITNEXUS_EMBEDDING_DIMS     - Dimensions (default: auto-detected from first response)
- *
- * Supports any OpenAI-compatible /v1/embeddings endpoint:
- *   - Self-hosted: Infinity, vLLM, TEI, llama.cpp
- *   - Cloud: OpenAI, Ollama (remote), LM Studio
- *   - VPS/Tailscale: any endpoint reachable over the network
+ * Configuration for HTTP embedding endpoint (OpenAI-compatible /v1/embeddings).
+ * Populated from GITNEXUS_EMBEDDING_* environment variables.
  */
 export interface HttpEmbeddingConfig {
   /** Base URL for the embedding API (must include /v1) */
@@ -85,7 +76,7 @@ export interface HttpEmbeddingConfig {
   model: string;
   /** API key for authentication */
   apiKey: string;
-  /** Override dimensions (auto-detected if not set) */
+  /** Vector dimensions — must match model output (default: 384) */
   dimensions?: number;
 }
 

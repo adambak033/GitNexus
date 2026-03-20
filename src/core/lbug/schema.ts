@@ -398,6 +398,7 @@ CREATE REL TABLE ${REL_TABLE_NAME} (
 // Separate table for vector storage to avoid copy-on-write overhead
 // ============================================================================
 
+/** Embedding vector dimensions. Default 384 (snowflake-arctic-embed-xs). */
 export const EMBEDDING_DIMS = parseInt(process.env.GITNEXUS_EMBEDDING_DIMS ?? '384', 10);
 
 export const EMBEDDING_SCHEMA = `

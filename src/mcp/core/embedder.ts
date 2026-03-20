@@ -7,15 +7,15 @@
 
 import { pipeline, env, type FeatureExtractionPipeline } from '@huggingface/transformers';
 
-// Model config
-const MODEL_ID = 'Snowflake/snowflake-arctic-embed-xs';
-const EMBEDDING_DIMS = parseInt(process.env.GITNEXUS_EMBEDDING_DIMS ?? '384', 10);
-
 // HTTP embedding config
 const HTTP_URL = process.env.GITNEXUS_EMBEDDING_URL ?? '';
 const HTTP_MODEL = process.env.GITNEXUS_EMBEDDING_MODEL ?? '';
 const HTTP_KEY = process.env.GITNEXUS_EMBEDDING_API_KEY ?? 'unused';
 const USE_HTTP = !!(HTTP_URL && HTTP_MODEL);
+
+// Model config
+const MODEL_ID = 'Snowflake/snowflake-arctic-embed-xs';
+const EMBEDDING_DIMS = parseInt(process.env.GITNEXUS_EMBEDDING_DIMS ?? '384', 10);
 
 // Module-level state for singleton pattern
 let embedderInstance: FeatureExtractionPipeline | null = null;
@@ -104,18 +104,31 @@ export const isEmbedderReady = (): boolean => USE_HTTP || embedderInstance !== n
  */
 export const embedQuery = async (query: string): Promise<number[]> => {
   if (USE_HTTP) {
-    const resp = await fetch(`${HTTP_URL.replace(/\/+$/, '')}/embeddings`, {
-      method: 'POST',
-      signal: AbortSignal.timeout(30_000),
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${HTTP_KEY}`,
-      },
-      body: JSON.stringify({ input: [query], model: HTTP_MODEL }),
-    });
-    if (!resp.ok) throw new Error(`Embedding endpoint returned ${resp.status}`);
-    const data = (await resp.json()) as { data: Array<{ embedding: number[] }> };
-    return data.data[0].embedding;
+    const url = `${HTTP_URL.replace(/\/+$/, '')}/embeddings`;
+    const body = JSON.stringify({ input: [query], model: HTTP_MODEL });
+    const headers = {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${HTTP_KEY}`,
+    };
+
+    for (let attempt = 0; attempt <= 1; attempt++) {
+      const resp = await fetch(url, {
+        method: 'POST',
+        signal: AbortSignal.timeout(30_000),
+        headers,
+        body,
+      });
+      if (!resp.ok) {
+        if ((resp.status === 429 || resp.status >= 500) && attempt < 1) {
+          await new Promise(r => setTimeout(r, 1_000));
+          continue;
+        }
+        throw new Error(`Embedding endpoint returned ${resp.status}`);
+      }
+      const data = (await resp.json()) as { data: Array<{ embedding: number[] }> };
+      return data.data[0].embedding;
+    }
+    throw new Error('Embedding request failed after retry');
   }
 
   const embedder = await initEmbedder();

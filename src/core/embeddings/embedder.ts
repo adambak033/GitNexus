@@ -21,11 +21,8 @@ import { join } from 'path';
 import { DEFAULT_EMBEDDING_CONFIG, type EmbeddingConfig, type HttpEmbeddingConfig, type ModelProgress } from './types.js';
 
 // ─── HTTP Embedding Backend ───────────────────────────────────────────────────
-// When GITNEXUS_EMBEDDING_URL is set, all embedding calls go to the HTTP
-// endpoint instead of loading a local transformers.js model. This enables:
-//   - Self-hosted servers (Infinity, vLLM, TEI) over Tailscale/VPN
-//   - Higher-quality models (bge-large 1024d vs arctic-xs 384d)
-//   - Shared embedding infrastructure across tools
+// When GITNEXUS_EMBEDDING_URL + GITNEXUS_EMBEDDING_MODEL are set, embedding
+// calls proxy to a remote OpenAI-compatible /v1/embeddings endpoint.
 
 function getHttpConfig(): HttpEmbeddingConfig | null {
   const baseUrl = process.env.GITNEXUS_EMBEDDING_URL;
@@ -107,8 +104,6 @@ function isHttpMode(): boolean {
   if (httpConfig === undefined) httpConfig = getHttpConfig();
   return httpConfig !== null;
 }
-
-// ─── End HTTP Backend ─────────────────────────────────────────────────────────
 
 /**
  * Check whether CUDA libraries are actually available on this system.
@@ -297,7 +292,8 @@ export const isEmbedderReady = (): boolean => {
 
 /**
  * Get the effective embedding dimensions.
- * HTTP mode may use different dimensions than the local default.
+ * Returns configured dimensions. In HTTP mode, uses GITNEXUS_EMBEDDING_DIMS
+ * or falls back to auto-detected dims from the last HTTP response.
  */
 export const getEmbeddingDimensions = (): number => {
   if (isHttpMode()) {
@@ -311,6 +307,9 @@ export const getEmbeddingDimensions = (): number => {
  * Get the embedder instance (throws if not initialized)
  */
 export const getEmbedder = (): FeatureExtractionPipeline => {
+  if (isHttpMode()) {
+    throw new Error('getEmbedder() is not available in HTTP embedding mode. Use embedText()/embedBatch() instead.');
+  }
   if (!embedderInstance) {
     throw new Error('Embedder not initialized. Call initEmbedder() first.');
   }
