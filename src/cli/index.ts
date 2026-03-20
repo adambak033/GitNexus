@@ -33,6 +33,12 @@ program
    .action(createLazyAction(() => import('./analyze.js'), 'analyzeCommand'));
 
 program
+  .command('index [path...]')
+  .description('Register an existing .gitnexus/ folder into the global registry (no re-analysis needed)')
+  .option('-f, --force', 'Register even if meta.json is missing (stats will be empty)')
+  .action(createLazyAction(() => import('./index-repo.js'), 'indexCommand'));
+
+program
   .command('serve')
   .description('Start local HTTP server for web UI connection')
   .option('-p, --port <port>', 'Port number', '4747')
