@@ -40,6 +40,26 @@ export type ExportedTypeMap = Map<string, Map<string, string>>;
 const MAX_EXPORTS_PER_FILE = 500;
 const MAX_TYPE_NAME_LENGTH = 256;
 
+/** Build a map of imported callee names → return types for cross-file call-result binding.
+ *  Consulted ONLY when SymbolTable has no unambiguous local match (local-first principle). */
+export function buildImportedReturnTypes(
+  filePath: string,
+  namedImportMap: ReadonlyMap<string, ReadonlyMap<string, { sourcePath: string; exportedName: string }>>,
+  symbolTable: { lookupExactFull(filePath: string, name: string): { returnType?: string } | undefined },
+): ReadonlyMap<string, string> {
+  const result = new Map<string, string>();
+  const fileImports = namedImportMap.get(filePath);
+  if (!fileImports) return result;
+
+  for (const [localName, binding] of fileImports) {
+    const def = symbolTable.lookupExactFull(binding.sourcePath, binding.exportedName);
+    if (!def?.returnType) continue;
+    const simpleReturn = extractReturnTypeName(def.returnType);
+    if (simpleReturn) result.set(localName, simpleReturn);
+  }
+  return result;
+}
+
 /** Collect resolved type bindings for exported file-scope symbols.
  *  Uses graph node isExported flag — does NOT require isExported on SymbolDefinition. */
 function collectExportedBindings(
@@ -94,6 +114,41 @@ export function buildExportedTypeMapFromGraph(
     }
   });
   return result;
+}
+
+/** Seed cross-file receiver types into pre-extracted call records.
+ *  Fills missing receiverTypeName for single-hop imported variables
+ *  using ExportedTypeMap + namedImportMap — zero disk I/O, zero AST re-parsing.
+ *  Mutates calls in-place. Runs BEFORE processCallsFromExtracted. */
+export function seedCrossFileReceiverTypes(
+  calls: ExtractedCall[],
+  namedImportMap: ReadonlyMap<string, ReadonlyMap<string, { sourcePath: string; exportedName: string }>>,
+  exportedTypeMap: ReadonlyMap<string, ReadonlyMap<string, string>>,
+): { enrichedCount: number } {
+  if (namedImportMap.size === 0 || exportedTypeMap.size === 0) {
+    return { enrichedCount: 0 };
+  }
+  let enrichedCount = 0;
+  for (const call of calls) {
+    if (call.receiverTypeName || !call.receiverName) continue;
+    if (call.callForm !== 'member') continue;
+
+    const fileImports = namedImportMap.get(call.filePath);
+    if (!fileImports) continue;
+
+    const binding = fileImports.get(call.receiverName);
+    if (!binding) continue;
+
+    const upstream = exportedTypeMap.get(binding.sourcePath);
+    if (!upstream) continue;
+
+    const type = upstream.get(binding.exportedName);
+    if (type) {
+      call.receiverTypeName = type;
+      enrichedCount++;
+    }
+  }
+  return { enrichedCount };
 }
 
 // Stdlib methods that preserve the receiver's type identity. When TypeEnv already
@@ -204,6 +259,9 @@ export const processCalls = async (
   exportedTypeMap?: ExportedTypeMap,
   /** Phase 14: pre-resolved cross-file bindings to seed into buildTypeEnv. Keyed by filePath → Map<localName, typeName>. */
   importedBindingsMap?: ReadonlyMap<string, ReadonlyMap<string, string>>,
+  /** Phase 14 E3: cross-file return types for imported callables. Keyed by filePath → Map<calleeName, returnType>.
+   *  Consulted ONLY when SymbolTable has no unambiguous match (local-first principle). */
+  importedReturnTypesMap?: ReadonlyMap<string, ReadonlyMap<string, string>>,
 ): Promise<ExtractedHeritage[]> => {
   const parser = await loadParser();
   const collectedHeritage: ExtractedHeritage[] = [];
@@ -290,7 +348,8 @@ export const processCalls = async (
     }
 
     const importedBindings = importedBindingsMap?.get(file.path);
-    const typeEnv = lang ? buildTypeEnv(tree, lang, { symbolTable: ctx.symbols, parentMap, importedBindings }) : null;
+    const importedReturnTypes = importedReturnTypesMap?.get(file.path);
+    const typeEnv = lang ? buildTypeEnv(tree, lang, { symbolTable: ctx.symbols, parentMap, importedBindings, importedReturnTypes }) : null;
     if (typeEnv && exportedTypeMap) {
       const fileExports = collectExportedBindings(typeEnv, file.path, ctx.symbols, graph);
       if (fileExports) exportedTypeMap.set(file.path, fileExports);

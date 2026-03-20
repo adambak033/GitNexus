@@ -129,6 +129,58 @@ describe('Cross-File Binding Propagation: TypeScript re-export chain', () => {
 });
 
 // ---------------------------------------------------------------------------
+// E3: Cross-file return type propagation
+// api.ts exports getConfig(): Config
+// consumer.ts imports getConfig, calls const c = getConfig(); c.validate()
+// → c is typed Config via importedReturnTypes (E3), enabling Config#validate edge
+// ---------------------------------------------------------------------------
+
+describe('Cross-File Binding Propagation: TypeScript E3 return type propagation', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(CROSS_FILE_FIXTURES, 'ts-return-type'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects Config class with validate method', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('Config');
+    expect(getNodesByLabel(result, 'Method')).toContain('validate');
+  });
+
+  it('detects getConfig function and run function', () => {
+    expect(getNodesByLabel(result, 'Function')).toContain('getConfig');
+    expect(getNodesByLabel(result, 'Function')).toContain('run');
+  });
+
+  it('resolves c.validate() in run() to Config#validate via cross-file return type propagation', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const validateCall = calls.find(c =>
+      c.target === 'validate' &&
+      c.source === 'run' &&
+      c.targetFilePath.includes('api'),
+    );
+    expect(validateCall).toBeDefined();
+  });
+
+  it('emits HAS_METHOD edge from Config to validate', () => {
+    const hasMethod = getRelationships(result, 'HAS_METHOD');
+    const edge = hasMethod.find(e => e.source === 'Config' && e.target === 'validate');
+    expect(edge).toBeDefined();
+  });
+
+  it('emits IMPORTS edge from consumer to api', () => {
+    const imports = getRelationships(result, 'IMPORTS');
+    const edge = imports.find(e =>
+      e.sourceFilePath.includes('consumer') && e.targetFilePath.includes('api'),
+    );
+    expect(edge).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Circular imports: a.ts ↔ b.ts
 // a.ts imports getB from b.ts; b.ts imports A from a.ts
 // Conservative expectation: pipeline completes without error.

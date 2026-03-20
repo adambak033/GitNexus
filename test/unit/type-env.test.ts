@@ -4128,4 +4128,117 @@ function process() {
     });
   });
 
+  describe('importedReturnTypes (Phase 14 E3)', () => {
+    // Minimal mock SymbolTable that returns a known callable
+    const makeSymbolTable = (
+      callables: Array<{ name: string; returnType?: string }>,
+    ) => ({
+      lookupFuzzyCallable: (name: string) =>
+        callables
+          .filter(c => c.name === name)
+          .map(c => ({ nodeId: 'n1', filePath: 'src.ts', type: 'Function' as const, returnType: c.returnType })),
+      lookupFuzzy: () => [],
+      lookupExact: () => undefined,
+      lookupExactFull: () => undefined,
+      add: () => {},
+      getStats: () => ({ fileCount: 0, globalSymbolCount: 0 }),
+      clear: () => {},
+    });
+
+    it('SymbolTable has unambiguous match → uses it, ignores cross-file', () => {
+      // SymbolTable knows getConfig() returns Config (SymbolType)
+      // importedReturnTypes says getConfig → WrongType — SymbolTable must win
+      const symbolTable = makeSymbolTable([{ name: 'getConfig', returnType: 'Config' }]);
+      const tree = parse('const c = getConfig();', TypeScript.typescript);
+      const typeEnv = buildTypeEnv(tree, 'typescript', {
+        symbolTable: symbolTable as any,
+        importedReturnTypes: new Map([['getConfig', 'WrongType']]),
+      });
+      // SymbolTable result (Config) wins over cross-file fallback (WrongType)
+      expect(flatGet(typeEnv.env, 'c')).toBe('Config');
+    });
+
+    it('SymbolTable has no match (0 results) → falls back to cross-file', () => {
+      // SymbolTable knows nothing about getConfig
+      const symbolTable = makeSymbolTable([]);
+      const tree = parse('const c = getConfig();', TypeScript.typescript);
+      const typeEnv = buildTypeEnv(tree, 'typescript', {
+        symbolTable: symbolTable as any,
+        importedReturnTypes: new Map([['getConfig', 'Config']]),
+      });
+      // Cross-file fallback provides Config
+      expect(flatGet(typeEnv.env, 'c')).toBe('Config');
+    });
+
+    it('SymbolTable has 2+ matches (ambiguous) → returns undefined, NO cross-file fallback', () => {
+      // Two overloads of process() — ambiguous → must NOT fall back to cross-file
+      const symbolTable = makeSymbolTable([
+        { name: 'process', returnType: 'User' },
+        { name: 'process', returnType: 'Admin' },
+      ]);
+      const tree = parse('const r = process();', TypeScript.typescript);
+      const typeEnv = buildTypeEnv(tree, 'typescript', {
+        symbolTable: symbolTable as any,
+        importedReturnTypes: new Map([['process', 'User']]),
+      });
+      // Ambiguous → conservative → no binding produced
+      expect(flatGet(typeEnv.env, 'r')).toBeUndefined();
+    });
+
+    it('no SymbolTable → uses cross-file return types directly', () => {
+      const tree = parse('const c = getConfig();', TypeScript.typescript);
+      const typeEnv = buildTypeEnv(tree, 'typescript', {
+        importedReturnTypes: new Map([['getConfig', 'Config']]),
+      });
+      expect(flatGet(typeEnv.env, 'c')).toBe('Config');
+    });
+
+    it('cross-file has entry but SymbolTable covers it → SymbolTable wins', () => {
+      // SymbolTable provides the authoritative return type; cross-file entry is ignored
+      const symbolTable = makeSymbolTable([{ name: 'getUser', returnType: 'User' }]);
+      const tree = parse('const u = getUser();', TypeScript.typescript);
+      const typeEnv = buildTypeEnv(tree, 'typescript', {
+        symbolTable: symbolTable as any,
+        importedReturnTypes: new Map([['getUser', 'CrossFileUser']]),
+      });
+      // SymbolTable result (User) wins
+      expect(flatGet(typeEnv.env, 'u')).toBe('User');
+    });
+
+    it('does nothing when importedReturnTypes is absent', () => {
+      const tree = parse('const c = getConfig();', TypeScript.typescript);
+      const typeEnv = buildTypeEnv(tree, 'typescript');
+      // No annotation, no SymbolTable, no cross-file → no binding
+      expect(flatGet(typeEnv.env, 'c')).toBeUndefined();
+    });
+
+    it('resolved cross-file callee enables downstream call edges via lookup', () => {
+      // File has: const c = getConfig(); c.validate();
+      // importedReturnTypes maps getConfig → Config
+      // After fixpoint, c should be typed as Config, making lookup('c', ...) return 'Config'
+      const code = `
+function process() {
+  const c = getConfig();
+  c.validate();
+}`;
+      const tree = parse(code, TypeScript.typescript);
+      const typeEnv = buildTypeEnv(tree, 'typescript', {
+        importedReturnTypes: new Map([['getConfig', 'Config']]),
+      });
+
+      const calls: any[] = [];
+      function findCalls(node: any) {
+        if (node.type === 'call_expression') calls.push(node);
+        for (let i = 0; i < node.childCount; i++) findCalls(node.child(i));
+      }
+      findCalls(tree.rootNode);
+
+      // calls[0] = getConfig(), calls[1] = c.validate()
+      // From inside process(), c should resolve to Config
+      const validateCall = calls.find((n: any) => n.text.includes('validate'));
+      expect(validateCall).toBeDefined();
+      expect(typeEnv.lookup('c', validateCall)).toBe('Config');
+    });
+  });
+
 });

@@ -6,19 +6,17 @@ import {
   processImportsFromExtracted,
   buildImportResolutionContext
 } from './import-processor.js';
-import { processCalls, processCallsFromExtracted, processAssignmentsFromExtracted, processRoutesFromExtracted, type ExportedTypeMap, buildExportedTypeMapFromGraph } from './call-processor.js';
+import { processCalls, processCallsFromExtracted, processAssignmentsFromExtracted, processRoutesFromExtracted, seedCrossFileReceiverTypes, buildImportedReturnTypes, type ExportedTypeMap, buildExportedTypeMapFromGraph } from './call-processor.js';
 import { processHeritage, processHeritageFromExtracted } from './heritage-processor.js';
 import { computeMRO } from './mro-processor.js';
 import { processCommunities } from './community-processor.js';
 import { processProcesses } from './process-processor.js';
 import { createResolutionContext } from './resolution-context.js';
-import { buildTypeEnv } from './type-env.js';
 import { createASTCache } from './ast-cache.js';
 import { PipelineProgress, PipelineResult } from '../../types/pipeline.js';
 import { walkRepositoryPaths, readFileContents } from './filesystem-walker.js';
 import { getLanguageFromFilename } from './utils.js';
-import { isLanguageAvailable, loadParser, loadLanguage } from '../tree-sitter/parser-loader.js';
-import { getTreeSitterBufferSize } from './constants.js';
+import { isLanguageAvailable } from '../tree-sitter/parser-loader.js';
 import { createWorkerPool, WorkerPool } from './workers/worker-pool.js';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -82,6 +80,92 @@ export function topologicalLevelSort(
   return levels;
 }
 
+/** Cycle decomposition from Tarjan's SCC algorithm. */
+export interface ImportCycleInfo {
+  /** Strongly connected components, each containing ≥2 files */
+  sccs: readonly (readonly string[])[];
+  /** Files in cycles (flattened sccs — for backward compat) */
+  cycleFiles: readonly string[];
+}
+
+interface TarjanFrame {
+  node: string;
+  neighborIdx: number;
+  neighbors: readonly string[];
+}
+
+/** Decompose cycle files into strongly connected components using iterative Tarjan's.
+ *  Runs on the cycle subgraph only (cycle nodes from Kahn's output), not the full graph.
+ *  Iterative to avoid stack overflow on large repos (V8 stack limit ~10K-15K frames). */
+export function computeImportCycleSCCs(
+  importMap: ReadonlyMap<string, ReadonlySet<string>>,
+  cycleNodes: readonly string[],
+): ImportCycleInfo {
+  // Build subgraph of only cycle nodes
+  const cycleSet = new Set(cycleNodes);
+  const subgraph = new Map<string, readonly string[]>();
+  for (const node of cycleNodes) {
+    const deps = importMap.get(node);
+    subgraph.set(node, deps ? [...deps].filter(d => cycleSet.has(d)) : []);
+  }
+
+  // Iterative Tarjan's on subgraph
+  const state = new Map<string, { index: number; lowlink: number; onStack: boolean }>();
+  const stack: string[] = [];
+  const sccs: string[][] = [];
+  let nextIndex = 0;
+
+  for (const startNode of subgraph.keys()) {
+    if (state.has(startNode)) continue;
+    const s = { index: nextIndex, lowlink: nextIndex, onStack: true };
+    nextIndex++;
+    state.set(startNode, s);
+    stack.push(startNode);
+    const workStack: TarjanFrame[] = [
+      { node: startNode, neighborIdx: 0, neighbors: subgraph.get(startNode)! },
+    ];
+
+    while (workStack.length > 0) {
+      const frame = workStack[workStack.length - 1];
+      if (frame.neighborIdx < frame.neighbors.length) {
+        const w = frame.neighbors[frame.neighborIdx];
+        frame.neighborIdx++;
+        const wState = state.get(w);
+        if (!wState) {
+          const ws = { index: nextIndex, lowlink: nextIndex, onStack: true };
+          nextIndex++;
+          state.set(w, ws);
+          stack.push(w);
+          workStack.push({ node: w, neighborIdx: 0, neighbors: subgraph.get(w)! });
+        } else if (wState.onStack) {
+          state.get(frame.node)!.lowlink = Math.min(
+            state.get(frame.node)!.lowlink, wState.index,
+          );
+        }
+      } else {
+        workStack.pop();
+        const vState = state.get(frame.node)!;
+        if (workStack.length > 0) {
+          const pState = state.get(workStack[workStack.length - 1].node)!;
+          pState.lowlink = Math.min(pState.lowlink, vState.lowlink);
+        }
+        if (vState.lowlink === vState.index) {
+          const component: string[] = [];
+          let w: string;
+          do { w = stack.pop()!; state.get(w)!.onStack = false; component.push(w); }
+          while (w !== frame.node);
+          if (component.length >= 2) sccs.push(component);
+        }
+      }
+    }
+  }
+
+  return {
+    sccs,
+    cycleFiles: sccs.flat(),
+  };
+}
+
 /** Max bytes of source content to load per parse chunk. Each chunk's source +
  *  parsed ASTs + extracted records + worker serialization overhead all live in
  *  memory simultaneously, so this must be conservative. 20MB source ≈ 200-400MB
@@ -90,6 +174,11 @@ const CHUNK_BYTE_BUDGET = 20 * 1024 * 1024; // 20MB
 
 /** Max AST trees to keep in LRU cache */
 const AST_CACHE_CAP = 50;
+
+/** Threshold for parallel re-resolution within topological levels.
+ *  When more files need re-resolution than this threshold, process in parallel via workers.
+ *  Set to Infinity to disable (current default — enable when metrics justify). */
+const PARALLEL_RE_RESOLUTION_THRESHOLD = Infinity;
 
 export interface PipelineOptions {
   /** Skip MRO, community detection, and process extraction for faster test runs. */
@@ -105,6 +194,7 @@ export const runPipelineFromRepo = async (
   const ctx = createResolutionContext();
   const symbolTable = ctx.symbols;
   let astCache = createASTCache(AST_CACHE_CAP);
+  const pipelineStart = Date.now();
 
   const cleanup = () => {
     astCache.clear();
@@ -302,6 +392,16 @@ export const runPipelineFromRepo = async (
               stats: { filesProcessed: filesParsedSoFar, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
             });
           }, repoPath, importCtx);
+          // Phase 14 E1: Seed cross-file receiver types from ExportedTypeMap
+          // before call resolution — eliminates re-parse for single-hop imported receivers.
+          if (exportedTypeMap.size > 0 && ctx.namedImportMap.size > 0) {
+            const { enrichedCount } = seedCrossFileReceiverTypes(
+              chunkWorkerData.calls, ctx.namedImportMap, exportedTypeMap,
+            );
+            if (isDev && enrichedCount > 0) {
+              console.log(`🔗 E1: Seeded ${enrichedCount} cross-file receiver types (chunk ${chunkIdx + 1})`);
+            }
+          }
           // Calls + Heritage + Routes — resolve in parallel (no shared mutable state between them)
           // This is safe because each writes disjoint relationship types into idempotent id-keyed Maps,
           // and the single-threaded event loop prevents races between synchronous addRelationship calls.
@@ -410,15 +510,40 @@ export const runPipelineFromRepo = async (
       const allPathSet = new Set(allPaths);
       const levels = topologicalLevelSort(ctx.importMap);
 
+      // E2: SCC diagnostics for import cycles (dev-mode only)
+      if (isDev && levels.length > 0) {
+        const lastLevel = levels[levels.length - 1];
+        // Kahn's dumps cycle files in the last level — detect via positive in-degree check
+        // If there are cycle files, decompose into SCCs for diagnostics
+        if (lastLevel.length > 1) {
+          const cycleInfo = computeImportCycleSCCs(ctx.importMap, lastLevel);
+          if (cycleInfo.sccs.length > 0) {
+            console.log(`🔄 Detected ${cycleInfo.sccs.length} import cycle(s) (${cycleInfo.cycleFiles.length} files):`);
+            for (const scc of cycleInfo.sccs.slice(0, 5)) {
+              console.log(`   Cycle (${scc.length} files): ${scc.slice(0, 3).join(', ')}${scc.length > 3 ? '...' : ''}`);
+            }
+            if (cycleInfo.sccs.length > 5) {
+              console.log(`   ... and ${cycleInfo.sccs.length - 5} more cycle(s)`);
+            }
+          }
+        }
+      }
+
       // Count files that would benefit from cross-file seeding
       let filesWithGaps = 0;
       for (const level of levels) {
         for (const filePath of level) {
           const imports = ctx.namedImportMap.get(filePath);
           if (!imports) continue;
+          let hasGap = false;
           for (const [, binding] of imports) {
-            if (exportedTypeMap.has(binding.sourcePath)) { filesWithGaps++; break; }
+            // E1/E2: upstream file has variable bindings in exportedTypeMap
+            if (exportedTypeMap.has(binding.sourcePath)) { hasGap = true; break; }
+            // E3: upstream callable has a known return type in SymbolTable
+            const def = ctx.symbols.lookupExactFull(binding.sourcePath, binding.exportedName);
+            if (def?.returnType) { hasGap = true; break; }
           }
+          if (hasGap) filesWithGaps++;
         }
       }
 
@@ -439,10 +564,22 @@ export const runPipelineFromRepo = async (
 
         let crossFileResolved = 0;
         const crossFileStart = Date.now();
+        const MAX_CROSS_FILE_REPROCESS = 2000;
         astCache = createASTCache(AST_CACHE_CAP);
 
+        // ── Worker parallelization design (Phase 14 E4, deferred) ──────────
+        // Files within the same topological level have no mutual dependencies
+        // and could be processed in parallel. When PARALLEL_RE_RESOLUTION_THRESHOLD
+        // is set below Infinity, partition level candidates into worker batches:
+        //   1. Serialize ExportedTypeMap snapshot + per-file seeded bindings
+        //   2. Ship to workers via structured clone (Map<string, Map<string, string>> serializes efficiently)
+        //   3. Workers return updated exports → merge into ExportedTypeMap before next level
+        // Gating: implement when re-resolution pass exceeds 20% of total ingestion time.
         for (const level of levels) {
+          // Batch: collect files needing re-resolution in this level, then read all at once
+          const levelCandidates: { filePath: string; seeded: Map<string, string>; importedReturns: ReadonlyMap<string, string> }[] = [];
           for (const filePath of level) {
+            if (crossFileResolved + levelCandidates.length >= MAX_CROSS_FILE_REPROCESS) break;
             const imports = ctx.namedImportMap.get(filePath);
             if (!imports) continue;
 
@@ -455,34 +592,64 @@ export const runPipelineFromRepo = async (
                 if (type) seeded.set(localName, type);
               }
             }
-            if (seeded.size === 0) continue;
+
+            // E3: Build cross-file return types for imported callables
+            const importedReturns = buildImportedReturnTypes(filePath, ctx.namedImportMap, ctx.symbols);
+
+            // Skip if neither variable bindings nor callable return types are available
+            if (seeded.size === 0 && importedReturns.size === 0) continue;
 
             // Validate path before re-reading (defense-in-depth)
             if (!allPathSet.has(filePath)) continue;
 
-            // Re-read, re-parse, and re-resolve with seeded bindings
             const lang = getLanguageFromFilename(filePath);
             if (!lang || !isLanguageAvailable(lang)) continue;
 
-            const contentMap = await readFileContents(repoPath, [filePath]);
+            levelCandidates.push({ filePath, seeded, importedReturns });
+          }
+
+          if (levelCandidates.length === 0) continue;
+
+          // Batch read all files in this level at once (avoids per-file I/O overhead)
+          const levelPaths = levelCandidates.map(c => c.filePath);
+          const contentMap = await readFileContents(repoPath, levelPaths);
+
+          for (const { filePath, seeded, importedReturns } of levelCandidates) {
             const content = contentMap.get(filePath);
             if (!content) continue;
 
             // Re-parse and re-resolve calls with cross-file seeded type environment
+            // Reuse the level-scoped AST cache (LRU eviction handles capacity)
             const reFile = [{ path: filePath, content }];
             const bindings = new Map<string, ReadonlyMap<string, string>>();
-            bindings.set(filePath, seeded);
-            astCache = createASTCache(1);
-            await processCalls(graph, reFile, astCache, ctx, undefined, exportedTypeMap, bindings);
-            astCache.clear();
+            if (seeded.size > 0) bindings.set(filePath, seeded);
+
+            const importedReturnTypesMap = new Map<string, ReadonlyMap<string, string>>();
+            if (importedReturns.size > 0) {
+              importedReturnTypesMap.set(filePath, importedReturns);
+            }
+
+            await processCalls(graph, reFile, astCache, ctx, undefined, exportedTypeMap, bindings.size > 0 ? bindings : undefined, importedReturnTypesMap.size > 0 ? importedReturnTypesMap : undefined);
 
             crossFileResolved++;
           }
+
+          if (crossFileResolved >= MAX_CROSS_FILE_REPROCESS) {
+            if (isDev) console.log(`⚠️ Cross-file re-resolution capped at ${MAX_CROSS_FILE_REPROCESS} files`);
+            break;
+          }
         }
+        // Clear AST cache after re-resolution pass completes
+        astCache.clear();
 
         if (isDev) {
           const elapsed = Date.now() - crossFileStart;
-          console.log(`🔗 Cross-file re-resolution: ${crossFileResolved} files re-processed in ${elapsed}ms`);
+          const totalElapsed = Date.now() - pipelineStart;
+          const reResolutionPct = totalElapsed > 0 ? ((elapsed / totalElapsed) * 100).toFixed(1) : '0';
+          console.log(
+            `🔗 Cross-file re-resolution: ${crossFileResolved}/${filesWithGaps} candidates re-processed` +
+            ` in ${elapsed}ms (${reResolutionPct}% of total ingestion time so far)`,
+          );
         }
       }
     }

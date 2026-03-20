@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { processCallsFromExtracted } from '../../src/core/ingestion/call-processor.js';
+import { processCallsFromExtracted, seedCrossFileReceiverTypes } from '../../src/core/ingestion/call-processor.js';
 import { extractReturnTypeName } from '../../src/core/ingestion/type-extractors/shared.js';
 import { createResolutionContext, type ResolutionContext } from '../../src/core/ingestion/resolution-context.js';
 import { createKnowledgeGraph } from '../../src/core/graph/graph.js';
@@ -866,5 +866,169 @@ describe('extractReturnTypeName', () => {
   it('post-cap: accepts normal short type names well under 512 characters', () => {
     expect(extractReturnTypeName('HttpClient')).toBe('HttpClient');
     expect(extractReturnTypeName('UserService')).toBe('UserService');
+  });
+});
+
+describe('seedCrossFileReceiverTypes', () => {
+  it('single-hop: imported receiver gets type from ExportedTypeMap', () => {
+    const calls: ExtractedCall[] = [{
+      filePath: 'src/service.ts',
+      calledName: 'save',
+      sourceId: 'Function:src/service.ts:run',
+      receiverName: 'repo',
+      callForm: 'member',
+    }];
+
+    const namedImportMap = new Map([
+      ['src/service.ts', new Map([
+        ['repo', { sourcePath: 'src/models/repo.ts', exportedName: 'repo' }],
+      ])],
+    ]);
+
+    const exportedTypeMap = new Map([
+      ['src/models/repo.ts', new Map([
+        ['repo', 'Repo'],
+      ])],
+    ]);
+
+    const { enrichedCount } = seedCrossFileReceiverTypes(calls, namedImportMap, exportedTypeMap);
+
+    expect(enrichedCount).toBe(1);
+    expect(calls[0].receiverTypeName).toBe('Repo');
+  });
+
+  it('no-op when receiverTypeName already exists', () => {
+    const calls: ExtractedCall[] = [{
+      filePath: 'src/service.ts',
+      calledName: 'save',
+      sourceId: 'Function:src/service.ts:run',
+      receiverName: 'repo',
+      receiverTypeName: 'AlreadyKnown',
+      callForm: 'member',
+    }];
+
+    const namedImportMap = new Map([
+      ['src/service.ts', new Map([
+        ['repo', { sourcePath: 'src/models/repo.ts', exportedName: 'repo' }],
+      ])],
+    ]);
+
+    const exportedTypeMap = new Map([
+      ['src/models/repo.ts', new Map([
+        ['repo', 'Repo'],
+      ])],
+    ]);
+
+    const { enrichedCount } = seedCrossFileReceiverTypes(calls, namedImportMap, exportedTypeMap);
+
+    expect(enrichedCount).toBe(0);
+    expect(calls[0].receiverTypeName).toBe('AlreadyKnown');
+  });
+
+  it('no-op for free function calls (callForm !== member)', () => {
+    const calls: ExtractedCall[] = [{
+      filePath: 'src/service.ts',
+      calledName: 'doSomething',
+      sourceId: 'Function:src/service.ts:run',
+      receiverName: 'repo',
+      callForm: 'free',
+    }];
+
+    const namedImportMap = new Map([
+      ['src/service.ts', new Map([
+        ['repo', { sourcePath: 'src/models/repo.ts', exportedName: 'repo' }],
+      ])],
+    ]);
+
+    const exportedTypeMap = new Map([
+      ['src/models/repo.ts', new Map([
+        ['repo', 'Repo'],
+      ])],
+    ]);
+
+    const { enrichedCount } = seedCrossFileReceiverTypes(calls, namedImportMap, exportedTypeMap);
+
+    expect(enrichedCount).toBe(0);
+    expect(calls[0].receiverTypeName).toBeUndefined();
+  });
+
+  it('aliased imports: local name maps to exported name via binding', () => {
+    const calls: ExtractedCall[] = [{
+      filePath: 'src/controller.ts',
+      calledName: 'find',
+      sourceId: 'Function:src/controller.ts:handle',
+      receiverName: 'myRepo',
+      callForm: 'member',
+    }];
+
+    // import { repoInstance as myRepo } from 'src/models/repo.ts'
+    const namedImportMap = new Map([
+      ['src/controller.ts', new Map([
+        ['myRepo', { sourcePath: 'src/models/repo.ts', exportedName: 'repoInstance' }],
+      ])],
+    ]);
+
+    const exportedTypeMap = new Map([
+      ['src/models/repo.ts', new Map([
+        ['repoInstance', 'Repo'],
+      ])],
+    ]);
+
+    const { enrichedCount } = seedCrossFileReceiverTypes(calls, namedImportMap, exportedTypeMap);
+
+    expect(enrichedCount).toBe(1);
+    expect(calls[0].receiverTypeName).toBe('Repo');
+  });
+
+  it('early exit when maps are empty', () => {
+    const calls: ExtractedCall[] = [{
+      filePath: 'src/service.ts',
+      calledName: 'save',
+      sourceId: 'Function:src/service.ts:run',
+      receiverName: 'repo',
+      callForm: 'member',
+    }];
+
+    const { enrichedCount: countA } = seedCrossFileReceiverTypes(
+      calls,
+      new Map(),
+      new Map([['src/models/repo.ts', new Map([['repo', 'Repo']])]]),
+    );
+    expect(countA).toBe(0);
+
+    const { enrichedCount: countB } = seedCrossFileReceiverTypes(
+      calls,
+      new Map([['src/service.ts', new Map([['repo', { sourcePath: 'src/models/repo.ts', exportedName: 'repo' }]])]]),
+      new Map(),
+    );
+    expect(countB).toBe(0);
+
+    expect(calls[0].receiverTypeName).toBeUndefined();
+  });
+
+  it('no mutation when no matching exports found', () => {
+    const calls: ExtractedCall[] = [{
+      filePath: 'src/service.ts',
+      calledName: 'save',
+      sourceId: 'Function:src/service.ts:run',
+      receiverName: 'repo',
+      callForm: 'member',
+    }];
+
+    // namedImportMap has the file, but exportedTypeMap has no entry for the source path
+    const namedImportMap = new Map([
+      ['src/service.ts', new Map([
+        ['repo', { sourcePath: 'src/models/repo.ts', exportedName: 'repo' }],
+      ])],
+    ]);
+
+    const exportedTypeMap = new Map([
+      ['src/other-file.ts', new Map([['something', 'OtherType']])],
+    ]);
+
+    const { enrichedCount } = seedCrossFileReceiverTypes(calls, namedImportMap, exportedTypeMap);
+
+    expect(enrichedCount).toBe(0);
+    expect(calls[0].receiverTypeName).toBeUndefined();
   });
 });

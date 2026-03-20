@@ -651,6 +651,10 @@ export interface BuildTypeEnvOptions {
    *  Seeded into FILE_SCOPE after walk() for names with no local binding.
    *  Local declarations always take precedence (first-writer-wins). */
   importedBindings?: ReadonlyMap<string, string>;
+  /** Cross-file return type fallback for imported callables (Phase 14 E3).
+   *  Consulted ONLY when SymbolTable has no unambiguous match.
+   *  Local definitions always take precedence (local-first principle). */
+  importedReturnTypes?: ReadonlyMap<string, string>;
 }
 
 /** Seed cross-file type bindings into the file scope.
@@ -687,24 +691,35 @@ export const buildTypeEnv = (
   const config = typeConfigs[language];
   const bindings: ConstructorBinding[] = [];
 
-  // Build ReturnTypeLookup from optional SymbolTable.
-  // Conservative: returns undefined when callee is ambiguous (0 or 2+ matches).
+  // Build ReturnTypeLookup: SymbolTable is authoritative when it has an unambiguous match.
+  // Cross-file importedReturnTypes are consulted ONLY when SymbolTable has 0 matches.
+  // Ambiguous (2+) → undefined, no cross-file fallback (conservative, local-first principle).
   const returnTypeLookup: ReturnTypeLookup = {
     lookupReturnType(callee: string): string | undefined {
-      if (!symbolTable) return undefined;
-      if (isBuiltInOrNoise(callee)) return undefined;
-      const callables = symbolTable.lookupFuzzyCallable(callee);
-      if (callables.length !== 1) return undefined;
-      const rawReturn = callables[0].returnType;
-      if (!rawReturn) return undefined;
-      return extractReturnTypeName(rawReturn);
+      // SymbolTable is authoritative when it has an unambiguous match
+      if (symbolTable) {
+        if (isBuiltInOrNoise(callee)) return undefined;
+        const callables = symbolTable.lookupFuzzyCallable(callee);
+        if (callables.length === 1) {
+          const rawReturn = callables[0].returnType;
+          if (rawReturn) return extractReturnTypeName(rawReturn);
+        }
+        // Ambiguous (2+) → return undefined (conservative, no cross-file fallback)
+        if (callables.length > 1) return undefined;
+      }
+      // No match (0 results or no symbolTable) → fall back to cross-file
+      return options?.importedReturnTypes?.get(callee);
     },
     lookupRawReturnType(callee: string): string | undefined {
-      if (!symbolTable) return undefined;
-      if (isBuiltInOrNoise(callee)) return undefined;
-      const callables = symbolTable.lookupFuzzyCallable(callee);
-      if (callables.length !== 1) return undefined;
-      return callables[0].returnType;
+      if (symbolTable) {
+        if (isBuiltInOrNoise(callee)) return undefined;
+        const callables = symbolTable.lookupFuzzyCallable(callee);
+        if (callables.length === 1) return callables[0].returnType;
+        // Ambiguous (2+) → return undefined (conservative, no cross-file fallback)
+        if (callables.length > 1) return undefined;
+      }
+      // Cross-file return types are already processed — return as-is
+      return options?.importedReturnTypes?.get(callee);
     }
   };
 
