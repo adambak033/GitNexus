@@ -44,6 +44,41 @@ function getHttpConfig(): HttpEmbeddingConfig | null {
 let httpConfig: HttpEmbeddingConfig | null | undefined;
 let httpDimensions: number | null = null;
 
+const HTTP_TIMEOUT_MS = 30_000;
+const HTTP_MAX_RETRIES = 2;
+const HTTP_RETRY_BACKOFF_MS = 1_000;
+
+async function httpEmbedBatch(
+  url: string,
+  batch: string[],
+  model: string,
+  apiKey: string,
+  attempt = 0,
+): Promise<Array<{ embedding: number[] }>> {
+  const resp = await fetch(url, {
+    method: 'POST',
+    signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({ input: batch, model }),
+  });
+
+  if (!resp.ok) {
+    const status = resp.status;
+    if ((status === 429 || status >= 500) && attempt < HTTP_MAX_RETRIES) {
+      const delay = HTTP_RETRY_BACKOFF_MS * (attempt + 1);
+      await new Promise(r => setTimeout(r, delay));
+      return httpEmbedBatch(url, batch, model, apiKey, attempt + 1);
+    }
+    throw new Error(`Embedding endpoint returned ${status}`);
+  }
+
+  const data = (await resp.json()) as { data: Array<{ embedding: number[] }> };
+  return data.data;
+}
+
 async function httpEmbed(texts: string[]): Promise<Float32Array[]> {
   if (httpConfig === undefined) httpConfig = getHttpConfig();
   if (!httpConfig) throw new Error('HTTP embedding not configured');
@@ -54,31 +89,14 @@ async function httpEmbed(texts: string[]): Promise<Float32Array[]> {
 
   for (let i = 0; i < texts.length; i += batchSize) {
     const batch = texts.slice(i, i + batchSize);
-    const resp = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${httpConfig.apiKey}`,
-      },
-      body: JSON.stringify({ input: batch, model: httpConfig.model }),
-    });
+    const items = await httpEmbedBatch(url, batch, httpConfig.model, httpConfig.apiKey);
 
-    if (!resp.ok) {
-      const body = await resp.text();
-      throw new Error(`Embedding endpoint ${resp.status}: ${body}`);
-    }
-
-    const data = (await resp.json()) as {
-      data: Array<{ embedding: number[] }>;
-    };
-
-    for (const item of data.data) {
+    for (const item of items) {
       allVectors.push(new Float32Array(item.embedding));
     }
 
-    // Auto-detect dimensions from first response
-    if (httpDimensions === null && data.data.length > 0) {
-      httpDimensions = data.data[0].embedding.length;
+    if (httpDimensions === null && items.length > 0) {
+      httpDimensions = items[0].embedding.length;
     }
   }
 
@@ -155,10 +173,11 @@ export const initEmbedder = async (
   config: Partial<EmbeddingConfig> = {},
   forceDevice?: 'dml' | 'cuda' | 'cpu' | 'wasm'
 ): Promise<FeatureExtractionPipeline> => {
-  // HTTP mode: skip local model loading entirely
   if (isHttpMode()) {
-    // Return a dummy pipeline — embedText/embedBatch bypass it via isHttpMode()
-    return null as unknown as FeatureExtractionPipeline;
+    throw new Error(
+      'initEmbedder() should not be called in HTTP mode. ' +
+      'Use embedText()/embedBatch() which handle HTTP transparently.'
+    );
   }
 
   // Return existing instance if available

@@ -26,7 +26,9 @@ let initPromise: Promise<FeatureExtractionPipeline> | null = null;
  * Initialize the embedding model (lazy, on first search)
  */
 export const initEmbedder = async (): Promise<FeatureExtractionPipeline> => {
-  if (USE_HTTP) return null as unknown as FeatureExtractionPipeline;
+  if (USE_HTTP) {
+    throw new Error('initEmbedder() should not be called in HTTP mode.');
+  }
 
   if (embedderInstance) {
     return embedderInstance;
@@ -104,13 +106,14 @@ export const embedQuery = async (query: string): Promise<number[]> => {
   if (USE_HTTP) {
     const resp = await fetch(`${HTTP_URL.replace(/\/+$/, '')}/embeddings`, {
       method: 'POST',
+      signal: AbortSignal.timeout(30_000),
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${HTTP_KEY}`,
       },
       body: JSON.stringify({ input: [query], model: HTTP_MODEL }),
     });
-    if (!resp.ok) throw new Error(`Embedding endpoint ${resp.status}`);
+    if (!resp.ok) throw new Error(`Embedding endpoint returned ${resp.status}`);
     const data = (await resp.json()) as { data: Array<{ embedding: number[] }> };
     return data.data[0].embedding;
   }

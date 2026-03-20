@@ -161,14 +161,16 @@ export const runEmbeddingPipeline = async (
       modelDownloadPercent: 0,
     });
 
-    await initEmbedder((modelProgress: ModelProgress) => {
-      const downloadPercent = modelProgress.progress ?? 0;
-      onProgress({
-        phase: 'loading-model',
-        percent: Math.round(downloadPercent * 0.2),
-        modelDownloadPercent: downloadPercent,
-      });
-    }, finalConfig);
+    if (!isEmbedderReady()) {
+      await initEmbedder((modelProgress: ModelProgress) => {
+        const downloadPercent = modelProgress.progress ?? 0;
+        onProgress({
+          phase: 'loading-model',
+          percent: Math.round(downloadPercent * 0.2),
+          modelDownloadPercent: downloadPercent,
+        });
+      }, finalConfig);
+    }
 
     onProgress({
       phase: 'loading-model',
