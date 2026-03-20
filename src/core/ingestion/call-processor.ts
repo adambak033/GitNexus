@@ -33,6 +33,38 @@ import { typeConfigs } from './type-extractors/index.js';
 import type { LiteralTypeInferrer } from './type-extractors/types.js';
 import type { SyntaxNode } from './utils.js';
 
+/** Per-file resolved type bindings for exported symbols.
+ *  Populated during call processing, consumed by Phase 14 re-resolution pass. */
+export type ExportedTypeMap = Map<string, Map<string, string>>;
+
+const MAX_EXPORTS_PER_FILE = 500;
+const MAX_TYPE_NAME_LENGTH = 256;
+
+/** Collect resolved type bindings for exported file-scope symbols.
+ *  Uses graph node isExported flag — does NOT require isExported on SymbolDefinition. */
+function collectExportedBindings(
+  typeEnv: { readonly env: ReadonlyMap<string, ReadonlyMap<string, string>> },
+  filePath: string,
+  symbolTable: { lookupExact(filePath: string, name: string): string | undefined },
+  graph: { getNode(id: string): { properties?: { isExported?: boolean } } | undefined },
+): Map<string, string> | null {
+  const fileScope = typeEnv.env.get('');
+  if (!fileScope || fileScope.size === 0) return null;
+
+  const exported = new Map<string, string>();
+  for (const [varName, typeName] of fileScope) {
+    if (exported.size >= MAX_EXPORTS_PER_FILE) break;
+    if (!typeName || typeName.length > MAX_TYPE_NAME_LENGTH) continue;
+    const nodeId = symbolTable.lookupExact(filePath, varName);
+    if (!nodeId) continue;
+    const node = graph.getNode(nodeId);
+    if (node?.properties?.isExported) {
+      exported.set(varName, typeName);
+    }
+  }
+  return exported.size > 0 ? exported : null;
+}
+
 // Stdlib methods that preserve the receiver's type identity. When TypeEnv already
 // strips nullable wrappers (Option<User> → User), these chain steps are no-ops
 // for type resolution — the current type passes through unchanged.
@@ -138,6 +170,7 @@ export const processCalls = async (
   astCache: ASTCache,
   ctx: ResolutionContext,
   onProgress?: (current: number, total: number) => void,
+  exportedTypeMap?: ExportedTypeMap,
 ): Promise<ExtractedHeritage[]> => {
   const parser = await loadParser();
   const collectedHeritage: ExtractedHeritage[] = [];
@@ -224,6 +257,10 @@ export const processCalls = async (
     }
 
     const typeEnv = lang ? buildTypeEnv(tree, lang, { symbolTable: ctx.symbols, parentMap }) : null;
+    if (typeEnv && exportedTypeMap) {
+      const fileExports = collectExportedBindings(typeEnv, file.path, ctx.symbols, graph);
+      if (fileExports) exportedTypeMap.set(file.path, fileExports);
+    }
     const callRouter = callRouters[language];
 
     const verifiedReceivers = typeEnv && typeEnv.constructorBindings.length > 0
@@ -964,6 +1001,7 @@ export const processCallsFromExtracted = async (
   ctx: ResolutionContext,
   onProgress?: (current: number, total: number) => void,
   constructorBindings?: FileConstructorBindings[],
+  exportedTypeMap?: ExportedTypeMap,
 ) => {
   // Scope-aware receiver types: keyed by filePath → "funcName\0varName" → typeName.
   // The scope dimension prevents collisions when two functions in the same file

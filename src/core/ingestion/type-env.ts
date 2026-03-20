@@ -647,6 +647,26 @@ const resolveFixpointBindings = (
 export interface BuildTypeEnvOptions {
   symbolTable?: SymbolTable;
   parentMap?: ReadonlyMap<string, readonly string[]>;
+  /** Pre-resolved bindings from upstream files (Phase 14).
+   *  Seeded into FILE_SCOPE after walk() for names with no local binding.
+   *  Local declarations always take precedence (first-writer-wins). */
+  importedBindings?: ReadonlyMap<string, string>;
+}
+
+/** Seed cross-file type bindings into the file scope.
+ *  MUST be called AFTER walk() completes so that local declarations
+ *  (Tier 0/1) always take precedence over imported bindings (first-writer-wins). */
+function seedImportedBindings(
+  env: TypeEnv,
+  importedBindings: ReadonlyMap<string, string>,
+): void {
+  let fileEnv = env.get(FILE_SCOPE);
+  if (!fileEnv) { fileEnv = new Map(); env.set(FILE_SCOPE, fileEnv); }
+  for (const [name, type] of importedBindings) {
+    if (!fileEnv.has(name)) {
+      fileEnv.set(name, type);
+    }
+  }
 }
 
 export const buildTypeEnv = (
@@ -995,6 +1015,12 @@ export const buildTypeEnv = (
   };
 
   walk(tree.rootNode, FILE_SCOPE);
+
+  // Phase 14: Seed cross-file bindings from upstream files AFTER walk
+  // (local declarations from walk() take precedence — first-writer-wins)
+  if (options?.importedBindings && options.importedBindings.size > 0) {
+    seedImportedBindings(env, options.importedBindings);
+  }
 
   resolveFixpointBindings(pendingItems, env, returnTypeLookup, symbolTable, parentMap);
 

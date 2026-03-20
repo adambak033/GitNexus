@@ -4044,4 +4044,88 @@ class App {
     });
   });
 
+  describe('Phase 14: importedBindings seeding', () => {
+    it('seeds imported bindings into file scope for unbound names', () => {
+      // Source has no local declaration of 'config', so the imported binding wins
+      const tree = parse('', TypeScript.typescript);
+      const { env } = buildTypeEnv(tree, 'typescript', {
+        importedBindings: new Map([['config', 'Config']]),
+      });
+      const fileScope = env.get('');
+      expect(fileScope?.get('config')).toBe('Config');
+    });
+
+    it('local declarations take precedence over imported bindings', () => {
+      // Source declares config: AppConfig — imported binding for 'config' must not overwrite it
+      const tree = parse('const config: AppConfig = getConfig();', TypeScript.typescript);
+      const { env } = buildTypeEnv(tree, 'typescript', {
+        importedBindings: new Map([['config', 'Config']]),
+      });
+      const fileScope = env.get('');
+      // AppConfig from the local annotation wins over the imported 'Config'
+      expect(fileScope?.get('config')).toBe('AppConfig');
+    });
+
+    it('does nothing when importedBindings is empty', () => {
+      const tree = parse('const user: User = getUser();', TypeScript.typescript);
+      const { env: envWithout } = buildTypeEnv(tree, 'typescript');
+      const { env: envWith } = buildTypeEnv(tree, 'typescript', {
+        importedBindings: new Map(),
+      });
+      // Both envs should produce the same file-scope content
+      const scopeWithout = envWithout.get('');
+      const scopeWith = envWith.get('');
+      expect(scopeWith?.get('user')).toBe(scopeWithout?.get('user'));
+      expect(scopeWith?.size).toBe(scopeWithout?.size);
+    });
+
+    it('seeds multiple bindings', () => {
+      const tree = parse('', TypeScript.typescript);
+      const { env } = buildTypeEnv(tree, 'typescript', {
+        importedBindings: new Map([
+          ['user', 'User'],
+          ['config', 'Config'],
+        ]),
+      });
+      const fileScope = env.get('');
+      expect(fileScope?.get('user')).toBe('User');
+      expect(fileScope?.get('config')).toBe('Config');
+    });
+
+    it('seeded bindings are reachable via lookup from a nested call node', () => {
+      // A call inside a function should still be able to look up a file-scope seeded binding
+      const code = `
+function process() {
+  config.validate();
+}`;
+      const tree = parse(code, TypeScript.typescript);
+      const typeEnv = buildTypeEnv(tree, 'typescript', {
+        importedBindings: new Map([['config', 'Config']]),
+      });
+
+      const calls: any[] = [];
+      function findCalls(node: any) {
+        if (node.type === 'call_expression') calls.push(node);
+        for (let i = 0; i < node.childCount; i++) findCalls(node.child(i));
+      }
+      findCalls(tree.rootNode);
+
+      // config.validate() — lookup 'config' from inside the process function scope
+      expect(typeEnv.lookup('config', calls[0])).toBe('Config');
+    });
+
+    it('seeds bindings with no conflict when local file has unrelated declarations', () => {
+      // File has 'user' declared locally; 'config' comes from importedBindings
+      const tree = parse('const user: User = getUser();', TypeScript.typescript);
+      const { env } = buildTypeEnv(tree, 'typescript', {
+        importedBindings: new Map([['config', 'Config']]),
+      });
+      const fileScope = env.get('');
+      // Local binding preserved
+      expect(fileScope?.get('user')).toBe('User');
+      // Imported binding added for the name that had no local declaration
+      expect(fileScope?.get('config')).toBe('Config');
+    });
+  });
+
 });

@@ -6,23 +6,81 @@ import {
   processImportsFromExtracted,
   buildImportResolutionContext
 } from './import-processor.js';
-import { processCalls, processCallsFromExtracted, processAssignmentsFromExtracted, processRoutesFromExtracted } from './call-processor.js';
+import { processCalls, processCallsFromExtracted, processAssignmentsFromExtracted, processRoutesFromExtracted, type ExportedTypeMap } from './call-processor.js';
 import { processHeritage, processHeritageFromExtracted } from './heritage-processor.js';
 import { computeMRO } from './mro-processor.js';
 import { processCommunities } from './community-processor.js';
 import { processProcesses } from './process-processor.js';
 import { createResolutionContext } from './resolution-context.js';
+import { buildTypeEnv } from './type-env.js';
 import { createASTCache } from './ast-cache.js';
 import { PipelineProgress, PipelineResult } from '../../types/pipeline.js';
 import { walkRepositoryPaths, readFileContents } from './filesystem-walker.js';
 import { getLanguageFromFilename } from './utils.js';
-import { isLanguageAvailable } from '../tree-sitter/parser-loader.js';
+import { isLanguageAvailable, loadParser, loadLanguage } from '../tree-sitter/parser-loader.js';
+import { getTreeSitterBufferSize } from './constants.js';
 import { createWorkerPool, WorkerPool } from './workers/worker-pool.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const isDev = process.env.NODE_ENV === 'development';
+
+/** A group of files with no mutual dependencies, safe to process in parallel. */
+type IndependentFileGroup = readonly string[];
+
+/** Kahn's algorithm: returns files grouped by topological level.
+ *  Files in the same level have no mutual dependencies — safe to process in parallel.
+ *  Files in cycles are returned as a final group (no cross-cycle propagation). */
+export function topologicalLevelSort(
+  importMap: ReadonlyMap<string, ReadonlySet<string>>,
+): readonly IndependentFileGroup[] {
+  // Build in-degree map and reverse dependency map
+  const inDegree = new Map<string, number>();
+  const reverseDeps = new Map<string, string[]>();
+
+  for (const [file, deps] of importMap) {
+    if (!inDegree.has(file)) inDegree.set(file, 0);
+    for (const dep of deps) {
+      if (!inDegree.has(dep)) inDegree.set(dep, 0);
+      // file imports dep, so dep must be processed before file
+      // In Kahn's terms: dep → file (dep is a prerequisite of file)
+      inDegree.set(file, (inDegree.get(file) ?? 0) + 1);
+      let rev = reverseDeps.get(dep);
+      if (!rev) { rev = []; reverseDeps.set(dep, rev); }
+      rev.push(file);
+    }
+  }
+
+  // BFS from zero-in-degree nodes, grouping by level
+  const levels: string[][] = [];
+  let currentLevel = [...inDegree.entries()]
+    .filter(([, d]) => d === 0)
+    .map(([f]) => f);
+
+  while (currentLevel.length > 0) {
+    levels.push(currentLevel);
+    const nextLevel: string[] = [];
+    for (const file of currentLevel) {
+      for (const dependent of reverseDeps.get(file) ?? []) {
+        const newDeg = (inDegree.get(dependent) ?? 1) - 1;
+        inDegree.set(dependent, newDeg);
+        if (newDeg === 0) nextLevel.push(dependent);
+      }
+    }
+    currentLevel = nextLevel;
+  }
+
+  // Files still with positive in-degree are in cycles — add as final group
+  const cycleFiles = [...inDegree.entries()]
+    .filter(([, d]) => d > 0)
+    .map(([f]) => f);
+  if (cycleFiles.length > 0) {
+    levels.push(cycleFiles);
+  }
+
+  return levels;
+}
 
 /** Max bytes of source content to load per parse chunk. Each chunk's source +
  *  parsed ASTs + extracted records + worker serialization overhead all live in
@@ -201,6 +259,8 @@ export const runPipelineFromRepo = async (
     // are already registered). This trades ~5% cross-chunk resolution accuracy for
     // 200-400MB less memory — critical for Linux-kernel-scale repos.
     const sequentialChunkPaths: string[][] = [];
+    // Phase 14: Collect exported type bindings for cross-file propagation
+    const exportedTypeMap: ExportedTypeMap = new Map();
 
     try {
       for (let chunkIdx = 0; chunkIdx < numChunks; chunkIdx++) {
@@ -260,6 +320,7 @@ export const runPipelineFromRepo = async (
                 });
               },
               chunkWorkerData.constructorBindings,
+              exportedTypeMap,
             ),
             processHeritageFromExtracted(
               graph,
@@ -316,7 +377,7 @@ export const runPipelineFromRepo = async (
         .filter(p => chunkContents.has(p))
         .map(p => ({ path: p, content: chunkContents.get(p)! }));
       astCache = createASTCache(chunkFiles.length);
-      const rubyHeritage = await processCalls(graph, chunkFiles, astCache, ctx);
+      const rubyHeritage = await processCalls(graph, chunkFiles, astCache, ctx, undefined, exportedTypeMap);
       await processHeritage(graph, chunkFiles, astCache, ctx);
       if (rubyHeritage.length > 0) {
         await processHeritageFromExtracted(graph, rubyHeritage, ctx);
@@ -330,6 +391,114 @@ export const runPipelineFromRepo = async (
       const total = rcStats.cacheHits + rcStats.cacheMisses;
       const hitRate = total > 0 ? ((rcStats.cacheHits / total) * 100).toFixed(1) : '0';
       console.log(`🔍 Resolution cache: ${rcStats.cacheHits} hits, ${rcStats.cacheMisses} misses (${hitRate}% hit rate)`);
+    }
+
+    // ── Phase 14: Cross-file binding propagation ──────────────────────
+    // Seed downstream files with resolved type bindings from upstream files.
+    // Uses namedImportMap (populated during import processing) to determine
+    // which exported bindings each file needs. Files processed in topological
+    // import order so upstream bindings are available when downstream runs.
+    if (exportedTypeMap.size > 0 && ctx.namedImportMap.size > 0) {
+      const allPathSet = new Set(allPaths);
+      const levels = topologicalLevelSort(ctx.importMap);
+
+      // Count files that would benefit from cross-file seeding
+      let filesWithGaps = 0;
+      for (const level of levels) {
+        for (const filePath of level) {
+          const imports = ctx.namedImportMap.get(filePath);
+          if (!imports) continue;
+          for (const [, binding] of imports) {
+            if (exportedTypeMap.has(binding.sourcePath)) { filesWithGaps++; break; }
+          }
+        }
+      }
+
+      const totalProcessed = exportedTypeMap.size + filesWithGaps;
+      const gapRatio = totalProcessed > 0 ? filesWithGaps / totalProcessed : 0;
+      const CROSS_FILE_SKIP_THRESHOLD = 0.03;
+
+      if (gapRatio < CROSS_FILE_SKIP_THRESHOLD) {
+        if (isDev) {
+          console.log(`⏭️ Cross-file re-resolution skipped (${filesWithGaps} files, ${(gapRatio * 100).toFixed(1)}% < ${CROSS_FILE_SKIP_THRESHOLD * 100}% threshold)`);
+        }
+      } else {
+        onProgress({
+          phase: 'parsing',
+          percent: 82,
+          message: `Cross-file type propagation (${filesWithGaps} files)...`,
+          stats: { filesProcessed: totalFiles, totalFiles, nodesCreated: graph.nodeCount },
+        });
+
+        let crossFileResolved = 0;
+        const crossFileStart = Date.now();
+        astCache = createASTCache(AST_CACHE_CAP);
+
+        for (const level of levels) {
+          for (const filePath of level) {
+            const imports = ctx.namedImportMap.get(filePath);
+            if (!imports) continue;
+
+            // Build seeded bindings from upstream ExportedTypeMap
+            const seeded = new Map<string, string>();
+            for (const [localName, binding] of imports) {
+              const upstream = exportedTypeMap.get(binding.sourcePath);
+              if (upstream) {
+                const type = upstream.get(binding.exportedName);
+                if (type) seeded.set(localName, type);
+              }
+            }
+            if (seeded.size === 0) continue;
+
+            // Validate path before re-reading (defense-in-depth)
+            if (!allPathSet.has(filePath)) continue;
+
+            // Re-read, re-parse, and re-resolve with seeded bindings
+            const lang = getLanguageFromFilename(filePath);
+            if (!lang || !isLanguageAvailable(lang)) continue;
+
+            const contentMap = await readFileContents(repoPath, [filePath]);
+            const content = contentMap.get(filePath);
+            if (!content) continue;
+
+            const parser = await loadParser();
+            await loadLanguage(lang, filePath);
+            const bufferSize = getTreeSitterBufferSize(content.length);
+            if (bufferSize) (parser as any).setBufferSize?.(bufferSize);
+            const tree = parser.parse(content);
+
+            const typeEnv = buildTypeEnv(tree, lang, {
+              symbolTable: ctx.symbols,
+              importedBindings: seeded,
+            });
+
+            // Collect updated exports for downstream propagation
+            const fileScope = typeEnv.env.get('');
+            if (fileScope) {
+              const updated = new Map<string, string>();
+              for (const [varName, typeName] of fileScope) {
+                if (updated.size >= 500) break;
+                if (!typeName || typeName.length > 256) continue;
+                const nodeId = ctx.symbols.lookupExact(filePath, varName);
+                if (!nodeId) continue;
+                const node = graph.getNode(nodeId);
+                if (node?.properties?.isExported) {
+                  updated.set(varName, typeName);
+                }
+              }
+              if (updated.size > 0) exportedTypeMap.set(filePath, updated);
+            }
+
+            crossFileResolved++;
+          }
+          astCache.clear();
+        }
+
+        if (isDev) {
+          const elapsed = Date.now() - crossFileStart;
+          console.log(`🔗 Cross-file re-resolution: ${crossFileResolved} files re-processed in ${elapsed}ms`);
+        }
+      }
     }
 
     // Free import resolution context — suffix index + resolve cache no longer needed
