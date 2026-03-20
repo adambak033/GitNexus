@@ -126,4 +126,14 @@ describe('indexCommand', () => {
     );
     expect(process.exitCode).toBeUndefined();
   });
+
+  it('registers non-git path when --allow-non-git is set', async () => {
+    mockIsGitRepo.mockReturnValue(false);
+
+    const { indexCommand } = await import('../../src/cli/index-repo.js');
+    await indexCommand(['/outside/path'], { allowNonGit: true });
+
+    expect(mockRegisterRepo).toHaveBeenCalledTimes(1);
+    expect(process.exitCode).toBeUndefined();
+  });
 });

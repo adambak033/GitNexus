@@ -20,6 +20,7 @@ import { getGitRoot, isGitRepo } from "../storage/git.js";
 
 export interface IndexOptions {
   force?: boolean;
+  allowNonGit?: boolean;
 }
 
 export const indexCommand = async (
@@ -45,9 +46,10 @@ export const indexCommand = async (
     repoPath = gitRoot;
   }
 
-  if (!isGitRepo(repoPath)) {
+  if (!options?.allowNonGit && !isGitRepo(repoPath)) {
     console.log(`  Not a git repository: ${repoPath}`);
     console.log("  Initialize one with `git init` or choose a valid repo path.\n");
+    console.log("  Or use --allow-non-git to register an existing .gitnexus index anyway.\n");
     process.exitCode = 1;
     return;
   }
