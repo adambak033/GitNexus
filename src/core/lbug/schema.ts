@@ -13,7 +13,7 @@
 // NODE TABLE NAMES
 // ============================================================================
 export const NODE_TABLES = [
-  'File', 'Folder', 'Function', 'Class', 'Interface', 'Method', 'CodeElement', 'Community', 'Process',
+  'File', 'Folder', 'Function', 'Class', 'Interface', 'Method', 'CodeElement', 'Community', 'Process', 'Section',
   // Multi-language support
   'Struct', 'Enum', 'Macro', 'Typedef', 'Union', 'Namespace', 'Trait', 'Impl',
   'TypeAlias', 'Const', 'Static', 'Property', 'Record', 'Delegate', 'Annotation', 'Constructor', 'Template', 'Module'
@@ -238,6 +238,7 @@ CREATE REL TABLE ${REL_TABLE_NAME} (
   FROM File TO \`Constructor\`,
   FROM File TO \`Template\`,
   FROM File TO \`Module\`,
+  FROM File TO Section,
   FROM Folder TO Folder,
   FROM Folder TO File,
   FROM Function TO Function,
@@ -462,6 +463,8 @@ export const NODE_SCHEMA_QUERIES = [
   CONSTRUCTOR_SCHEMA,
   TEMPLATE_SCHEMA,
   MODULE_SCHEMA,
+  // Markdown support
+  SECTION_SCHEMA,
 ];
 
 export const REL_SCHEMA_QUERIES = [
