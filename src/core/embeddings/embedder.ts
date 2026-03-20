@@ -18,92 +18,8 @@ import { pipeline, env, type FeatureExtractionPipeline } from '@huggingface/tran
 import { existsSync } from 'fs';
 import { execFileSync } from 'child_process';
 import { join } from 'path';
-import { DEFAULT_EMBEDDING_CONFIG, type EmbeddingConfig, type HttpEmbeddingConfig, type ModelProgress } from './types.js';
-
-// ─── HTTP Embedding Backend ───────────────────────────────────────────────────
-// When GITNEXUS_EMBEDDING_URL + GITNEXUS_EMBEDDING_MODEL are set, embedding
-// calls proxy to a remote OpenAI-compatible /v1/embeddings endpoint.
-
-function getHttpConfig(): HttpEmbeddingConfig | null {
-  const baseUrl = process.env.GITNEXUS_EMBEDDING_URL;
-  const model = process.env.GITNEXUS_EMBEDDING_MODEL;
-  if (!baseUrl || !model) return null;
-  return {
-    baseUrl: baseUrl.replace(/\/+$/, ''),
-    model,
-    apiKey: process.env.GITNEXUS_EMBEDDING_API_KEY ?? 'unused',
-    dimensions: process.env.GITNEXUS_EMBEDDING_DIMS
-      ? parseInt(process.env.GITNEXUS_EMBEDDING_DIMS, 10)
-      : undefined,
-  };
-}
-
-let httpConfig: HttpEmbeddingConfig | null | undefined;
-let httpDimensions: number | null = null;
-
-const HTTP_TIMEOUT_MS = 30_000;
-const HTTP_MAX_RETRIES = 2;
-const HTTP_RETRY_BACKOFF_MS = 1_000;
-
-async function httpEmbedBatch(
-  url: string,
-  batch: string[],
-  model: string,
-  apiKey: string,
-  attempt = 0,
-): Promise<Array<{ embedding: number[] }>> {
-  const resp = await fetch(url, {
-    method: 'POST',
-    signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({ input: batch, model }),
-  });
-
-  if (!resp.ok) {
-    const status = resp.status;
-    if ((status === 429 || status >= 500) && attempt < HTTP_MAX_RETRIES) {
-      const delay = HTTP_RETRY_BACKOFF_MS * (attempt + 1);
-      await new Promise(r => setTimeout(r, delay));
-      return httpEmbedBatch(url, batch, model, apiKey, attempt + 1);
-    }
-    throw new Error(`Embedding endpoint returned ${status}`);
-  }
-
-  const data = (await resp.json()) as { data: Array<{ embedding: number[] }> };
-  return data.data;
-}
-
-async function httpEmbed(texts: string[]): Promise<Float32Array[]> {
-  if (httpConfig === undefined) httpConfig = getHttpConfig();
-  if (!httpConfig) throw new Error('HTTP embedding not configured');
-
-  const url = `${httpConfig.baseUrl}/embeddings`;
-  const batchSize = 64;
-  const allVectors: Float32Array[] = [];
-
-  for (let i = 0; i < texts.length; i += batchSize) {
-    const batch = texts.slice(i, i + batchSize);
-    const items = await httpEmbedBatch(url, batch, httpConfig.model, httpConfig.apiKey);
-
-    for (const item of items) {
-      allVectors.push(new Float32Array(item.embedding));
-    }
-
-    if (httpDimensions === null && items.length > 0) {
-      httpDimensions = items[0].embedding.length;
-    }
-  }
-
-  return allVectors;
-}
-
-function isHttpMode(): boolean {
-  if (httpConfig === undefined) httpConfig = getHttpConfig();
-  return httpConfig !== null;
-}
+import { DEFAULT_EMBEDDING_CONFIG, type EmbeddingConfig, type ModelProgress } from './types.js';
+import { isHttpMode, getHttpDimensions, httpEmbed } from './http-client.js';
 
 /**
  * Check whether CUDA libraries are actually available on this system.
@@ -292,13 +208,11 @@ export const isEmbedderReady = (): boolean => {
 
 /**
  * Get the effective embedding dimensions.
- * Returns configured dimensions. In HTTP mode, uses GITNEXUS_EMBEDDING_DIMS
- * or falls back to auto-detected dims from the last HTTP response.
+ * In HTTP mode, uses GITNEXUS_EMBEDDING_DIMS if set, otherwise the default.
  */
 export const getEmbeddingDimensions = (): number => {
   if (isHttpMode()) {
-    const cfg = getHttpConfig();
-    return cfg?.dimensions ?? httpDimensions ?? DEFAULT_EMBEDDING_CONFIG.dimensions;
+    return getHttpDimensions() ?? DEFAULT_EMBEDDING_CONFIG.dimensions;
   }
   return DEFAULT_EMBEDDING_CONFIG.dimensions;
 };

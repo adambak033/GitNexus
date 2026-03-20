@@ -65,20 +65,6 @@ export interface EmbeddingConfig {
   maxSnippetLength: number;
 }
 
-/**
- * Configuration for HTTP embedding endpoint (OpenAI-compatible /v1/embeddings).
- * Populated from GITNEXUS_EMBEDDING_* environment variables.
- */
-export interface HttpEmbeddingConfig {
-  /** Base URL for the embedding API (must include /v1) */
-  baseUrl: string;
-  /** Model name to send in the request */
-  model: string;
-  /** API key for authentication */
-  apiKey: string;
-  /** Vector dimensions — must match model output (default: 384) */
-  dimensions?: number;
-}
 
 /**
  * Default embedding configuration

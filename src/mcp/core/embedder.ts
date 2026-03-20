@@ -6,16 +6,10 @@
  */
 
 import { pipeline, env, type FeatureExtractionPipeline } from '@huggingface/transformers';
-
-// HTTP embedding config
-const HTTP_URL = process.env.GITNEXUS_EMBEDDING_URL ?? '';
-const HTTP_MODEL = process.env.GITNEXUS_EMBEDDING_MODEL ?? '';
-const HTTP_KEY = process.env.GITNEXUS_EMBEDDING_API_KEY ?? 'unused';
-const USE_HTTP = !!(HTTP_URL && HTTP_MODEL);
+import { isHttpMode, getHttpDimensions, httpEmbedQuery } from '../../core/embeddings/http-client.js';
 
 // Model config
 const MODEL_ID = 'Snowflake/snowflake-arctic-embed-xs';
-const EMBEDDING_DIMS = parseInt(process.env.GITNEXUS_EMBEDDING_DIMS ?? '384', 10);
 
 // Module-level state for singleton pattern
 let embedderInstance: FeatureExtractionPipeline | null = null;
@@ -26,7 +20,7 @@ let initPromise: Promise<FeatureExtractionPipeline> | null = null;
  * Initialize the embedding model (lazy, on first search)
  */
 export const initEmbedder = async (): Promise<FeatureExtractionPipeline> => {
-  if (USE_HTTP) {
+  if (isHttpMode()) {
     throw new Error('initEmbedder() should not be called in HTTP mode.');
   }
 
@@ -97,38 +91,14 @@ export const initEmbedder = async (): Promise<FeatureExtractionPipeline> => {
 /**
  * Check if embedder is ready
  */
-export const isEmbedderReady = (): boolean => USE_HTTP || embedderInstance !== null;
+export const isEmbedderReady = (): boolean => isHttpMode() || embedderInstance !== null;
 
 /**
  * Embed a query text for semantic search
  */
 export const embedQuery = async (query: string): Promise<number[]> => {
-  if (USE_HTTP) {
-    const url = `${HTTP_URL.replace(/\/+$/, '')}/embeddings`;
-    const body = JSON.stringify({ input: [query], model: HTTP_MODEL });
-    const headers = {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${HTTP_KEY}`,
-    };
-
-    for (let attempt = 0; attempt <= 1; attempt++) {
-      const resp = await fetch(url, {
-        method: 'POST',
-        signal: AbortSignal.timeout(30_000),
-        headers,
-        body,
-      });
-      if (!resp.ok) {
-        if ((resp.status === 429 || resp.status >= 500) && attempt < 1) {
-          await new Promise(r => setTimeout(r, 1_000));
-          continue;
-        }
-        throw new Error(`Embedding endpoint returned ${resp.status}`);
-      }
-      const data = (await resp.json()) as { data: Array<{ embedding: number[] }> };
-      return data.data[0].embedding;
-    }
-    throw new Error('Embedding request failed after retry');
+  if (isHttpMode()) {
+    return httpEmbedQuery(query);
   }
 
   const embedder = await initEmbedder();
@@ -144,7 +114,9 @@ export const embedQuery = async (query: string): Promise<number[]> => {
 /**
  * Get embedding dimensions
  */
-export const getEmbeddingDims = (): number => EMBEDDING_DIMS;
+export const getEmbeddingDims = (): number => {
+  return getHttpDimensions() ?? 384;
+};
 
 /**
  * Cleanup embedder
