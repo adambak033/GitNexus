@@ -3852,4 +3852,196 @@ class App {
     });
   });
 
+  describe('multi-declarator type association (sizeBefore optimization)', () => {
+    it('Java: multi-declarator captures all variable names with shared type', () => {
+      const tree = parse(`
+class App {
+    void run() {
+        User a = getA(), b = getB();
+        a.save();
+        b.save();
+    }
+}
+      `, Java);
+      const { env } = buildTypeEnv(tree, 'java');
+      expect(flatGet(env, 'a')).toBe('User');
+      expect(flatGet(env, 'b')).toBe('User');
+    });
+
+    it('Java: untyped declaration before typed does not get false type association', () => {
+      // `x` has no type annotation → must NOT be associated with the User type
+      // from the later declaration. This guards the sizeBefore skip logic.
+      const tree = parse(`
+class App {
+    void run() {
+        var x = getX();
+        User user = getUser();
+        user.save();
+    }
+}
+      `, Java);
+      const { env } = buildTypeEnv(tree, 'java');
+      expect(flatGet(env, 'user')).toBe('User');
+      // x should NOT have a type binding (it's untyped via var)
+      expect(flatGet(env, 'x')).toBeUndefined();
+    });
+
+    it('C#: multi-declarator with shared type captures both variables', () => {
+      const tree = parse(`
+class App {
+    void Run() {
+        User a = GetA(), b = GetB();
+        a.Save();
+        b.Save();
+    }
+}
+      `, CSharp);
+      const { env } = buildTypeEnv(tree, 'csharp');
+      expect(flatGet(env, 'a')).toBe('User');
+      expect(flatGet(env, 'b')).toBe('User');
+    });
+
+    it('Java: single declarator with type still works after optimization', () => {
+      const tree = parse(`
+class App {
+    void run() {
+        User user = getUser();
+        user.save();
+    }
+}
+      `, Java);
+      const { env } = buildTypeEnv(tree, 'java');
+      expect(flatGet(env, 'user')).toBe('User');
+    });
+
+    it('Java: for-loop resolves element type from multi-declarator typed iterable', () => {
+      // Tests that declarationTypeNodes is correctly populated for multi-declarator
+      // variables, enabling for-loop element type resolution (Strategy 1).
+      const tree = parse(`
+class App {
+    void run() {
+        List<User> users = getUsers(), admins = getAdmins();
+        for (User u : users) {
+            u.save();
+        }
+    }
+}
+      `, Java);
+      const { env } = buildTypeEnv(tree, 'java');
+      expect(flatGet(env, 'users')).toBe('List');
+      expect(flatGet(env, 'admins')).toBe('List');
+      expect(flatGet(env, 'u')).toBe('User');
+    });
+  });
+
+  describe('constructorTypeMap (virtual dispatch detection)', () => {
+    it('Java: Animal a = new Dog() populates constructorTypeMap with Dog', () => {
+      const tree = parse(`
+class Animal {}
+class Dog extends Animal {}
+class App {
+    void run() {
+        Animal a = new Dog();
+    }
+}
+      `, Java);
+      const { constructorTypeMap } = buildTypeEnv(tree, 'java');
+      // Find the entry for variable 'a'
+      let ctorType: string | undefined;
+      for (const [key, value] of constructorTypeMap) {
+        if (key.endsWith('\0a')) { ctorType = value; break; }
+      }
+      expect(ctorType).toBe('Dog');
+    });
+
+    it('Java: same-type constructor does NOT populate constructorTypeMap', () => {
+      const tree = parse(`
+class User {}
+class App {
+    void run() {
+        User u = new User();
+    }
+}
+      `, Java);
+      const { constructorTypeMap } = buildTypeEnv(tree, 'java');
+      let found = false;
+      for (const [key] of constructorTypeMap) {
+        if (key.endsWith('\0u')) { found = true; break; }
+      }
+      expect(found).toBe(false);
+    });
+
+    it('TypeScript: const a: Animal = new Dog() — constructorTypeMap not populated (type on variable_declarator, not lexical_declaration)', () => {
+      // TS virtual dispatch for this pattern works through call-processor,
+      // not constructorTypeMap — the type annotation is on the child
+      // variable_declarator, not the outer lexical_declaration.
+      const tree = parse(`
+class Animal {}
+class Dog extends Animal {}
+const a: Animal = new Dog();
+      `, TypeScript.typescript);
+      const { env, constructorTypeMap } = buildTypeEnv(tree, 'typescript');
+      expect(flatGet(env, 'a')).toBe('Animal');
+      let found = false;
+      for (const [key] of constructorTypeMap) {
+        if (key.endsWith('\0a')) { found = true; break; }
+      }
+      expect(found).toBe(false);
+    });
+
+    it('C++: Animal* a = new Dog() populates constructorTypeMap', () => {
+      const tree = parse(`
+class Animal {};
+class Dog : public Animal {};
+void run() {
+    Animal* a = new Dog();
+}
+      `, CPP);
+      const { constructorTypeMap } = buildTypeEnv(tree, 'cpp');
+      let ctorType: string | undefined;
+      for (const [key, value] of constructorTypeMap) {
+        if (key.endsWith('\0a')) { ctorType = value; break; }
+      }
+      expect(ctorType).toBe('Dog');
+    });
+
+    it('C#: Animal a = new Dog() populates constructorTypeMap', () => {
+      const tree = parse(`
+class Animal {}
+class Dog : Animal {}
+class App {
+    void Run() {
+        Animal a = new Dog();
+    }
+}
+      `, CSharp);
+      const { constructorTypeMap } = buildTypeEnv(tree, 'csharp');
+      let ctorType: string | undefined;
+      for (const [key, value] of constructorTypeMap) {
+        if (key.endsWith('\0a')) { ctorType = value; break; }
+      }
+      expect(ctorType).toBe('Dog');
+    });
+
+    it('C#: implicit new() does NOT populate constructorTypeMap (type from declaration)', () => {
+      const tree = parse(`
+class Dog {}
+class App {
+    void Run() {
+        Dog d = new();
+    }
+}
+      `, CSharp);
+      const { env, constructorTypeMap } = buildTypeEnv(tree, 'csharp');
+      // d should be bound via declared type path
+      expect(flatGet(env, 'd')).toBe('Dog');
+      // constructorTypeMap should NOT have an entry (same type, no override needed)
+      let found = false;
+      for (const [key] of constructorTypeMap) {
+        if (key.endsWith('\0d')) { found = true; break; }
+      }
+      expect(found).toBe(false);
+    });
+  });
+
 });

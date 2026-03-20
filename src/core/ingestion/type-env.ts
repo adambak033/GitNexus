@@ -827,13 +827,17 @@ export const buildTypeEnv = (
         }
       }
       // Run the language-specific declaration extractor (may or may not add to scopeEnv).
-      const keysBefore = typeNode ? new Set(scopeEnv.keys()) : undefined;
+      const sizeBefore = typeNode ? scopeEnv.size : -1;
       config.extractDeclaration(node, scopeEnv);
       // Fallback: for multi-declarator languages (TS, C#, Java) where the type field
-      // is on variable_declarator children, capture via keysBefore/keysAfter diff.
-      if (typeNode && keysBefore) {
+      // is on variable_declarator children, capture newly-added keys.
+      // Map preserves insertion order, so new keys are always at the end —
+      // skip the first sizeBefore entries to find only newly-added variables.
+      if (sizeBefore >= 0 && scopeEnv.size > sizeBefore) {
+        let skip = sizeBefore;
         for (const varName of scopeEnv.keys()) {
-          if (!keysBefore.has(varName) && !declarationTypeNodes.has(`${scope}\0${varName}`)) {
+          if (skip > 0) { skip--; continue; }
+          if (!declarationTypeNodes.has(`${scope}\0${varName}`)) {
             declarationTypeNodes.set(`${scope}\0${varName}`, typeNode);
           }
         }
@@ -850,9 +854,10 @@ export const buildTypeEnv = (
       // When a declaration has BOTH a type annotation AND a constructor initializer,
       // record the constructor type for receiver override at call resolution time.
       // e.g., `Animal a = new Dog()` → constructorTypeMap.set('scope\0a', 'Dog')
-      if (keysBefore) {
+      if (sizeBefore >= 0 && scopeEnv.size > sizeBefore) {
+        let ctorSkip = sizeBefore;
         for (const varName of scopeEnv.keys()) {
-          if (keysBefore.has(varName)) continue;
+          if (ctorSkip > 0) { ctorSkip--; continue; }
           const declaredType = scopeEnv.get(varName);
           if (!declaredType) continue;
           const ctorType = extractConstructorTypeName(node)

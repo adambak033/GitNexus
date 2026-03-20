@@ -649,7 +649,7 @@ export const extractMethodSignature = (node: SyntaxNode | null | undefined): Met
 
   /** AST node types that represent parameters with default values. */
   const OPTIONAL_PARAM_TYPES = new Set([
-    'optional_parameter',                // TypeScript: (x?: number) or (x: number = 5)
+    'optional_parameter',                // TypeScript, Ruby: (x?: number), (x: number = 5), def f(x = 5)
     'default_parameter',                 // Python: def f(x=5)
     'typed_default_parameter',           // Python: def f(x: int = 5)
     'optional_parameter_declaration',    // C++: void f(int x = 5)
@@ -667,9 +667,8 @@ export const extractMethodSignature = (node: SyntaxNode | null | undefined): Met
     }
     // Kotlin: default values are siblings of the parameter node, not children.
     // The AST is: parameter, =, <literal>  — all at function_value_parameters level.
-    // Walk forward from the parameter to find an immediately following '=' token.
-    let sib = paramNode.nextSibling;
-    while (sib && (sib.type === ',' || sib.type === ')')) sib = null; // stop at , or )
+    // Check if the immediately following sibling is '=' (default value separator).
+    const sib = paramNode.nextSibling;
     if (sib && sib.type === '=') return true;
     return false;
   };
