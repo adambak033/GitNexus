@@ -1496,3 +1496,24 @@ describe('C# overload disambiguation by parameter types', () => {
     expect(lookupCalls.length).toBe(1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// C# optional parameter arity resolution
+// ---------------------------------------------------------------------------
+
+describe('C# optional parameter arity resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'csharp-optional-params'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves g.Greet("Alice") with 1 arg to Greet with 2 params (1 optional)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const greetCalls = calls.filter(c => c.source === 'Main' && c.target === 'Greet');
+    expect(greetCalls.length).toBe(1);
+  });
+});

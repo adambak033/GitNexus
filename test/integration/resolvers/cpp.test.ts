@@ -1114,3 +1114,24 @@ describe('C++ smart pointer virtual dispatch via make_shared', () => {
     expect(speakCall).toBeDefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// C++ default parameter arity resolution
+// ---------------------------------------------------------------------------
+
+describe('C++ default parameter arity resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'cpp-default-params'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves greet("Alice") with 1 arg to greet with 2 params (1 default)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const greetCalls = calls.filter(c => c.source === 'process' && c.target === 'greet');
+    expect(greetCalls.length).toBe(1);
+  });
+});

@@ -537,7 +537,9 @@ const filterCallableCandidates = (
   if (!hasParameterMetadata) return kindFiltered;
 
   return kindFiltered.filter(candidate =>
-    candidate.parameterCount === undefined || candidate.parameterCount === argCount
+    candidate.parameterCount === undefined
+    || (argCount >= (candidate.requiredParameterCount ?? candidate.parameterCount)
+      && argCount <= candidate.parameterCount)
   );
 };
 

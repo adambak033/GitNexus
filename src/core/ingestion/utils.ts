@@ -603,6 +603,10 @@ export const getLanguageFromFilename = (filename: string): SupportedLanguages | 
 
 export interface MethodSignature {
   parameterCount: number | undefined;
+  /** Number of required (non-optional, non-default) parameters.
+   *  Only set when fewer than parameterCount — enables range-based arity filtering.
+   *  undefined means all parameters are required (or metadata unavailable). */
+  requiredParameterCount: number | undefined;
   /** Per-parameter type names extracted via extractSimpleTypeName.
    *  Only populated for languages with method overloading (Java, Kotlin, C#, C++).
    *  undefined (not []) when no types are extractable — avoids empty array allocations. */
@@ -622,11 +626,12 @@ const CALL_ARGUMENT_LIST_TYPES = new Set([
  */
 export const extractMethodSignature = (node: SyntaxNode | null | undefined): MethodSignature => {
   let parameterCount: number | undefined = 0;
+  let requiredCount = 0;
   let returnType: string | undefined;
   let isVariadic = false;
   const paramTypes: string[] = [];
 
-  if (!node) return { parameterCount, parameterTypes: undefined, returnType };
+  if (!node) return { parameterCount, requiredParameterCount: undefined, parameterTypes: undefined, returnType };
 
   const paramListTypes = new Set([
     'formal_parameters', 'parameters', 'parameter_list',
@@ -641,6 +646,33 @@ export const extractMethodSignature = (node: SyntaxNode | null | undefined): Met
     'list_splat_pattern',              // Python: *args
     'dictionary_splat_pattern',        // Python: **kwargs
   ]);
+
+  /** AST node types that represent parameters with default values. */
+  const OPTIONAL_PARAM_TYPES = new Set([
+    'optional_parameter',                // TypeScript: (x?: number) or (x: number = 5)
+    'default_parameter',                 // Python: def f(x=5)
+    'typed_default_parameter',           // Python: def f(x: int = 5)
+    'optional_parameter_declaration',    // C++: void f(int x = 5)
+  ]);
+
+  /** Check if a parameter node has a default value (handles Kotlin, C#, Swift, PHP
+   *  where defaults are expressed as child nodes rather than distinct node types). */
+  const hasDefaultValue = (paramNode: SyntaxNode): boolean => {
+    if (OPTIONAL_PARAM_TYPES.has(paramNode.type)) return true;
+    // C#, Swift, PHP: check for '=' token or equals_value_clause child
+    for (let i = 0; i < paramNode.childCount; i++) {
+      const c = paramNode.child(i);
+      if (!c) continue;
+      if (c.type === '=' || c.type === 'equals_value_clause') return true;
+    }
+    // Kotlin: default values are siblings of the parameter node, not children.
+    // The AST is: parameter, =, <literal>  — all at function_value_parameters level.
+    // Walk forward from the parameter to find an immediately following '=' token.
+    let sib = paramNode.nextSibling;
+    while (sib && (sib.type === ',' || sib.type === ')')) sib = null; // stop at , or )
+    if (sib && sib.type === '=') return true;
+    return false;
+  };
 
   const findParameterList = (current: SyntaxNode): SyntaxNode | null => {
     for (const child of current.children) {
@@ -664,6 +696,15 @@ export const extractMethodSignature = (node: SyntaxNode | null | undefined): Met
       if (param.type === 'comment') continue;
       if (param.text === 'self' || param.text === '&self' || param.text === '&mut self' ||
           param.type === 'self_parameter') {
+        continue;
+      }
+      // Kotlin: default values are siblings of the parameter node inside
+      // function_value_parameters, so they appear as named children (e.g.
+      // string_literal, integer_literal, boolean_literal, call_expression).
+      // Skip any named child that isn't a parameter-like or modifier node.
+      if (param.type.endsWith('_literal') || param.type === 'call_expression'
+        || param.type === 'navigation_expression' || param.type === 'prefix_expression'
+        || param.type === 'parenthesized_expression') {
         continue;
       }
       // Check for variadic parameter types
@@ -712,6 +753,7 @@ export const extractMethodSignature = (node: SyntaxNode | null | undefined): Met
         }
         if (!found) paramTypes.push('unknown');
       }
+      if (!hasDefaultValue(param)) requiredCount++;
       parameterCount++;
     }
     // C/C++: bare `...` token in parameter list (not a named child — check all children)
@@ -803,7 +845,10 @@ export const extractMethodSignature = (node: SyntaxNode | null | undefined): Met
   // Only include parameterTypes when at least one type was successfully extracted.
   // Use undefined (not []) to avoid empty array allocations for untyped parameters.
   const hasTypes = paramTypes.length > 0 && paramTypes.some(t => t !== 'unknown');
-  return { parameterCount, parameterTypes: hasTypes ? paramTypes : undefined, returnType };
+  // Only set requiredParameterCount when it differs from total — saves memory on the common case.
+  const requiredParameterCount = (!isVariadic && requiredCount < (parameterCount ?? 0))
+    ? requiredCount : undefined;
+  return { parameterCount, requiredParameterCount, parameterTypes: hasTypes ? paramTypes : undefined, returnType };
 };
 
 /**

@@ -2290,3 +2290,28 @@ describe('TypeScript overload disambiguation via inferLiteralType', () => {
     expect(lookupCalls.length).toBe(1);
   });
 });
+
+// ── Phase P: Optional / Default Parameter Arity Resolution ───────────────
+
+describe('TypeScript optional parameter arity resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'ts-optional-params'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves greet("Alice") with 1 arg to greet with 2 params (1 optional)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const greetCalls = calls.filter(c => c.source === 'process' && c.target === 'greet');
+    expect(greetCalls.length).toBe(1);
+  });
+
+  it('resolves search("test") with 1 arg to search with 2 params (1 optional)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const searchCalls = calls.filter(c => c.source === 'process' && c.target === 'search');
+    expect(searchCalls.length).toBe(1);
+  });
+});

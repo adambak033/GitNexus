@@ -5,6 +5,9 @@ export interface SymbolDefinition {
   filePath: string;
   type: NodeLabel;
   parameterCount?: number;
+  /** Number of required (non-optional, non-default) parameters.
+   *  Enables range-based arity filtering: argCount >= requiredParameterCount && argCount <= parameterCount. */
+  requiredParameterCount?: number;
   /** Per-parameter type names for overload disambiguation (e.g. ['int', 'String']).
    *  Populated when parameter types are resolvable from AST (any typed language).
    *  Used for disambiguation in overloading languages (Java, Kotlin, C#, C++). */
@@ -26,9 +29,9 @@ export interface SymbolTable {
     name: string,
     nodeId: string,
     type: NodeLabel,
-    metadata?: { parameterCount?: number; parameterTypes?: string[]; returnType?: string; declaredType?: string; ownerId?: string }
+    metadata?: { parameterCount?: number; requiredParameterCount?: number; parameterTypes?: string[]; returnType?: string; declaredType?: string; ownerId?: string }
   ) => void;
-  
+
   /**
    * High Confidence: Look for a symbol specifically inside a file
    * Returns the Node ID if found
@@ -106,13 +109,14 @@ export const createSymbolTable = (): SymbolTable => {
     name: string,
     nodeId: string,
     type: NodeLabel,
-    metadata?: { parameterCount?: number; parameterTypes?: string[]; returnType?: string; declaredType?: string; ownerId?: string }
+    metadata?: { parameterCount?: number; requiredParameterCount?: number; parameterTypes?: string[]; returnType?: string; declaredType?: string; ownerId?: string }
   ) => {
     const def: SymbolDefinition = {
       nodeId,
       filePath,
       type,
       ...(metadata?.parameterCount !== undefined ? { parameterCount: metadata.parameterCount } : {}),
+      ...(metadata?.requiredParameterCount !== undefined ? { requiredParameterCount: metadata.requiredParameterCount } : {}),
       ...(metadata?.parameterTypes !== undefined ? { parameterTypes: metadata.parameterTypes } : {}),
       ...(metadata?.returnType !== undefined ? { returnType: metadata.returnType } : {}),
       ...(metadata?.declaredType !== undefined ? { declaredType: metadata.declaredType } : {}),

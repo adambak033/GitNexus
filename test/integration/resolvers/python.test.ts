@@ -1474,3 +1474,28 @@ describe('Python grandparent method resolution via MRO (Phase B)', () => {
     expect(greetCall).toBeDefined();
   });
 });
+
+// ── Phase P: Default Parameter Arity Resolution ──────────────────────────
+
+describe('Python default parameter arity resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'python-default-params'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves greet("alice") with 1 arg to greet with 2 params (1 default)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const greetCalls = calls.filter(c => c.source === 'process' && c.target === 'greet');
+    expect(greetCalls.length).toBe(1);
+  });
+
+  it('resolves search("test") with 1 arg to search with 2 params (1 default)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const searchCalls = calls.filter(c => c.source === 'process' && c.target === 'search');
+    expect(searchCalls.length).toBe(1);
+  });
+});
