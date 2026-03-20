@@ -32,7 +32,8 @@ export type NodeLabel =
   | 'Delegate'
   | 'Annotation'
   | 'Constructor'
-  | 'Template';
+  | 'Template'
+  | 'Section';
 
 
 import { SupportedLanguages } from '../../config/supported-languages.js';
@@ -65,6 +66,8 @@ export type NodeProperties = {
   entryPointReason?: string,
   // Method signature (for MRO disambiguation)
   parameterCount?: number,
+  // Section-specific (markdown heading level, 1-6)
+  level?: number,
   returnType?: string,
 }
 

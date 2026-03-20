@@ -192,6 +192,19 @@ export const ANNOTATION_SCHEMA = CODE_ELEMENT_BASE('Annotation');
 export const CONSTRUCTOR_SCHEMA = CODE_ELEMENT_BASE('Constructor');
 export const TEMPLATE_SCHEMA = CODE_ELEMENT_BASE('Template');
 export const MODULE_SCHEMA = CODE_ELEMENT_BASE('Module');
+// Markdown heading sections
+export const SECTION_SCHEMA = `
+CREATE NODE TABLE Section (
+  id STRING,
+  name STRING,
+  filePath STRING,
+  startLine INT64,
+  endLine INT64,
+  level INT64,
+  content STRING,
+  description STRING,
+  PRIMARY KEY (id)
+)`;
 
 // ============================================================================
 // RELATION TABLE SCHEMA
@@ -289,6 +302,8 @@ CREATE REL TABLE ${REL_TABLE_NAME} (
   FROM \`Template\` TO Interface,
   FROM \`Template\` TO \`Constructor\`,
   FROM \`Module\` TO \`Module\`,
+  FROM Section TO Section,
+  FROM Section TO File,
   FROM CodeElement TO Community,
   FROM Interface TO Community,
   FROM Interface TO Function,
