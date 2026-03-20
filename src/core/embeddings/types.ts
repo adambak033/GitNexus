@@ -53,7 +53,7 @@ export interface EmbeddingProgress {
  * Configuration for the embedding pipeline
  */
 export interface EmbeddingConfig {
-  /** Model identifier for transformers.js */
+  /** Model identifier for transformers.js (local) or the HTTP endpoint model name */
   modelId: string;
   /** Number of nodes to embed in each batch */
   batchSize: number;
@@ -63,6 +63,30 @@ export interface EmbeddingConfig {
   device: 'auto' | 'dml' | 'cuda' | 'cpu' | 'wasm';
   /** Maximum characters of code snippet to include */
   maxSnippetLength: number;
+}
+
+/**
+ * Configuration for HTTP embedding endpoint (OpenAI-compatible).
+ * Set via environment variables:
+ *   GITNEXUS_EMBEDDING_URL      - Base URL (e.g. http://localhost:8080/v1)
+ *   GITNEXUS_EMBEDDING_MODEL    - Model name (e.g. BAAI/bge-large-en-v1.5)
+ *   GITNEXUS_EMBEDDING_API_KEY  - API key (default: "unused")
+ *   GITNEXUS_EMBEDDING_DIMS     - Dimensions (default: auto-detected from first response)
+ *
+ * Supports any OpenAI-compatible /v1/embeddings endpoint:
+ *   - Self-hosted: Infinity, vLLM, TEI, llama.cpp
+ *   - Cloud: OpenAI, Ollama (remote), LM Studio
+ *   - VPS/Tailscale: any endpoint reachable over the network
+ */
+export interface HttpEmbeddingConfig {
+  /** Base URL for the embedding API (must include /v1) */
+  baseUrl: string;
+  /** Model name to send in the request */
+  model: string;
+  /** API key for authentication */
+  apiKey: string;
+  /** Override dimensions (auto-detected if not set) */
+  dimensions?: number;
 }
 
 /**

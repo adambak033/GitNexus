@@ -18,7 +18,79 @@ import { pipeline, env, type FeatureExtractionPipeline } from '@huggingface/tran
 import { existsSync } from 'fs';
 import { execFileSync } from 'child_process';
 import { join } from 'path';
-import { DEFAULT_EMBEDDING_CONFIG, type EmbeddingConfig, type ModelProgress } from './types.js';
+import { DEFAULT_EMBEDDING_CONFIG, type EmbeddingConfig, type HttpEmbeddingConfig, type ModelProgress } from './types.js';
+
+// ─── HTTP Embedding Backend ───────────────────────────────────────────────────
+// When GITNEXUS_EMBEDDING_URL is set, all embedding calls go to the HTTP
+// endpoint instead of loading a local transformers.js model. This enables:
+//   - Self-hosted servers (Infinity, vLLM, TEI) over Tailscale/VPN
+//   - Higher-quality models (bge-large 1024d vs arctic-xs 384d)
+//   - Shared embedding infrastructure across tools
+
+function getHttpConfig(): HttpEmbeddingConfig | null {
+  const baseUrl = process.env.GITNEXUS_EMBEDDING_URL;
+  const model = process.env.GITNEXUS_EMBEDDING_MODEL;
+  if (!baseUrl || !model) return null;
+  return {
+    baseUrl: baseUrl.replace(/\/+$/, ''),
+    model,
+    apiKey: process.env.GITNEXUS_EMBEDDING_API_KEY ?? 'unused',
+    dimensions: process.env.GITNEXUS_EMBEDDING_DIMS
+      ? parseInt(process.env.GITNEXUS_EMBEDDING_DIMS, 10)
+      : undefined,
+  };
+}
+
+let httpConfig: HttpEmbeddingConfig | null | undefined;
+let httpDimensions: number | null = null;
+
+async function httpEmbed(texts: string[]): Promise<Float32Array[]> {
+  if (httpConfig === undefined) httpConfig = getHttpConfig();
+  if (!httpConfig) throw new Error('HTTP embedding not configured');
+
+  const url = `${httpConfig.baseUrl}/embeddings`;
+  const batchSize = 64;
+  const allVectors: Float32Array[] = [];
+
+  for (let i = 0; i < texts.length; i += batchSize) {
+    const batch = texts.slice(i, i + batchSize);
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${httpConfig.apiKey}`,
+      },
+      body: JSON.stringify({ input: batch, model: httpConfig.model }),
+    });
+
+    if (!resp.ok) {
+      const body = await resp.text();
+      throw new Error(`Embedding endpoint ${resp.status}: ${body}`);
+    }
+
+    const data = (await resp.json()) as {
+      data: Array<{ embedding: number[] }>;
+    };
+
+    for (const item of data.data) {
+      allVectors.push(new Float32Array(item.embedding));
+    }
+
+    // Auto-detect dimensions from first response
+    if (httpDimensions === null && data.data.length > 0) {
+      httpDimensions = data.data[0].embedding.length;
+    }
+  }
+
+  return allVectors;
+}
+
+function isHttpMode(): boolean {
+  if (httpConfig === undefined) httpConfig = getHttpConfig();
+  return httpConfig !== null;
+}
+
+// ─── End HTTP Backend ─────────────────────────────────────────────────────────
 
 /**
  * Check whether CUDA libraries are actually available on this system.
@@ -83,6 +155,12 @@ export const initEmbedder = async (
   config: Partial<EmbeddingConfig> = {},
   forceDevice?: 'dml' | 'cuda' | 'cpu' | 'wasm'
 ): Promise<FeatureExtractionPipeline> => {
+  // HTTP mode: skip local model loading entirely
+  if (isHttpMode()) {
+    // Return a dummy pipeline — embedText/embedBatch bypass it via isHttpMode()
+    return null as unknown as FeatureExtractionPipeline;
+  }
+
   // Return existing instance if available
   if (embedderInstance) {
     return embedderInstance;
@@ -195,7 +273,19 @@ export const initEmbedder = async (
  * Check if the embedder is initialized and ready
  */
 export const isEmbedderReady = (): boolean => {
-  return embedderInstance !== null;
+  return isHttpMode() || embedderInstance !== null;
+};
+
+/**
+ * Get the effective embedding dimensions.
+ * HTTP mode may use different dimensions than the local default.
+ */
+export const getEmbeddingDimensions = (): number => {
+  if (isHttpMode()) {
+    const cfg = getHttpConfig();
+    return cfg?.dimensions ?? httpDimensions ?? DEFAULT_EMBEDDING_CONFIG.dimensions;
+  }
+  return DEFAULT_EMBEDDING_CONFIG.dimensions;
 };
 
 /**
@@ -212,9 +302,14 @@ export const getEmbedder = (): FeatureExtractionPipeline => {
  * Embed a single text string
  * 
  * @param text - Text to embed
- * @returns Float32Array of embedding vector (384 dimensions)
+ * @returns Float32Array of embedding vector
  */
 export const embedText = async (text: string): Promise<Float32Array> => {
+  if (isHttpMode()) {
+    const [vec] = await httpEmbed([text]);
+    return vec;
+  }
+
   const embedder = getEmbedder();
   
   const result = await embedder(text, {
@@ -236,6 +331,10 @@ export const embedText = async (text: string): Promise<Float32Array> => {
 export const embedBatch = async (texts: string[]): Promise<Float32Array[]> => {
   if (texts.length === 0) {
     return [];
+  }
+
+  if (isHttpMode()) {
+    return httpEmbed(texts);
   }
 
   const embedder = getEmbedder();
