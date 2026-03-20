@@ -166,7 +166,7 @@ const TYPE_PRESERVING_METHODS = new Set([
  * Returns null if the call is at module/file level (top-level code).
  */
 const findEnclosingFunction = (
-  node: any,
+  node: SyntaxNode,
   filePath: string,
   ctx: ResolutionContext
 ): string | null => {

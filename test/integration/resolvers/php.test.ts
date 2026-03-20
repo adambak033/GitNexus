@@ -4,7 +4,7 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import path from 'path';
 import {
-  FIXTURES, getRelationships, getNodesByLabel, edgeSet,
+  FIXTURES, CROSS_FILE_FIXTURES, getRelationships, getNodesByLabel, edgeSet,
   runPipelineFromRepo, type PipelineResult,
 } from './helpers.js';
 
@@ -1447,5 +1447,71 @@ describe('PHP grandparent method resolution via MRO (Phase B)', () => {
       c.target === 'greet' && c.targetFilePath.includes('A.php'),
     );
     expect(greetCall).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 14: Cross-file binding propagation
+// Models/UserFactory.php exports function getUser(): User
+// Main.php imports getUser via use function, calls $u = getUser(); $u->save()
+// → $u is typed User via cross-file return type propagation
+// ---------------------------------------------------------------------------
+
+describe('PHP cross-file binding propagation', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(CROSS_FILE_FIXTURES, 'php-cross-file'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User class with save and getName methods', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Method')).toContain('save');
+    expect(getNodesByLabel(result, 'Method')).toContain('getName');
+  });
+
+  it('detects getUser function and Main class with run method', () => {
+    expect(getNodesByLabel(result, 'Function')).toContain('getUser');
+    expect(getNodesByLabel(result, 'Class')).toContain('Main');
+    expect(getNodesByLabel(result, 'Method')).toContain('run');
+  });
+
+  it('emits IMPORTS edge from Main.php to UserFactory.php', () => {
+    const imports = getRelationships(result, 'IMPORTS');
+    const edge = imports.find(e =>
+      e.sourceFilePath.includes('Main') && e.targetFilePath.includes('UserFactory'),
+    );
+    expect(edge).toBeDefined();
+  });
+
+  it('resolves $u->save() in run() to User#save via cross-file return type propagation', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' &&
+      c.source === 'run' &&
+      c.targetFilePath.includes('User.php'),
+    );
+    expect(saveCall).toBeDefined();
+  });
+
+  it('resolves $u->getName() in run() to User#getName via cross-file return type propagation', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const getNameCall = calls.find(c =>
+      c.target === 'getName' &&
+      c.source === 'run' &&
+      c.targetFilePath.includes('User.php'),
+    );
+    expect(getNameCall).toBeDefined();
+  });
+
+  it('emits HAS_METHOD edges linking save and getName to User', () => {
+    const hasMethod = getRelationships(result, 'HAS_METHOD');
+    const saveEdge = hasMethod.find(e => e.source === 'User' && e.target === 'save');
+    const getNameEdge = hasMethod.find(e => e.source === 'User' && e.target === 'getName');
+    expect(saveEdge).toBeDefined();
+    expect(getNameEdge).toBeDefined();
   });
 });

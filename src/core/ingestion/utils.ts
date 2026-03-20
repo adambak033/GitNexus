@@ -260,6 +260,18 @@ export const BUILT_IN_NAMES = new Set([
 /** Check if a name is a built-in function or common noise that should be filtered out */
 export const isBuiltInOrNoise = (name: string): boolean => BUILT_IN_NAMES.has(name);
 
+/** Check if a Kotlin function_declaration capture is inside a class_body (i.e., a method).
+ *  Kotlin grammar uses function_declaration for both top-level functions and class methods.
+ *  Returns true when the captured definition node has a class_body ancestor. */
+export function isKotlinClassMethod(captureNode: { parent?: any } | null | undefined): boolean {
+  let ancestor = captureNode?.parent;
+  while (ancestor) {
+    if (ancestor.type === 'class_body') return true;
+    ancestor = ancestor.parent;
+  }
+  return false;
+}
+
 /** AST node types that represent a class-like container (for HAS_METHOD edge extraction) */
 export const CLASS_CONTAINER_TYPES = new Set([
   'class_declaration', 'abstract_class_declaration',
@@ -461,6 +473,12 @@ export const extractFunctionName = (node: SyntaxNode): { funcName: string | null
         }
       }
       funcName = nameNode?.text;
+
+      // Kotlin: function_declaration inside a class_body is a method, not a top-level function.
+      // Must match the label assigned in parse-worker.ts for consistent generateId() output.
+      if (funcName && node.type === 'function_declaration' && isKotlinClassMethod(node)) {
+        label = 'Method';
+      }
     }
   } else if (node.type === 'impl_item') {
     let funcItem: SyntaxNode | null = null;

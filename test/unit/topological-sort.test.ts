@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { topologicalLevelSort, computeImportCycleSCCs } from '../../src/core/ingestion/pipeline.js';
+import { topologicalLevelSort } from '../../src/core/ingestion/pipeline.js';
 
 describe('topologicalLevelSort', () => {
   it('returns empty levels for empty graph', () => {
@@ -146,82 +146,5 @@ describe('topologicalLevelSort', () => {
     const uniqueFiles = new Set(allFiles);
     expect(uniqueFiles.size).toBe(allFiles.length);
     expect(uniqueFiles.size).toBe(4);
-  });
-});
-
-describe('computeImportCycleSCCs', () => {
-  it('returns no SCCs for empty cycle nodes', () => {
-    const importMap = new Map<string, Set<string>>();
-    const result = computeImportCycleSCCs(importMap, []);
-    expect(result.sccs).toHaveLength(0);
-    expect(result.cycleFiles).toHaveLength(0);
-  });
-
-  it('detects a simple two-node cycle A→B→A as one SCC', () => {
-    const importMap = new Map<string, Set<string>>([
-      ['a.ts', new Set(['b.ts'])],
-      ['b.ts', new Set(['a.ts'])],
-    ]);
-    const result = computeImportCycleSCCs(importMap, ['a.ts', 'b.ts']);
-    expect(result.sccs).toHaveLength(1);
-    expect(result.sccs[0]).toHaveLength(2);
-    expect(result.sccs[0]).toContain('a.ts');
-    expect(result.sccs[0]).toContain('b.ts');
-    expect(result.cycleFiles).toContain('a.ts');
-    expect(result.cycleFiles).toContain('b.ts');
-  });
-
-  it('detects two independent cycles as two SCCs', () => {
-    // A→B→A and C→D→C are separate cycles
-    const importMap = new Map<string, Set<string>>([
-      ['a.ts', new Set(['b.ts'])],
-      ['b.ts', new Set(['a.ts'])],
-      ['c.ts', new Set(['d.ts'])],
-      ['d.ts', new Set(['c.ts'])],
-    ]);
-    const result = computeImportCycleSCCs(importMap, ['a.ts', 'b.ts', 'c.ts', 'd.ts']);
-    expect(result.sccs).toHaveLength(2);
-    const allInSccs = result.sccs.flat();
-    expect(allInSccs).toContain('a.ts');
-    expect(allInSccs).toContain('b.ts');
-    expect(allInSccs).toContain('c.ts');
-    expect(allInSccs).toContain('d.ts');
-  });
-
-  it('filters out single-node components (not true cycles)', () => {
-    // A single node with no self-loop is not an SCC of size ≥2
-    const importMap = new Map<string, Set<string>>([
-      ['a.ts', new Set()],
-    ]);
-    const result = computeImportCycleSCCs(importMap, ['a.ts']);
-    expect(result.sccs).toHaveLength(0);
-    expect(result.cycleFiles).toHaveLength(0);
-  });
-
-  it('detects a three-node cycle A→B→C→A as one SCC alongside an independent two-node cycle', () => {
-    const importMap = new Map<string, Set<string>>([
-      ['a.ts', new Set(['b.ts'])],
-      ['b.ts', new Set(['c.ts'])],
-      ['c.ts', new Set(['a.ts'])],
-      ['d.ts', new Set(['e.ts'])],
-      ['e.ts', new Set(['d.ts'])],
-    ]);
-    const result = computeImportCycleSCCs(importMap, ['a.ts', 'b.ts', 'c.ts', 'd.ts', 'e.ts']);
-    expect(result.sccs).toHaveLength(2);
-    const sizes = result.sccs.map(s => s.length).sort((x, y) => x - y);
-    expect(sizes).toEqual([2, 3]);
-  });
-
-  it('cycleFiles is the union of all SCC members', () => {
-    const importMap = new Map<string, Set<string>>([
-      ['a.ts', new Set(['b.ts'])],
-      ['b.ts', new Set(['a.ts'])],
-      ['c.ts', new Set(['d.ts'])],
-      ['d.ts', new Set(['c.ts'])],
-    ]);
-    const cycleNodes = ['a.ts', 'b.ts', 'c.ts', 'd.ts'];
-    const result = computeImportCycleSCCs(importMap, cycleNodes);
-    expect(new Set(result.cycleFiles)).toEqual(new Set(result.sccs.flat()));
-    expect(result.cycleFiles).toHaveLength(4);
   });
 });

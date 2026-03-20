@@ -31,6 +31,7 @@ import {
   isBuiltInOrNoise,
   getDefinitionNodeFromCaptures,
   findEnclosingClassId,
+  isKotlinClassMethod,
   extractMethodSignature,
   countCallArguments,
   inferCallForm,
@@ -256,7 +257,8 @@ const findEnclosingFunctionId = (node: any, filePath: string): string | null => 
 const getLabelFromCaptures = (captureMap: Record<string, any>): NodeLabel | null => {
   // Skip imports (handled separately) and calls
   if (captureMap['import'] || captureMap['call']) return null;
-  if (!captureMap['name']) return null;
+  // Allow constructors without explicit @name capture (e.g. Swift init) — name synthesized downstream
+  if (!captureMap['name'] && !captureMap['definition.constructor']) return null;
 
   if (captureMap['definition.function']) return 'Function';
   if (captureMap['definition.class']) return 'Class';
@@ -1144,7 +1146,7 @@ const processFileGroup = (
         }
       }
 
-      const nodeLabel = getLabelFromCaptures(captureMap);
+      let nodeLabel = getLabelFromCaptures(captureMap);
       if (!nodeLabel) continue;
 
       // C/C++: @definition.function is broad and also matches inline class methods (inside
@@ -1162,6 +1164,12 @@ const processFileGroup = (
           ancestor = ancestor.parent;
         }
         if (ancestor) continue; // found a class/struct ancestor → skip
+      }
+
+      // Kotlin: function_declaration inside a class_body is a method, not a top-level function.
+      if (language === SupportedLanguages.Kotlin && nodeLabel === 'Function' &&
+          isKotlinClassMethod(captureMap['definition.function'])) {
+        nodeLabel = 'Method';
       }
 
       const nameNode = captureMap['name'];

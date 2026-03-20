@@ -8,6 +8,7 @@ import type { PipelineResult } from '../../../src/types/pipeline.js';
 import type { GraphRelationship } from '../../../src/core/graph/types.js';
 
 export const FIXTURES = path.resolve(__dirname, '..', '..', 'fixtures', 'lang-resolution');
+export const CROSS_FILE_FIXTURES = path.resolve(__dirname, '..', '..', 'fixtures', 'cross-file-binding');
 
 export type RelEdge = {
   source: string;

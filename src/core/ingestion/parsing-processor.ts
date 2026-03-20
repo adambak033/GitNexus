@@ -5,7 +5,7 @@ import { LANGUAGE_QUERIES } from './tree-sitter-queries.js';
 import { generateId } from '../../lib/utils.js';
 import { SymbolTable } from './symbol-table.js';
 import { ASTCache } from './ast-cache.js';
-import { getLanguageFromFilename, yieldToEventLoop, getDefinitionNodeFromCaptures, findEnclosingClassId, extractMethodSignature } from './utils.js';
+import { getLanguageFromFilename, yieldToEventLoop, getDefinitionNodeFromCaptures, findEnclosingClassId, extractMethodSignature, isKotlinClassMethod } from './utils.js';
 import { extractPropertyDeclaredType } from './type-extractors/shared.js';
 import { isNodeExported } from './export-detection.js';
 import { detectFrameworkFromAST } from './framework-detection.js';
@@ -222,7 +222,13 @@ const processParsingSequential = async (
           }
           if (ancestor) return; // inside a class body — handled by @definition.method
         }
-        nodeLabel = 'Function';
+
+        // Kotlin: function_declaration inside a class_body is a method, not a top-level function.
+        if (language === SupportedLanguages.Kotlin &&
+            isKotlinClassMethod(captureMap['definition.function'])) {
+          nodeLabel = 'Method';
+        }
+        if (nodeLabel !== 'Method') nodeLabel = 'Function';
       }
       else if (captureMap['definition.class']) nodeLabel = 'Class';
       else if (captureMap['definition.interface']) nodeLabel = 'Interface';

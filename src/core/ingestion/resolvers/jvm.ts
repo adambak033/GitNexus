@@ -39,26 +39,39 @@ export function resolveJvmWildcard(
     const candidates = extensions.flatMap(ext => index.getFilesInDir(packagePath, ext));
     // Filter to only direct children (no subdirectories)
     const packageSuffix = '/' + packagePath + '/';
+    const packagePrefix = packagePath + '/';
     return candidates.filter(f => {
       const normalized = f.replace(/\\/g, '/');
-      const idx = normalized.indexOf(packageSuffix);
-      if (idx < 0) return false;
-      const afterPkg = normalized.substring(idx + packageSuffix.length);
+      // Match both nested (src/models/User.kt) and root-level (models/User.kt) packages
+      let afterPkg: string;
+      const idx = normalized.lastIndexOf(packageSuffix);
+      if (idx >= 0) {
+        afterPkg = normalized.substring(idx + packageSuffix.length);
+      } else if (normalized.startsWith(packagePrefix)) {
+        afterPkg = normalized.substring(packagePrefix.length);
+      } else {
+        return false;
+      }
       return !afterPkg.includes('/');
     });
   }
 
   // Fallback: linear scan
   const packageSuffix = '/' + packagePath + '/';
+  const packagePrefix = packagePath + '/';
   const matches: string[] = [];
   for (let i = 0; i < normalizedFileList.length; i++) {
     const normalized = normalizedFileList[i];
-    if (normalized.includes(packageSuffix) &&
-        extensions.some(ext => normalized.endsWith(ext))) {
-      const afterPackage = normalized.substring(normalized.indexOf(packageSuffix) + packageSuffix.length);
-      if (!afterPackage.includes('/')) {
-        matches.push(allFileList[i]);
-      }
+    if (!extensions.some(ext => normalized.endsWith(ext))) continue;
+    // Match both nested (src/models/User.kt) and root-level (models/User.kt) packages
+    let afterPackage: string | null = null;
+    if (normalized.includes(packageSuffix)) {
+      afterPackage = normalized.substring(normalized.lastIndexOf(packageSuffix) + packageSuffix.length);
+    } else if (normalized.startsWith(packagePrefix)) {
+      afterPackage = normalized.substring(packagePrefix.length);
+    }
+    if (afterPackage !== null && !afterPackage.includes('/')) {
+      matches.push(allFileList[i]);
     }
   }
   return matches;

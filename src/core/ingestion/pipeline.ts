@@ -80,92 +80,6 @@ export function topologicalLevelSort(
   return levels;
 }
 
-/** Cycle decomposition from Tarjan's SCC algorithm. */
-export interface ImportCycleInfo {
-  /** Strongly connected components, each containing ≥2 files */
-  sccs: readonly (readonly string[])[];
-  /** Files in cycles (flattened sccs — for backward compat) */
-  cycleFiles: readonly string[];
-}
-
-interface TarjanFrame {
-  node: string;
-  neighborIdx: number;
-  neighbors: readonly string[];
-}
-
-/** Decompose cycle files into strongly connected components using iterative Tarjan's.
- *  Runs on the cycle subgraph only (cycle nodes from Kahn's output), not the full graph.
- *  Iterative to avoid stack overflow on large repos (V8 stack limit ~10K-15K frames). */
-export function computeImportCycleSCCs(
-  importMap: ReadonlyMap<string, ReadonlySet<string>>,
-  cycleNodes: readonly string[],
-): ImportCycleInfo {
-  // Build subgraph of only cycle nodes
-  const cycleSet = new Set(cycleNodes);
-  const subgraph = new Map<string, readonly string[]>();
-  for (const node of cycleNodes) {
-    const deps = importMap.get(node);
-    subgraph.set(node, deps ? [...deps].filter(d => cycleSet.has(d)) : []);
-  }
-
-  // Iterative Tarjan's on subgraph
-  const state = new Map<string, { index: number; lowlink: number; onStack: boolean }>();
-  const stack: string[] = [];
-  const sccs: string[][] = [];
-  let nextIndex = 0;
-
-  for (const startNode of subgraph.keys()) {
-    if (state.has(startNode)) continue;
-    const s = { index: nextIndex, lowlink: nextIndex, onStack: true };
-    nextIndex++;
-    state.set(startNode, s);
-    stack.push(startNode);
-    const workStack: TarjanFrame[] = [
-      { node: startNode, neighborIdx: 0, neighbors: subgraph.get(startNode)! },
-    ];
-
-    while (workStack.length > 0) {
-      const frame = workStack[workStack.length - 1];
-      if (frame.neighborIdx < frame.neighbors.length) {
-        const w = frame.neighbors[frame.neighborIdx];
-        frame.neighborIdx++;
-        const wState = state.get(w);
-        if (!wState) {
-          const ws = { index: nextIndex, lowlink: nextIndex, onStack: true };
-          nextIndex++;
-          state.set(w, ws);
-          stack.push(w);
-          workStack.push({ node: w, neighborIdx: 0, neighbors: subgraph.get(w)! });
-        } else if (wState.onStack) {
-          state.get(frame.node)!.lowlink = Math.min(
-            state.get(frame.node)!.lowlink, wState.index,
-          );
-        }
-      } else {
-        workStack.pop();
-        const vState = state.get(frame.node)!;
-        if (workStack.length > 0) {
-          const pState = state.get(workStack[workStack.length - 1].node)!;
-          pState.lowlink = Math.min(pState.lowlink, vState.lowlink);
-        }
-        if (vState.lowlink === vState.index) {
-          const component: string[] = [];
-          let w: string;
-          do { w = stack.pop()!; state.get(w)!.onStack = false; component.push(w); }
-          while (w !== frame.node);
-          if (component.length >= 2) sccs.push(component);
-        }
-      }
-    }
-  }
-
-  return {
-    sccs,
-    cycleFiles: sccs.flat(),
-  };
-}
-
 /** Max bytes of source content to load per parse chunk. Each chunk's source +
  *  parsed ASTs + extracted records + worker serialization overhead all live in
  *  memory simultaneously, so this must be conservative. 20MB source ≈ 200-400MB
@@ -175,10 +89,147 @@ const CHUNK_BYTE_BUDGET = 20 * 1024 * 1024; // 20MB
 /** Max AST trees to keep in LRU cache */
 const AST_CACHE_CAP = 50;
 
-/** Threshold for parallel re-resolution within topological levels.
- *  When more files need re-resolution than this threshold, process in parallel via workers.
- *  Set to Infinity to disable (current default — enable when metrics justify). */
-const PARALLEL_RE_RESOLUTION_THRESHOLD = Infinity;
+/** Minimum percentage of files that must benefit from cross-file seeding to justify the re-resolution pass. */
+const CROSS_FILE_SKIP_THRESHOLD = 0.03;
+/** Hard cap on files re-processed during cross-file propagation. */
+const MAX_CROSS_FILE_REPROCESS = 2000;
+
+/** Phase 14: Cross-file binding propagation.
+ *  Seeds downstream files with resolved type bindings from upstream exports.
+ *  Files are processed in topological import order so upstream bindings are
+ *  available when downstream files are re-resolved. */
+async function runCrossFileBindingPropagation(
+  graph: ReturnType<typeof createKnowledgeGraph>,
+  ctx: ReturnType<typeof createResolutionContext>,
+  exportedTypeMap: ExportedTypeMap,
+  allPaths: string[],
+  totalFiles: number,
+  repoPath: string,
+  pipelineStart: number,
+  onProgress: (progress: PipelineProgress) => void,
+): Promise<void> {
+  // For the worker path, buildTypeEnv runs inside workers without SymbolTable,
+  // so exported bindings must be collected from graph + SymbolTable in main thread.
+  if (exportedTypeMap.size === 0 && graph.nodeCount > 0) {
+    const graphExports = buildExportedTypeMapFromGraph(graph, ctx.symbols);
+    for (const [fp, exports] of graphExports) exportedTypeMap.set(fp, exports);
+  }
+
+  if (exportedTypeMap.size === 0 || ctx.namedImportMap.size === 0) return;
+
+  const allPathSet = new Set(allPaths);
+  const levels = topologicalLevelSort(ctx.importMap);
+
+  // Cycle diagnostic: Kahn's dumps cycle files in the last level (positive in-degree)
+  if (isDev && levels.length > 0) {
+    const lastLevel = levels[levels.length - 1];
+    if (lastLevel.length > 1) {
+      console.log(`🔄 ${lastLevel.length} files in import cycles (skipped for cross-file propagation)`);
+    }
+  }
+
+  // Quick count of files with cross-file binding gaps (early exit once threshold exceeded)
+  let filesWithGaps = 0;
+  const gapThreshold = Math.max(1, Math.ceil(totalFiles * CROSS_FILE_SKIP_THRESHOLD));
+  outer: for (const level of levels) {
+    for (const filePath of level) {
+      const imports = ctx.namedImportMap.get(filePath);
+      if (!imports) continue;
+      for (const [, binding] of imports) {
+        const upstream = exportedTypeMap.get(binding.sourcePath);
+        if (upstream?.has(binding.exportedName)) { filesWithGaps++; break; }
+        const def = ctx.symbols.lookupExactFull(binding.sourcePath, binding.exportedName);
+        if (def?.returnType) { filesWithGaps++; break; }
+      }
+      if (filesWithGaps >= gapThreshold) break outer;
+    }
+  }
+
+  const gapRatio = totalFiles > 0 ? filesWithGaps / totalFiles : 0;
+  if (gapRatio < CROSS_FILE_SKIP_THRESHOLD && filesWithGaps < gapThreshold) {
+    if (isDev) {
+      console.log(`⏭️ Cross-file re-resolution skipped (${filesWithGaps}/${totalFiles} files, ${(gapRatio * 100).toFixed(1)}% < ${CROSS_FILE_SKIP_THRESHOLD * 100}% threshold)`);
+    }
+    return;
+  }
+
+  onProgress({
+    phase: 'parsing',
+    percent: 82,
+    message: `Cross-file type propagation (${filesWithGaps}+ files)...`,
+    stats: { filesProcessed: totalFiles, totalFiles, nodesCreated: graph.nodeCount },
+  });
+
+  let crossFileResolved = 0;
+  const crossFileStart = Date.now();
+  let astCache = createASTCache(AST_CACHE_CAP);
+
+  for (const level of levels) {
+    const levelCandidates: { filePath: string; seeded: Map<string, string>; importedReturns: ReadonlyMap<string, string> }[] = [];
+    for (const filePath of level) {
+      if (crossFileResolved + levelCandidates.length >= MAX_CROSS_FILE_REPROCESS) break;
+      const imports = ctx.namedImportMap.get(filePath);
+      if (!imports) continue;
+
+      const seeded = new Map<string, string>();
+      for (const [localName, binding] of imports) {
+        const upstream = exportedTypeMap.get(binding.sourcePath);
+        if (upstream) {
+          const type = upstream.get(binding.exportedName);
+          if (type) seeded.set(localName, type);
+        }
+      }
+
+      const importedReturns = buildImportedReturnTypes(filePath, ctx.namedImportMap, ctx.symbols);
+      if (seeded.size === 0 && importedReturns.size === 0) continue;
+      if (!allPathSet.has(filePath)) continue;
+
+      const lang = getLanguageFromFilename(filePath);
+      if (!lang || !isLanguageAvailable(lang)) continue;
+
+      levelCandidates.push({ filePath, seeded, importedReturns });
+    }
+
+    if (levelCandidates.length === 0) continue;
+
+    const levelPaths = levelCandidates.map(c => c.filePath);
+    const contentMap = await readFileContents(repoPath, levelPaths);
+
+    for (const { filePath, seeded, importedReturns } of levelCandidates) {
+      const content = contentMap.get(filePath);
+      if (!content) continue;
+
+      const reFile = [{ path: filePath, content }];
+      const bindings = new Map<string, ReadonlyMap<string, string>>();
+      if (seeded.size > 0) bindings.set(filePath, seeded);
+
+      const importedReturnTypesMap = new Map<string, ReadonlyMap<string, string>>();
+      if (importedReturns.size > 0) {
+        importedReturnTypesMap.set(filePath, importedReturns);
+      }
+
+      await processCalls(graph, reFile, astCache, ctx, undefined, exportedTypeMap, bindings.size > 0 ? bindings : undefined, importedReturnTypesMap.size > 0 ? importedReturnTypesMap : undefined);
+      crossFileResolved++;
+    }
+
+    if (crossFileResolved >= MAX_CROSS_FILE_REPROCESS) {
+      if (isDev) console.log(`⚠️ Cross-file re-resolution capped at ${MAX_CROSS_FILE_REPROCESS} files`);
+      break;
+    }
+  }
+
+  astCache.clear();
+
+  if (isDev) {
+    const elapsed = Date.now() - crossFileStart;
+    const totalElapsed = Date.now() - pipelineStart;
+    const reResolutionPct = totalElapsed > 0 ? ((elapsed / totalElapsed) * 100).toFixed(1) : '0';
+    console.log(
+      `🔗 Cross-file re-resolution: ${crossFileResolved} candidates re-processed` +
+      ` in ${elapsed}ms (${reResolutionPct}% of total ingestion time so far)`,
+    );
+  }
+}
 
 export interface PipelineOptions {
   /** Skip MRO, community detection, and process extraction for faster test runs. */
@@ -494,173 +545,15 @@ export const runPipelineFromRepo = async (
     }
 
     // ── Phase 14: Cross-file binding propagation ──────────────────────
-    // Seed downstream files with resolved type bindings from upstream files.
-    // Uses namedImportMap (populated during import processing) to determine
-    // which exported bindings each file needs. Files processed in topological
-    // import order so upstream bindings are available when downstream runs.
-
-    // For the worker path, buildTypeEnv runs inside workers without SymbolTable,
-    // so exported bindings must be collected from graph + SymbolTable in main thread.
-    if (exportedTypeMap.size === 0 && graph.nodeCount > 0) {
-      const graphExports = buildExportedTypeMapFromGraph(graph, ctx.symbols);
-      for (const [fp, exports] of graphExports) exportedTypeMap.set(fp, exports);
-    }
-
-    if (exportedTypeMap.size > 0 && ctx.namedImportMap.size > 0) {
-      const allPathSet = new Set(allPaths);
-      const levels = topologicalLevelSort(ctx.importMap);
-
-      // E2: SCC diagnostics for import cycles (dev-mode only)
-      if (isDev && levels.length > 0) {
-        const lastLevel = levels[levels.length - 1];
-        // Kahn's dumps cycle files in the last level — detect via positive in-degree check
-        // If there are cycle files, decompose into SCCs for diagnostics
-        if (lastLevel.length > 1) {
-          const cycleInfo = computeImportCycleSCCs(ctx.importMap, lastLevel);
-          if (cycleInfo.sccs.length > 0) {
-            console.log(`🔄 Detected ${cycleInfo.sccs.length} import cycle(s) (${cycleInfo.cycleFiles.length} files):`);
-            for (const scc of cycleInfo.sccs.slice(0, 5)) {
-              console.log(`   Cycle (${scc.length} files): ${scc.slice(0, 3).join(', ')}${scc.length > 3 ? '...' : ''}`);
-            }
-            if (cycleInfo.sccs.length > 5) {
-              console.log(`   ... and ${cycleInfo.sccs.length - 5} more cycle(s)`);
-            }
-          }
-        }
-      }
-
-      // Count files that would benefit from cross-file seeding
-      let filesWithGaps = 0;
-      for (const level of levels) {
-        for (const filePath of level) {
-          const imports = ctx.namedImportMap.get(filePath);
-          if (!imports) continue;
-          let hasGap = false;
-          for (const [, binding] of imports) {
-            // E1/E2: upstream file has a matching exported binding for this specific import
-            const upstream = exportedTypeMap.get(binding.sourcePath);
-            if (upstream?.has(binding.exportedName)) { hasGap = true; break; }
-            // E3: upstream callable has a known return type in SymbolTable
-            const def = ctx.symbols.lookupExactFull(binding.sourcePath, binding.exportedName);
-            if (def?.returnType) { hasGap = true; break; }
-          }
-          if (hasGap) filesWithGaps++;
-        }
-      }
-
-      const CROSS_FILE_SKIP_THRESHOLD = 0.03;
-      const gapRatio = totalFiles > 0 ? filesWithGaps / totalFiles : 0;
-
-      if (gapRatio < CROSS_FILE_SKIP_THRESHOLD) {
-        if (isDev) {
-          console.log(`⏭️ Cross-file re-resolution skipped (${filesWithGaps}/${totalFiles} files, ${(gapRatio * 100).toFixed(1)}% < ${CROSS_FILE_SKIP_THRESHOLD * 100}% threshold)`);
-        }
-      } else {
-        onProgress({
-          phase: 'parsing',
-          percent: 82,
-          message: `Cross-file type propagation (${filesWithGaps} files)...`,
-          stats: { filesProcessed: totalFiles, totalFiles, nodesCreated: graph.nodeCount },
-        });
-
-        let crossFileResolved = 0;
-        const crossFileStart = Date.now();
-        const MAX_CROSS_FILE_REPROCESS = 2000;
-        astCache = createASTCache(AST_CACHE_CAP);
-
-        // ── Worker parallelization design (Phase 14 E4, deferred) ──────────
-        // Files within the same topological level have no mutual dependencies
-        // and could be processed in parallel. When PARALLEL_RE_RESOLUTION_THRESHOLD
-        // is set below Infinity, partition level candidates into worker batches:
-        //   1. Serialize ExportedTypeMap snapshot + per-file seeded bindings
-        //   2. Ship to workers via structured clone (Map<string, Map<string, string>> serializes efficiently)
-        //   3. Workers return updated exports → merge into ExportedTypeMap before next level
-        // Gating: implement when re-resolution pass exceeds 20% of total ingestion time.
-        for (const level of levels) {
-          // Batch: collect files needing re-resolution in this level, then read all at once
-          const levelCandidates: { filePath: string; seeded: Map<string, string>; importedReturns: ReadonlyMap<string, string> }[] = [];
-          for (const filePath of level) {
-            if (crossFileResolved + levelCandidates.length >= MAX_CROSS_FILE_REPROCESS) break;
-            const imports = ctx.namedImportMap.get(filePath);
-            if (!imports) continue;
-
-            // Build seeded bindings from upstream ExportedTypeMap
-            const seeded = new Map<string, string>();
-            for (const [localName, binding] of imports) {
-              const upstream = exportedTypeMap.get(binding.sourcePath);
-              if (upstream) {
-                const type = upstream.get(binding.exportedName);
-                if (type) seeded.set(localName, type);
-              }
-            }
-
-            // E3: Build cross-file return types for imported callables
-            const importedReturns = buildImportedReturnTypes(filePath, ctx.namedImportMap, ctx.symbols);
-
-            // Skip if neither variable bindings nor callable return types are available
-            if (seeded.size === 0 && importedReturns.size === 0) continue;
-
-            // Validate path before re-reading (defense-in-depth)
-            if (!allPathSet.has(filePath)) continue;
-
-            const lang = getLanguageFromFilename(filePath);
-            if (!lang || !isLanguageAvailable(lang)) continue;
-
-            levelCandidates.push({ filePath, seeded, importedReturns });
-          }
-
-          if (levelCandidates.length === 0) continue;
-
-          // Batch read all files in this level at once (avoids per-file I/O overhead)
-          const levelPaths = levelCandidates.map(c => c.filePath);
-          const contentMap = await readFileContents(repoPath, levelPaths);
-
-          for (const { filePath, seeded, importedReturns } of levelCandidates) {
-            const content = contentMap.get(filePath);
-            if (!content) continue;
-
-            // Re-parse and re-resolve calls with cross-file seeded type environment
-            // Reuse the level-scoped AST cache (LRU eviction handles capacity)
-            const reFile = [{ path: filePath, content }];
-            const bindings = new Map<string, ReadonlyMap<string, string>>();
-            if (seeded.size > 0) bindings.set(filePath, seeded);
-
-            const importedReturnTypesMap = new Map<string, ReadonlyMap<string, string>>();
-            if (importedReturns.size > 0) {
-              importedReturnTypesMap.set(filePath, importedReturns);
-            }
-
-            await processCalls(graph, reFile, astCache, ctx, undefined, exportedTypeMap, bindings.size > 0 ? bindings : undefined, importedReturnTypesMap.size > 0 ? importedReturnTypesMap : undefined);
-
-            crossFileResolved++;
-          }
-
-          if (crossFileResolved >= MAX_CROSS_FILE_REPROCESS) {
-            if (isDev) console.log(`⚠️ Cross-file re-resolution capped at ${MAX_CROSS_FILE_REPROCESS} files`);
-            break;
-          }
-        }
-        // Clear AST cache after re-resolution pass completes
-        astCache.clear();
-
-        if (isDev) {
-          const elapsed = Date.now() - crossFileStart;
-          const totalElapsed = Date.now() - pipelineStart;
-          const reResolutionPct = totalElapsed > 0 ? ((elapsed / totalElapsed) * 100).toFixed(1) : '0';
-          console.log(
-            `🔗 Cross-file re-resolution: ${crossFileResolved}/${filesWithGaps} candidates re-processed` +
-            ` in ${elapsed}ms (${reResolutionPct}% of total ingestion time so far)`,
-          );
-        }
-      }
-    }
+    await runCrossFileBindingPropagation(
+      graph, ctx, exportedTypeMap, allPaths, totalFiles, repoPath, pipelineStart, onProgress,
+    );
 
     // Free import resolution context — suffix index + resolve cache no longer needed
     // (allPathObjects and importCtx hold ~94MB+ for large repos)
     allPathObjects.length = 0;
     importCtx.resolveCache.clear();
-    (importCtx as any).suffixIndex = null;
-    (importCtx as any).normalizedFileList = null;
+    importCtx.dispose();
 
     let communityResult: Awaited<ReturnType<typeof processCommunities>> | undefined;
     let processResult: Awaited<ReturnType<typeof processProcesses>> | undefined;

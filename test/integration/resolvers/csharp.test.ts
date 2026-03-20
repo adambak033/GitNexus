@@ -4,7 +4,7 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import path from 'path';
 import {
-  FIXTURES, getRelationships, getNodesByLabel, getNodesByLabelFull, edgeSet,
+  FIXTURES, CROSS_FILE_FIXTURES, getRelationships, getNodesByLabel, getNodesByLabelFull, edgeSet,
   runPipelineFromRepo, type PipelineResult,
 } from './helpers.js';
 
@@ -1515,5 +1515,75 @@ describe('C# optional parameter arity resolution', () => {
     const calls = getRelationships(result, 'CALLS');
     const greetCalls = calls.filter(c => c.source === 'Main' && c.target === 'Greet');
     expect(greetCalls.length).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 14: Cross-file binding propagation
+// Models/UserFactory.cs exports static GetUser() returning User
+// App/Program.cs uses static import, calls var u = GetUser(); u.Save()
+// → u is typed User via cross-file return type propagation
+// ---------------------------------------------------------------------------
+
+describe('C# cross-file binding propagation', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(CROSS_FILE_FIXTURES, 'csharp-cross-file'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User class with Save and GetName methods', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Method')).toContain('Save');
+    expect(getNodesByLabel(result, 'Method')).toContain('GetName');
+  });
+
+  it('detects UserFactory class with GetUser method', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('UserFactory');
+    expect(getNodesByLabel(result, 'Method')).toContain('GetUser');
+  });
+
+  it('detects Program class with Run method', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('Program');
+    expect(getNodesByLabel(result, 'Method')).toContain('Run');
+  });
+
+  it('emits IMPORTS edge from Program.cs to UserFactory.cs', () => {
+    const imports = getRelationships(result, 'IMPORTS');
+    const edge = imports.find(e =>
+      e.sourceFilePath.includes('Program') && e.targetFilePath.includes('UserFactory'),
+    );
+    expect(edge).toBeDefined();
+  });
+
+  it('resolves u.Save() in Run() to User#Save via cross-file return type propagation', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'Save' &&
+      c.source === 'Run' &&
+      c.targetFilePath.includes('User.cs'),
+    );
+    expect(saveCall).toBeDefined();
+  });
+
+  it('resolves u.GetName() in Run() to User#GetName via cross-file return type propagation', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const getNameCall = calls.find(c =>
+      c.target === 'GetName' &&
+      c.source === 'Run' &&
+      c.targetFilePath.includes('User.cs'),
+    );
+    expect(getNameCall).toBeDefined();
+  });
+
+  it('emits HAS_METHOD edges linking Save and GetName to User', () => {
+    const hasMethod = getRelationships(result, 'HAS_METHOD');
+    const saveEdge = hasMethod.find(e => e.source === 'User' && e.target === 'Save');
+    const getNameEdge = hasMethod.find(e => e.source === 'User' && e.target === 'GetName');
+    expect(saveEdge).toBeDefined();
+    expect(getNameEdge).toBeDefined();
   });
 });

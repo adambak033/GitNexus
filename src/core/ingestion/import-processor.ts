@@ -89,8 +89,10 @@ export interface ImportResolutionContext {
   allFilePaths: Set<string>;
   allFileList: string[];
   normalizedFileList: string[];
-  suffixIndex: SuffixIndex;
+  suffixIndex: SuffixIndex | null;
   resolveCache: Map<string, string | null>;
+  /** Release heavyweight fields (suffix index, file lists) to free memory after import resolution. */
+  dispose(): void;
 }
 
 export function buildImportResolutionContext(allPaths: string[]): ImportResolutionContext {
@@ -98,7 +100,15 @@ export function buildImportResolutionContext(allPaths: string[]): ImportResoluti
   const normalizedFileList = allFileList.map(p => p.replace(/\\/g, '/'));
   const allFilePaths = new Set(allFileList);
   const suffixIndex = buildSuffixIndex(normalizedFileList, allFileList);
-  return { allFilePaths, allFileList, normalizedFileList, suffixIndex, resolveCache: new Map() };
+  const ctx: ImportResolutionContext = {
+    allFilePaths, allFileList, normalizedFileList, suffixIndex, resolveCache: new Map(),
+    dispose() {
+      ctx.suffixIndex = null;
+      ctx.normalizedFileList = [];
+      ctx.resolveCache.clear();
+    },
+  };
+  return ctx;
 }
 
 // Config loaders extracted to ./language-config.ts (Phase 2 refactor)
@@ -169,6 +179,23 @@ function resolveLanguageImport(
         memberResolved = resolveJvmMemberImport(rawImportPath, normalizedFileList, allFileList, ['.java'], index);
       }
       if (memberResolved) return { kind: 'files', files: [memberResolved] };
+
+      // Kotlin: top-level function imports (e.g. import models.getUser) have only 2 segments,
+      // which resolveJvmMemberImport skips (requires ≥3). Fall back to package-directory scan
+      // for lowercase last segments (function/property imports). Uppercase last segments
+      // (class imports like models.User) fall through to standard suffix resolution.
+      if (language === SupportedLanguages.Kotlin) {
+        const segments = rawImportPath.split('.');
+        const lastSeg = segments[segments.length - 1];
+        if (segments.length >= 2 && lastSeg[0] && lastSeg[0] === lastSeg[0].toLowerCase()) {
+          const pkgWildcard = segments.slice(0, -1).join('.') + '.*';
+          let dirFiles = resolveJvmWildcard(pkgWildcard, normalizedFileList, allFileList, exts, index);
+          if (dirFiles.length === 0) {
+            dirFiles = resolveJvmWildcard(pkgWildcard, normalizedFileList, allFileList, ['.java'], index);
+          }
+          if (dirFiles.length > 0) return { kind: 'files', files: dirFiles };
+        }
+      }
       // Fall through to standard resolution
     }
   }
