@@ -458,12 +458,14 @@ export const executeQuery = async (repoId: string, cypher: string): Promise<any[
   entry.lastUsed = Date.now();
 
   const conn = await checkout(entry);
+  silenceStdout();
   try {
     const queryResult = await withTimeout(conn.query(cypher), QUERY_TIMEOUT_MS, 'Query');
     const result = Array.isArray(queryResult) ? queryResult[0] : queryResult;
     const rows = await result.getAll();
     return rows;
   } finally {
+    restoreStdout();
     checkin(entry, conn);
   }
 };
@@ -485,6 +487,7 @@ export const executeParameterized = async (
   entry.lastUsed = Date.now();
 
   const conn = await checkout(entry);
+  silenceStdout();
   try {
     const stmt = await withTimeout(conn.prepare(cypher), QUERY_TIMEOUT_MS, 'Prepare');
     if (!stmt.isSuccess()) {
@@ -496,6 +499,7 @@ export const executeParameterized = async (
     const rows = await result.getAll();
     return rows;
   } finally {
+    restoreStdout();
     checkin(entry, conn);
   }
 };

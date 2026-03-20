@@ -246,11 +246,29 @@ export class LocalBackend {
   // ─── Lazy LadybugDB Init ────────────────────────────────────────────
 
   private async ensureInitialized(repoId: string): Promise<void> {
-    // Always check the actual pool — the idle timer may have evicted the connection
-    if (this.initializedRepos.has(repoId) && isLbugReady(repoId)) return;
-
     const handle = this.repos.get(repoId);
     if (!handle) throw new Error(`Unknown repo: ${repoId}`);
+
+    // Check if the index was rebuilt since we opened the connection (#297).
+    // Read meta.json's indexedAt and compare to the cached value — if it
+    // changed, close the stale pool and re-initialize with the fresh index.
+    if (this.initializedRepos.has(repoId) && isLbugReady(repoId)) {
+      try {
+        const metaPath = path.join(handle.storagePath, 'meta.json');
+        const metaRaw = await fs.readFile(metaPath, 'utf-8');
+        const meta = JSON.parse(metaRaw);
+        if (meta.indexedAt && meta.indexedAt !== handle.indexedAt) {
+          // Index was rebuilt — close stale connection and re-init
+          await closeLbug(repoId);
+          this.initializedRepos.delete(repoId);
+          handle.indexedAt = meta.indexedAt;
+        } else {
+          return; // Pool is current
+        }
+      } catch {
+        return; // Can't read meta — assume pool is fine
+      }
+    }
 
     try {
       await initLbug(repoId, handle.lbugPath);
@@ -1438,31 +1456,36 @@ export class LocalBackend {
     let affectedModules: any[] = [];
 
     if (impacted.length > 0) {
-      const allIds = impacted.map(i => `'${i.id.replace(/'/g, "''")}'`).join(', ');
-      const d1Ids = (grouped[1] || []).map((i: any) => `'${i.id.replace(/'/g, "''")}'`).join(', ');
+      // Cap IN-clause to 100 IDs to prevent oversized queries that crash
+      // the native DB engine on arm64 macOS (#292)
+      const cappedImpacted = impacted.slice(0, 100);
+      const allIds = cappedImpacted.map(i => `'${i.id.replace(/'/g, "''")}'`).join(', ');
+      const d1Items = (grouped[1] || []).slice(0, 100);
+      const d1Ids = d1Items.map((i: any) => `'${i.id.replace(/'/g, "''")}'`).join(', ');
 
-      // Affected processes: which execution flows are broken and at which step
-      const [processRows, moduleRows, directModuleRows] = await Promise.all([
-        executeQuery(repo.id, `
-          MATCH (s)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
-          WHERE s.id IN [${allIds}]
-          RETURN p.heuristicLabel AS name, COUNT(DISTINCT s.id) AS hits, MIN(r.step) AS minStep, p.stepCount AS stepCount
-          ORDER BY hits DESC
-          LIMIT 20
-        `).catch(() => []),
-        executeQuery(repo.id, `
-          MATCH (s)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
-          WHERE s.id IN [${allIds}]
-          RETURN c.heuristicLabel AS name, COUNT(DISTINCT s.id) AS hits
-          ORDER BY hits DESC
-          LIMIT 20
-        `).catch(() => []),
-        d1Ids ? executeQuery(repo.id, `
-          MATCH (s)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
-          WHERE s.id IN [${d1Ids}]
-          RETURN DISTINCT c.heuristicLabel AS name
-        `).catch(() => []) : Promise.resolve([]),
-      ]);
+      // Run enrichment queries sequentially to avoid concurrent native DB
+      // access that causes SIGSEGV on arm64 macOS (#285, #290, #292)
+      const processRows = await executeQuery(repo.id, `
+        MATCH (s)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
+        WHERE s.id IN [${allIds}]
+        RETURN p.heuristicLabel AS name, COUNT(DISTINCT s.id) AS hits, MIN(r.step) AS minStep, p.stepCount AS stepCount
+        ORDER BY hits DESC
+        LIMIT 20
+      `).catch(() => []);
+      const moduleRows = await executeQuery(repo.id, `
+        MATCH (s)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
+        WHERE s.id IN [${allIds}]
+        RETURN c.heuristicLabel AS name, COUNT(DISTINCT s.id) AS hits
+        ORDER BY hits DESC
+        LIMIT 20
+      `).catch(() => []);
+      const directModuleRows = d1Ids
+        ? await executeQuery(repo.id, `
+            MATCH (s)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
+            WHERE s.id IN [${d1Ids}]
+            RETURN DISTINCT c.heuristicLabel AS name
+          `).catch(() => [])
+        : [];
 
       affectedProcesses = processRows.map((r: any) => ({
         name: r.name || r[0],
