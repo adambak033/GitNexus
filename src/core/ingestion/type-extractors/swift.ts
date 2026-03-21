@@ -1,5 +1,5 @@
 import type { SyntaxNode } from '../utils.js';
-import type { LanguageTypeConfig, ParameterExtractor, TypeBindingExtractor, InitializerExtractor, ClassNameLookup, ConstructorBindingScanner } from './types.js';
+import type { LanguageTypeConfig, ParameterExtractor, TypeBindingExtractor, InitializerExtractor, ClassNameLookup, ConstructorBindingScanner, PendingAssignmentExtractor, PendingAssignment } from './types.js';
 import { extractSimpleTypeName, extractVarName, hasTypeAnnotation } from './shared.js';
 import { findChild } from '../resolvers/utils.js';
 
@@ -119,10 +119,90 @@ const scanConstructorBinding: ConstructorBindingScanner = (node) => {
   return undefined;
 };
 
+/**
+ * Swift: extract pending assignments for Tier 2 return-type propagation.
+ * Handles:
+ *   let user = getUser()           → callResult
+ *   let result = user.save()       → methodCallResult
+ *   let name = user.name           → fieldAccess
+ *   let copy = user                → copy
+ */
+const extractPendingAssignment: PendingAssignmentExtractor = (node, scopeEnv) => {
+  if (node.type !== 'property_declaration') return undefined;
+  // Skip if type annotation exists — extractDeclaration handles it
+  if (hasTypeAnnotation(node)) return undefined;
+
+  // Find the variable name from the pattern child
+  let lhs: string | undefined;
+  for (let i = 0; i < node.namedChildCount; i++) {
+    const child = node.namedChild(i);
+    if (child?.type === 'pattern') {
+      lhs = child.text;
+      break;
+    }
+  }
+  if (!lhs || scopeEnv.has(lhs)) return undefined;
+
+  // Find the value expression (last meaningful named child after pattern)
+  let valueNode: SyntaxNode | null = null;
+  for (let i = node.namedChildCount - 1; i >= 0; i--) {
+    const child = node.namedChild(i);
+    if (!child) continue;
+    if (child.type === 'pattern' || child.type === 'value_binding_pattern' || child.type === 'type_annotation') continue;
+    valueNode = child;
+    break;
+  }
+  if (!valueNode) return undefined;
+
+  // let copy = user → copy
+  if (valueNode.type === 'simple_identifier') {
+    return { kind: 'copy', lhs, rhs: valueNode.text };
+  }
+
+  // let name = user.name → fieldAccess
+  if (valueNode.type === 'navigation_expression') {
+    const receiver = valueNode.firstNamedChild;
+    const suffix = valueNode.lastNamedChild;
+    if (receiver?.type === 'simple_identifier' && suffix?.type === 'navigation_suffix') {
+      const field = suffix.lastNamedChild;
+      if (field?.type === 'simple_identifier') {
+        return { kind: 'fieldAccess', lhs, receiver: receiver.text, field: field.text };
+      }
+    }
+    return undefined;
+  }
+
+  // Call expressions
+  if (valueNode.type === 'call_expression') {
+    const callee = valueNode.firstNamedChild;
+    if (!callee) return undefined;
+
+    // let user = getUser() → callResult
+    if (callee.type === 'simple_identifier') {
+      return { kind: 'callResult', lhs, callee: callee.text };
+    }
+
+    // let result = user.save() → methodCallResult
+    if (callee.type === 'navigation_expression') {
+      const receiver = callee.firstNamedChild;
+      const suffix = callee.lastNamedChild;
+      if (receiver?.type === 'simple_identifier' && suffix?.type === 'navigation_suffix') {
+        const method = suffix.lastNamedChild;
+        if (method?.type === 'simple_identifier') {
+          return { kind: 'methodCallResult', lhs, receiver: receiver.text, method: method.text };
+        }
+      }
+    }
+  }
+
+  return undefined;
+};
+
 export const typeConfig: LanguageTypeConfig = {
   declarationNodeTypes: DECLARATION_NODE_TYPES,
   extractDeclaration,
   extractParameter,
   extractInitializer,
   scanConstructorBinding,
+  extractPendingAssignment,
 };
