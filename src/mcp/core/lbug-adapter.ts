@@ -148,6 +148,8 @@ function closeOne(repoId: string): void {
  * Create a new Connection from a repo's Database.
  * Silences stdout to prevent native module output from corrupting MCP stdio.
  */
+let activeQueryCount = 0;
+
 function silenceStdout(): void {
   if (stdoutSilenceCount++ === 0) {
     process.stdout.write = (() => true) as any;
@@ -163,8 +165,10 @@ function restoreStdout(): void {
 
 // Safety watchdog: restore stdout if it gets stuck silenced (e.g. native crash
 // inside createConnection before restoreStdout runs).
+// Exempts active queries and pre-warm — these legitimately hold silence for
+// longer than 1 second (queries can take up to QUERY_TIMEOUT_MS = 30s).
 setInterval(() => {
-  if (stdoutSilenceCount > 0 && !preWarmActive) {
+  if (stdoutSilenceCount > 0 && !preWarmActive && activeQueryCount === 0) {
     stdoutSilenceCount = 0;
     process.stdout.write = realStdoutWrite;
   }
@@ -458,12 +462,16 @@ export const executeQuery = async (repoId: string, cypher: string): Promise<any[
   entry.lastUsed = Date.now();
 
   const conn = await checkout(entry);
+  silenceStdout();
+  activeQueryCount++;
   try {
     const queryResult = await withTimeout(conn.query(cypher), QUERY_TIMEOUT_MS, 'Query');
     const result = Array.isArray(queryResult) ? queryResult[0] : queryResult;
     const rows = await result.getAll();
     return rows;
   } finally {
+    activeQueryCount--;
+    restoreStdout();
     checkin(entry, conn);
   }
 };
@@ -485,6 +493,8 @@ export const executeParameterized = async (
   entry.lastUsed = Date.now();
 
   const conn = await checkout(entry);
+  silenceStdout();
+  activeQueryCount++;
   try {
     const stmt = await withTimeout(conn.prepare(cypher), QUERY_TIMEOUT_MS, 'Prepare');
     if (!stmt.isSuccess()) {
@@ -496,6 +506,8 @@ export const executeParameterized = async (
     const rows = await result.getAll();
     return rows;
   } finally {
+    activeQueryCount--;
+    restoreStdout();
     checkin(entry, conn);
   }
 };
