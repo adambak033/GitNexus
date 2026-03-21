@@ -22,17 +22,24 @@ import { createRequire } from 'module';
 import { DEFAULT_EMBEDDING_CONFIG, type EmbeddingConfig, type ModelProgress } from './types.js';
 
 /**
- * Check whether the onnxruntime-node package ships the CUDA execution provider.
- * Versions before 1.24.0 are CPU-only and do not include libonnxruntime_providers_cuda.so.
- * Attempting CUDA on those versions causes an uncatchable native crash.
+ * Check whether the onnxruntime-node package that @huggingface/transformers
+ * will actually load at runtime ships the CUDA execution provider.
+ *
+ * Critical: we resolve from transformers' own module scope, NOT from ours.
+ * npm may install two copies — a top-level 1.24.x (our dep) and a nested
+ * 1.21.0 (transformers' pinned dep). The guard must inspect whichever copy
+ * transformers.js will dlopen, otherwise the check is meaningless.
  */
 function hasOrtCudaProvider(): boolean {
   try {
     const require = createRequire(import.meta.url);
-    const ortPath = dirname(require.resolve('onnxruntime-node/package.json'));
-    // Check both napi-v6 (>=1.24) and napi-v3 (<=1.21) layouts
-    return existsSync(join(ortPath, 'bin', 'napi-v6', 'linux', 'x64', 'libonnxruntime_providers_cuda.so')) ||
-           existsSync(join(ortPath, 'bin', 'napi-v3', 'linux', 'x64', 'libonnxruntime_providers_cuda.so'));
+    // Resolve from @huggingface/transformers' scope so we find the same
+    // onnxruntime-node binary that transformers.js will use at runtime
+    const transformersDir = dirname(require.resolve('@huggingface/transformers/package.json'));
+    const ortRequire = createRequire(join(transformersDir, 'package.json'));
+    const ortPath = dirname(ortRequire.resolve('onnxruntime-node/package.json'));
+    const arch = process.arch; // x64, arm64, etc.
+    return existsSync(join(ortPath, 'bin', 'napi-v6', 'linux', arch, 'libonnxruntime_providers_cuda.so'));
   } catch {
     return false;
   }
