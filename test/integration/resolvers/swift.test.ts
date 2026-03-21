@@ -224,3 +224,157 @@ describe.skipIf(!swiftAvailable)('Swift return-type inference via function retur
     expect(saveCall).toBeDefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Implicit imports: Swift files in the same module see each other without
+// explicit import statements. This is the foundation of all cross-file
+// resolution — without addSwiftImplicitImports, Tier 2a lookups fail.
+// ---------------------------------------------------------------------------
+
+describe.skipIf(!swiftAvailable)('Swift implicit imports (cross-file visibility)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'swift-implicit-imports'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects UserService class in Models.swift', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('UserService');
+  });
+
+  it('resolves UserService() constructor call across files (no explicit import)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const ctorCall = calls.find(c =>
+      c.target === 'UserService' && c.targetFilePath === 'Models.swift',
+    );
+    expect(ctorCall).toBeDefined();
+  });
+
+  it('resolves service.fetchUser() member call across files', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const memberCall = calls.find(c =>
+      c.target === 'fetchUser' && c.targetFilePath === 'Models.swift',
+    );
+    expect(memberCall).toBeDefined();
+  });
+
+  it('creates IMPORTS edges between files in the same module', () => {
+    const imports = getRelationships(result, 'IMPORTS');
+    const crossFileImport = imports.find(c =>
+      (c.sourceFilePath === 'App.swift' && c.targetFilePath === 'Models.swift')
+      || (c.sourceFilePath === 'Models.swift' && c.targetFilePath === 'App.swift'),
+    );
+    expect(crossFileImport).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Extension deduplication: Swift extensions create multiple Class nodes
+// with the same name. The resolver should deduplicate and prefer the
+// primary definition (shortest file path).
+// ---------------------------------------------------------------------------
+
+describe.skipIf(!swiftAvailable)('Swift extension deduplication', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'swift-extension-dedup'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects Product class', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('Product');
+  });
+
+  it('resolves Product() constructor despite extension creating duplicate class node', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const ctorCall = calls.find(c =>
+      c.target === 'Product' && c.source === 'process',
+    );
+    expect(ctorCall).toBeDefined();
+  });
+
+  it('resolves product.save() to Product.swift (primary definition)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'process' && c.targetFilePath === 'Product.swift',
+    );
+    expect(saveCall).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Constructor fallback: Swift constructors look like free function calls
+// (no `new` keyword). The resolver retries with constructor form when
+// free-form finds no callable but the name resolves to a Class/Struct.
+// ---------------------------------------------------------------------------
+
+describe.skipIf(!swiftAvailable)('Swift constructor call fallback (no new keyword)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'swift-constructor-fallback'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves OCRService() as constructor call across files', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const ctorCall = calls.find(c =>
+      c.target === 'OCRService' && c.targetFilePath === 'Service.swift',
+    );
+    expect(ctorCall).toBeDefined();
+  });
+
+  it('resolves ocr.recognize() member call via constructor-inferred type', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const memberCall = calls.find(c =>
+      c.target === 'recognize' && c.targetFilePath === 'Service.swift',
+    );
+    expect(memberCall).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Export visibility: internal (default) symbols are cross-file visible,
+// private/fileprivate are not. Verifies the export detection inversion.
+// ---------------------------------------------------------------------------
+
+describe.skipIf(!swiftAvailable)('Swift export visibility (internal vs private)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'swift-export-visibility'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves PublicService() constructor across files', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const ctorCall = calls.find(c =>
+      c.target === 'PublicService' && c.targetFilePath === 'Visible.swift',
+    );
+    expect(ctorCall).toBeDefined();
+  });
+
+  it('resolves internalHelper() across files (internal = module-scoped)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const helperCall = calls.find(c =>
+      c.target === 'internalHelper' && c.targetFilePath === 'Visible.swift',
+    );
+    expect(helperCall).toBeDefined();
+  });
+
+  // NOTE: private/fileprivate symbols are marked as unexported, which prevents
+  // Tier 2a (import-scoped) resolution. However, Tier 3 (global) still resolves
+  // them — export filtering at global scope is a separate enhancement.
+  // These tests verify the symbols ARE marked correctly in export detection
+  // (covered by parsing.test.ts mock tests), not end-to-end call blocking.
+});
