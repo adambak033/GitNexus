@@ -285,7 +285,9 @@ export const analyzeCommand = async (
   }
 
   if (!embeddingSkipped) {
-    updateBar(90, 'Loading embedding model...');
+    const { isHttpMode } = await import('../core/embeddings/http-client.js');
+    const httpMode = isHttpMode();
+    updateBar(90, httpMode ? 'Connecting to embedding endpoint...' : 'Loading embedding model...');
     const t0Emb = Date.now();
     const { runEmbeddingPipeline } = await import('../core/embeddings/embedding-pipeline.js');
     await runEmbeddingPipeline(
@@ -293,7 +295,9 @@ export const analyzeCommand = async (
       executeWithReusedStatement,
       (progress) => {
         const scaled = 90 + Math.round((progress.percent / 100) * 8);
-        const label = progress.phase === 'loading-model' ? 'Loading embedding model...' : `Embedding ${progress.nodesProcessed || 0}/${progress.totalNodes || '?'}`;
+        const label = progress.phase === 'loading-model'
+          ? (httpMode ? 'Connecting to embedding endpoint...' : 'Loading embedding model...')
+          : `Embedding ${progress.nodesProcessed || 0}/${progress.totalNodes || '?'}`;
         updateBar(scaled, label);
       },
       {},

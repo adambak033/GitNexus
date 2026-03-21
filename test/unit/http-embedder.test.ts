@@ -212,6 +212,56 @@ describe('HTTP embedding backend', () => {
       delete process.env.GITNEXUS_EMBEDDING_URL;
       delete process.env.GITNEXUS_EMBEDDING_MODEL;
     });
+
+    it('throws on empty response from endpoint', async () => {
+      process.env.GITNEXUS_EMBEDDING_URL = 'http://test:8080/v1';
+      process.env.GITNEXUS_EMBEDDING_MODEL = 'test-model';
+
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ data: [] }),
+      }));
+
+      const mod = await import('../../src/mcp/core/embedder.js');
+      await expect(mod.embedQuery('test')).rejects.toThrow('empty response');
+
+      delete process.env.GITNEXUS_EMBEDDING_URL;
+      delete process.env.GITNEXUS_EMBEDDING_MODEL;
+    });
+
+    it('throws when endpoint returns fewer embeddings than texts', async () => {
+      process.env.GITNEXUS_EMBEDDING_URL = 'http://test:8080/v1';
+      process.env.GITNEXUS_EMBEDDING_MODEL = 'test-model';
+
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ data: [{ embedding: [0.1] }] }),
+      }));
+
+      const { embedBatch } = await import('../../src/core/embeddings/embedder.js');
+      await expect(embedBatch(['text1', 'text2', 'text3'])).rejects.toThrow('1 vectors for 3 texts');
+
+      delete process.env.GITNEXUS_EMBEDDING_URL;
+      delete process.env.GITNEXUS_EMBEDDING_MODEL;
+    });
+
+    it('throws on dimension mismatch when GITNEXUS_EMBEDDING_DIMS is set', async () => {
+      process.env.GITNEXUS_EMBEDDING_URL = 'http://test:8080/v1';
+      process.env.GITNEXUS_EMBEDDING_MODEL = 'test-model';
+      process.env.GITNEXUS_EMBEDDING_DIMS = '512';
+
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ data: [{ embedding: [0.1, 0.2, 0.3] }] }),
+      }));
+
+      const { embedText } = await import('../../src/core/embeddings/embedder.js');
+      await expect(embedText('test')).rejects.toThrow('Embedding dimension mismatch');
+
+      delete process.env.GITNEXUS_EMBEDDING_URL;
+      delete process.env.GITNEXUS_EMBEDDING_MODEL;
+      delete process.env.GITNEXUS_EMBEDDING_DIMS;
+    });
   });
 
   describe('schema dimensions', () => {

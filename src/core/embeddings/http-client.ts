@@ -133,8 +133,6 @@ const httpEmbedBatch = async (
   return data.data;
 };
 
-let dimsMismatchWarned = false;
-
 /**
  * Embed texts via the HTTP backend, splitting into batches.
  * Reads config from env vars on every call.
@@ -156,20 +154,28 @@ export const httpEmbed = async (texts: string[]): Promise<Float32Array[]> => {
     const batchIndex = Math.floor(i / HTTP_BATCH_SIZE);
     const items = await httpEmbedBatch(url, batch, config.model, config.apiKey, batchIndex);
 
+    if (items.length !== batch.length) {
+      throw new Error(
+        `Embedding endpoint returned ${items.length} vectors for ${batch.length} texts ` +
+        `(${safeUrl(url)}, batch ${batchIndex})`,
+      );
+    }
+
     for (const item of items) {
       allVectors.push(new Float32Array(item.embedding));
     }
   }
 
-  // Warn once if the API returned a different dimension than configured
-  if (config.dimensions && allVectors.length > 0 && !dimsMismatchWarned) {
+  // Fail fast if the API returned vectors with unexpected dimensions —
+  // inserting them into the FLOAT[N] column would cause a cryptic Kuzu error.
+  if (config.dimensions && allVectors.length > 0) {
     const actual = allVectors[0].length;
     if (actual !== config.dimensions) {
-      console.warn(
-        `⚠️  HTTP embeddings returned ${actual}d vectors, expected ${config.dimensions}d (GITNEXUS_EMBEDDING_DIMS). ` +
-        `Update GITNEXUS_EMBEDDING_DIMS to match your model.`,
+      throw new Error(
+        `Embedding dimension mismatch: endpoint returned ${actual}d vectors, ` +
+        `but GITNEXUS_EMBEDDING_DIMS is set to ${config.dimensions}. ` +
+        `Update GITNEXUS_EMBEDDING_DIMS to match your model output.`,
       );
-      dimsMismatchWarned = true;
     }
   }
 
@@ -189,5 +195,8 @@ export const httpEmbedQuery = async (text: string): Promise<number[]> => {
 
   const url = `${config.baseUrl}/embeddings`;
   const items = await httpEmbedBatch(url, [text], config.model, config.apiKey);
+  if (!items.length) {
+    throw new Error(`Embedding endpoint returned empty response (${safeUrl(url)})`);
+  }
   return items[0].embedding;
 };
