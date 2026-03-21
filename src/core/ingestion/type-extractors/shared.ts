@@ -497,15 +497,6 @@ export const extractCalleeName = (callNode: SyntaxNode): string | undefined => {
   return extractSimpleTypeName(func);
 };
 
-/** Find the first named child with the given node type */
-export const findChildByType = (node: SyntaxNode, type: string): SyntaxNode | null => {
-  for (let i = 0; i < node.namedChildCount; i++) {
-    const child = node.namedChild(i);
-    if (child?.type === type) return child;
-  }
-  return null;
-};
-
 // Internal helper: extract the first comma-separated argument from a string,
 // respecting nested angle-bracket and square-bracket depth.
 function extractFirstArg(args: string): string {

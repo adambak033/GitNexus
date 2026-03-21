@@ -1515,3 +1515,53 @@ describe('PHP cross-file binding propagation', () => {
     expect(getNameEdge).toBeDefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// PHP use function / use const filtering (P0-3 fix)
+// Verifies that `use function` and `use const` declarations do NOT produce
+// class-type namedImportMap entries, while regular `use` class imports still work.
+// ---------------------------------------------------------------------------
+
+describe('PHP use function / use const filtering', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'php-use-function-const'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User class with save and getName methods', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Method')).toContain('save');
+    expect(getNodesByLabel(result, 'Method')).toContain('getName');
+  });
+
+  it('detects Calculator class with process method', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('Calculator');
+    expect(getNodesByLabel(result, 'Method')).toContain('process');
+  });
+
+  it('detects formatName as a standalone function (not a class)', () => {
+    expect(getNodesByLabel(result, 'Function')).toContain('formatName');
+    // formatName should NOT appear as a Class
+    expect(getNodesByLabel(result, 'Class')).not.toContain('formatName');
+  });
+
+  it('emits IMPORTS edge from Calculator.php to User.php (class import)', () => {
+    const imports = getRelationships(result, 'IMPORTS');
+    const edge = imports.find(e =>
+      e.sourceFilePath.includes('Calculator') && e.targetFilePath.includes('User'),
+    );
+    expect(edge).toBeDefined();
+  });
+
+  it('resolves $user->save() to User#save via class import binding', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'process' && c.targetFilePath.includes('User'),
+    );
+    expect(saveCall).toBeDefined();
+  });
+});

@@ -140,6 +140,11 @@ describe('detectFrameworkFromPath', () => {
       expect(result).not.toBeNull();
       expect(result!.entryPointMultiplier).toBe(3.0);
     });
+
+    it('does NOT treat Go helper files under cmd/ as entry points', () => {
+      expect(detectFrameworkFromPath('cmd/server/internal/util.go')).toBeNull();
+      expect(detectFrameworkFromPath('cmd/foo/config/setup.go')).toBeNull();
+    });
   });
 
   describe('Rust frameworks', () => {

@@ -8,7 +8,7 @@
  * Follows the existing ExportChecker / CallRouter pattern:
  *   - Function aliases (not interfaces) to avoid megamorphic inline-cache issues
  *   - `satisfies Record<SupportedLanguages, ...>` for compile-time exhaustiveness
- *   - Factory function that closes over per-language configs at build time
+ *   - Const dispatch table — configs are accessed via ctx.configs at call time
  */
 
 import { SupportedLanguages } from '../../config/supported-languages.js';
@@ -45,6 +45,7 @@ import {
   extractCsharpNamedBindings,
   extractJavaNamedBindings,
 } from './named-binding-extraction.js';
+import type { ImportResolutionContext } from './import-processor.js';
 
 // ============================================================================
 // Types
@@ -61,6 +62,20 @@ export type ImportResult =
   | { kind: 'package'; files: string[]; dirSuffix: string }
   | null;
 
+/** Bundled language-specific configs loaded once per ingestion run. */
+export interface ImportConfigs {
+  tsconfigPaths: TsconfigPaths | null;
+  goModule: GoModuleConfig | null;
+  composerConfig: ComposerConfig | null;
+  swiftPackageConfig: SwiftPackageConfig | null;
+  csharpConfigs: CSharpProjectConfig[];
+}
+
+/** Full context for import resolution: file lookups + language configs. */
+export interface ResolveCtx extends ImportResolutionContext {
+  configs: ImportConfigs;
+}
+
 /** Per-language import resolver -- function alias matching ExportChecker/CallRouter pattern. */
 export type ImportResolverFn = (
   rawImportPath: string,
@@ -73,24 +88,6 @@ export interface NamedBinding { local: string; exported: string }
 
 /** Per-language named binding extractor -- optional (returns undefined if language has no named imports). */
 type NamedBindingExtractorFn = (importNode: SyntaxNode) => NamedBinding[] | undefined;
-
-/** Bundled language-specific configs loaded once per ingestion run. */
-export interface ImportConfigs {
-  tsconfigPaths: TsconfigPaths | null;
-  goModule: GoModuleConfig | null;
-  composerConfig: ComposerConfig | null;
-  swiftPackageConfig: SwiftPackageConfig | null;
-  csharpConfigs: CSharpProjectConfig[];
-}
-
-/** Context for import path resolution — narrowed from ImportResolutionContext with non-null index. */
-export interface ResolveCtx {
-  allFilePaths: Set<string>;
-  allFileList: string[];
-  normalizedFileList: string[];
-  index: SuffixIndex;
-  resolveCache: Map<string, string | null>;
-}
 
 // ============================================================================
 // Import path preprocessing
@@ -105,10 +102,10 @@ export function preprocessImportPath(
   sourceText: string,
   importNode: SyntaxNode,
   language: SupportedLanguages,
-): string {
+): string | null {
   const cleaned = sourceText.replace(/['"<>]/g, '');
   // Defense-in-depth: reject null bytes and control characters (matches Ruby call-routing pattern)
-  if (!cleaned || cleaned.length > 2048 || /[\x00-\x1f]/.test(cleaned)) return '';
+  if (!cleaned || cleaned.length > 2048 || /[\x00-\x1f]/.test(cleaned)) return null;
   if (language === SupportedLanguages.Kotlin) {
     return appendKotlinWildcard(cleaned, importNode);
   }
@@ -128,7 +125,6 @@ function resolveStandard(
   filePath: string,
   ctx: ResolveCtx,
   language: SupportedLanguages,
-  tsconfigPaths: TsconfigPaths | null,
 ): ImportResult {
   const resolvedPath = resolveImportPath(
     filePath,
@@ -138,7 +134,7 @@ function resolveStandard(
     ctx.normalizedFileList,
     ctx.resolveCache,
     language,
-    tsconfigPaths,
+    ctx.configs.tsconfigPaths,
     ctx.index,
   );
   return resolvedPath ? { kind: 'files', files: [resolvedPath] } : null;
@@ -149,7 +145,6 @@ function resolveJavaImport(
   rawImportPath: string,
   filePath: string,
   ctx: ResolveCtx,
-  tsconfigPaths: TsconfigPaths | null,
 ): ImportResult {
   if (rawImportPath.endsWith('.*')) {
     const matchedFiles = resolveJvmWildcard(rawImportPath, ctx.normalizedFileList, ctx.allFileList, ['.java'], ctx.index);
@@ -158,7 +153,7 @@ function resolveJavaImport(
     const memberResolved = resolveJvmMemberImport(rawImportPath, ctx.normalizedFileList, ctx.allFileList, ['.java'], ctx.index);
     if (memberResolved) return { kind: 'files', files: [memberResolved] };
   }
-  return resolveStandard(rawImportPath, filePath, ctx, SupportedLanguages.Java, tsconfigPaths);
+  return resolveStandard(rawImportPath, filePath, ctx, SupportedLanguages.Java);
 }
 
 /**
@@ -169,7 +164,6 @@ function resolveKotlinImport(
   rawImportPath: string,
   filePath: string,
   ctx: ResolveCtx,
-  tsconfigPaths: TsconfigPaths | null,
 ): ImportResult {
   if (rawImportPath.endsWith('.*')) {
     const matchedFiles = resolveJvmWildcard(rawImportPath, ctx.normalizedFileList, ctx.allFileList, KOTLIN_EXTENSIONS, ctx.index);
@@ -200,7 +194,7 @@ function resolveKotlinImport(
       if (dirFiles.length > 0) return { kind: 'files', files: dirFiles };
     }
   }
-  return resolveStandard(rawImportPath, filePath, ctx, SupportedLanguages.Kotlin, tsconfigPaths);
+  return resolveStandard(rawImportPath, filePath, ctx, SupportedLanguages.Kotlin);
 }
 
 /** Go: package-level imports via go.mod module path. */
@@ -208,9 +202,8 @@ function resolveGoImport(
   rawImportPath: string,
   filePath: string,
   ctx: ResolveCtx,
-  goModule: GoModuleConfig | null,
-  tsconfigPaths: TsconfigPaths | null,
 ): ImportResult {
+  const goModule = ctx.configs.goModule;
   if (goModule && rawImportPath.startsWith(goModule.modulePath)) {
     const pkgSuffix = resolveGoPackageDir(rawImportPath, goModule);
     if (pkgSuffix) {
@@ -221,16 +214,16 @@ function resolveGoImport(
     }
     // Fall through if no files found (package might be external)
   }
-  return resolveStandard(rawImportPath, filePath, ctx, SupportedLanguages.Go, tsconfigPaths);
+  return resolveStandard(rawImportPath, filePath, ctx, SupportedLanguages.Go);
 }
 
-/** C#: namespace-based resolution via .csproj configs. */
+/** C#: namespace-based resolution via .csproj configs, with suffix-match fallback. */
 function resolveCSharpImportDispatch(
   rawImportPath: string,
-  _filePath: string,
+  filePath: string,
   ctx: ResolveCtx,
-  csharpConfigs: CSharpProjectConfig[],
 ): ImportResult {
+  const csharpConfigs = ctx.configs.csharpConfigs;
   if (csharpConfigs.length > 0) {
     const resolvedFiles = resolveCSharpImportHelper(rawImportPath, csharpConfigs, ctx.normalizedFileList, ctx.allFileList, ctx.index);
     if (resolvedFiles.length > 1) {
@@ -241,7 +234,7 @@ function resolveCSharpImportDispatch(
     }
     if (resolvedFiles.length > 0) return { kind: 'files', files: resolvedFiles };
   }
-  return null;
+  return resolveStandard(rawImportPath, filePath, ctx, SupportedLanguages.CSharp);
 }
 
 /** PHP: namespace-based resolution via composer.json PSR-4. */
@@ -249,9 +242,8 @@ function resolvePhpImportDispatch(
   rawImportPath: string,
   _filePath: string,
   ctx: ResolveCtx,
-  composerConfig: ComposerConfig | null,
 ): ImportResult {
-  const resolved = resolvePhpImportHelper(rawImportPath, composerConfig, ctx.allFilePaths, ctx.normalizedFileList, ctx.allFileList, ctx.index);
+  const resolved = resolvePhpImportHelper(rawImportPath, ctx.configs.composerConfig, ctx.allFilePaths, ctx.normalizedFileList, ctx.allFileList, ctx.index);
   return resolved ? { kind: 'files', files: [resolved] } : null;
 }
 
@@ -260,8 +252,8 @@ function resolveSwiftImportDispatch(
   rawImportPath: string,
   _filePath: string,
   ctx: ResolveCtx,
-  swiftPackageConfig: SwiftPackageConfig | null,
 ): ImportResult {
+  const swiftPackageConfig = ctx.configs.swiftPackageConfig;
   if (swiftPackageConfig) {
     const targetDir = swiftPackageConfig.targets.get(rawImportPath);
     if (targetDir) {
@@ -286,12 +278,11 @@ function resolvePythonImportDispatch(
   rawImportPath: string,
   filePath: string,
   ctx: ResolveCtx,
-  tsconfigPaths: TsconfigPaths | null,
 ): ImportResult {
   const resolved = resolvePythonImportHelper(filePath, rawImportPath, ctx.allFilePaths);
   if (resolved) return { kind: 'files', files: [resolved] };
   if (rawImportPath.startsWith('.')) return null; // relative but unresolved -- don't suffix-match
-  return resolveStandard(rawImportPath, filePath, ctx, SupportedLanguages.Python, tsconfigPaths);
+  return resolveStandard(rawImportPath, filePath, ctx, SupportedLanguages.Python);
 }
 
 /** Ruby: require / require_relative. */
@@ -304,13 +295,13 @@ function resolveRubyImportDispatch(
   return resolved ? { kind: 'files', files: [resolved] } : null;
 }
 
-/** Rust: expand top-level grouped imports: use {crate::a, crate::b}. */
+/** Rust: expand grouped imports: use {crate::a, crate::b} and use crate::models::{User, Repo}. */
 function resolveRustImportDispatch(
   rawImportPath: string,
   filePath: string,
   ctx: ResolveCtx,
-  tsconfigPaths: TsconfigPaths | null,
 ): ImportResult {
+  // Top-level grouped: use {crate::a, crate::b}
   if (rawImportPath.startsWith('{') && rawImportPath.endsWith('}')) {
     const inner = rawImportPath.slice(1, -1);
     const parts = inner.split(',').map(p => p.trim()).filter(Boolean);
@@ -321,7 +312,27 @@ function resolveRustImportDispatch(
     }
     return resolved.length > 0 ? { kind: 'files', files: resolved } : null;
   }
-  return resolveStandard(rawImportPath, filePath, ctx, SupportedLanguages.Rust, tsconfigPaths);
+
+  // Scoped grouped: use crate::models::{User, Repo}
+  const braceIdx = rawImportPath.indexOf('::{');
+  if (braceIdx !== -1 && rawImportPath.endsWith('}')) {
+    const pathPrefix = rawImportPath.substring(0, braceIdx);
+    const braceContent = rawImportPath.substring(braceIdx + 3, rawImportPath.length - 1);
+    const items = braceContent.split(',').map(s => s.trim()).filter(Boolean);
+    const resolved: string[] = [];
+    for (const item of items) {
+      // Handle `use crate::models::{User, Repo as R}` — strip alias for resolution
+      const itemName = item.includes(' as ') ? item.split(' as ')[0].trim() : item;
+      const r = resolveRustImportHelper(filePath, `${pathPrefix}::${itemName}`, ctx.allFilePaths);
+      if (r) resolved.push(r);
+    }
+    if (resolved.length > 0) return { kind: 'files', files: resolved };
+    // Fallback: resolve the prefix path itself (e.g. crate::models -> models.rs)
+    const prefixResult = resolveRustImportHelper(filePath, pathPrefix, ctx.allFilePaths);
+    if (prefixResult) return { kind: 'files', files: [prefixResult] };
+  }
+
+  return resolveStandard(rawImportPath, filePath, ctx, SupportedLanguages.Rust);
 }
 
 // ============================================================================
@@ -329,29 +340,26 @@ function resolveRustImportDispatch(
 // ============================================================================
 
 /**
- * Build the import resolver dispatch table with per-language configs closed over at construction time.
- * Each resolver function encapsulates the full resolution flow for its language, including
+ * Per-language import resolver dispatch table.
+ * Configs are accessed via ctx.configs at call time — no factory closure needed.
+ * Each resolver encapsulates the full resolution flow for its language, including
  * fallthrough to standard resolution where appropriate.
  */
-export function buildImportResolvers(configs: ImportConfigs): Record<SupportedLanguages, ImportResolverFn> {
-  const { tsconfigPaths, goModule, composerConfig, swiftPackageConfig, csharpConfigs } = configs;
-
-  return {
-    [SupportedLanguages.JavaScript]: (raw, fp, ctx) => resolveStandard(raw, fp, ctx, SupportedLanguages.JavaScript, tsconfigPaths),
-    [SupportedLanguages.TypeScript]: (raw, fp, ctx) => resolveStandard(raw, fp, ctx, SupportedLanguages.TypeScript, tsconfigPaths),
-    [SupportedLanguages.Python]: (raw, fp, ctx) => resolvePythonImportDispatch(raw, fp, ctx, tsconfigPaths),
-    [SupportedLanguages.Java]: (raw, fp, ctx) => resolveJavaImport(raw, fp, ctx, tsconfigPaths),
-    [SupportedLanguages.C]: (raw, fp, ctx) => resolveStandard(raw, fp, ctx, SupportedLanguages.C, tsconfigPaths),
-    [SupportedLanguages.CPlusPlus]: (raw, fp, ctx) => resolveStandard(raw, fp, ctx, SupportedLanguages.CPlusPlus, tsconfigPaths),
-    [SupportedLanguages.CSharp]: (raw, fp, ctx) => resolveCSharpImportDispatch(raw, fp, ctx, csharpConfigs),
-    [SupportedLanguages.Go]: (raw, fp, ctx) => resolveGoImport(raw, fp, ctx, goModule, tsconfigPaths),
-    [SupportedLanguages.Ruby]: (raw, fp, ctx) => resolveRubyImportDispatch(raw, fp, ctx),
-    [SupportedLanguages.Rust]: (raw, fp, ctx) => resolveRustImportDispatch(raw, fp, ctx, tsconfigPaths),
-    [SupportedLanguages.PHP]: (raw, fp, ctx) => resolvePhpImportDispatch(raw, fp, ctx, composerConfig),
-    [SupportedLanguages.Kotlin]: (raw, fp, ctx) => resolveKotlinImport(raw, fp, ctx, tsconfigPaths),
-    [SupportedLanguages.Swift]: (raw, fp, ctx) => resolveSwiftImportDispatch(raw, fp, ctx, swiftPackageConfig),
-  } satisfies Record<SupportedLanguages, ImportResolverFn>;
-}
+export const importResolvers = {
+  [SupportedLanguages.JavaScript]: (raw, fp, ctx) => resolveStandard(raw, fp, ctx, SupportedLanguages.JavaScript),
+  [SupportedLanguages.TypeScript]: (raw, fp, ctx) => resolveStandard(raw, fp, ctx, SupportedLanguages.TypeScript),
+  [SupportedLanguages.Python]: (raw, fp, ctx) => resolvePythonImportDispatch(raw, fp, ctx),
+  [SupportedLanguages.Java]: (raw, fp, ctx) => resolveJavaImport(raw, fp, ctx),
+  [SupportedLanguages.C]: (raw, fp, ctx) => resolveStandard(raw, fp, ctx, SupportedLanguages.C),
+  [SupportedLanguages.CPlusPlus]: (raw, fp, ctx) => resolveStandard(raw, fp, ctx, SupportedLanguages.CPlusPlus),
+  [SupportedLanguages.CSharp]: (raw, fp, ctx) => resolveCSharpImportDispatch(raw, fp, ctx),
+  [SupportedLanguages.Go]: (raw, fp, ctx) => resolveGoImport(raw, fp, ctx),
+  [SupportedLanguages.Ruby]: (raw, fp, ctx) => resolveRubyImportDispatch(raw, fp, ctx),
+  [SupportedLanguages.Rust]: (raw, fp, ctx) => resolveRustImportDispatch(raw, fp, ctx),
+  [SupportedLanguages.PHP]: (raw, fp, ctx) => resolvePhpImportDispatch(raw, fp, ctx),
+  [SupportedLanguages.Kotlin]: (raw, fp, ctx) => resolveKotlinImport(raw, fp, ctx),
+  [SupportedLanguages.Swift]: (raw, fp, ctx) => resolveSwiftImportDispatch(raw, fp, ctx),
+} satisfies Record<SupportedLanguages, ImportResolverFn>;
 
 /**
  * Per-language named binding extractor dispatch table.

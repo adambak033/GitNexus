@@ -11,14 +11,8 @@ import { loadImportConfigs } from './language-config.js';
 import { buildSuffixIndex } from './resolvers/index.js';
 import { callRouters } from './call-routing.js';
 import type { ResolutionContext } from './resolution-context.js';
-import type {
-  SuffixIndex,
-  TsconfigPaths,
-  GoModuleConfig,
-  CSharpProjectConfig,
-  ComposerConfig
-} from './resolvers/index.js';
-import { buildImportResolvers, namedBindingExtractors, preprocessImportPath } from './import-resolution.js';
+import type { SuffixIndex } from './resolvers/index.js';
+import { importResolvers, namedBindingExtractors, preprocessImportPath } from './import-resolution.js';
 import type { ImportResult, ResolveCtx, NamedBinding } from './import-resolution.js';
 
 // Re-export resolver types for consumers
@@ -138,17 +132,39 @@ function applyImportResult(
     // If the same local name is imported from multiple files (e.g., Java static imports
     // of overloaded methods), remove the entry so resolution falls through to Tier 2a
     // import-scoped which sees all candidates and can apply arity narrowing.
-    if (namedBindings && namedImportMap && files.length === 1) {
-      const resolvedFile = files[0];
+    if (namedBindings && namedImportMap) {
       if (!namedImportMap.has(filePath)) namedImportMap.set(filePath, new Map());
       const fileBindings = namedImportMap.get(filePath)!;
-      for (const binding of namedBindings) {
-        const existing = fileBindings.get(binding.local);
-        if (existing && existing.sourcePath !== resolvedFile) {
-          // Ambiguous: same name imported from different files — remove to fall through
-          fileBindings.delete(binding.local);
-        } else {
-          fileBindings.set(binding.local, { sourcePath: resolvedFile, exportedName: binding.exported });
+
+      if (files.length === 1) {
+        const resolvedFile = files[0];
+        for (const binding of namedBindings) {
+          const existing = fileBindings.get(binding.local);
+          if (existing && existing.sourcePath !== resolvedFile) {
+            fileBindings.delete(binding.local);
+          } else {
+            fileBindings.set(binding.local, { sourcePath: resolvedFile, exportedName: binding.exported });
+          }
+        }
+      } else {
+        // Multi-file resolution (e.g., Rust `use crate::models::{User, Repo}`).
+        // Match each binding to a resolved file by comparing the lowercase binding name
+        // to the file's basename (without extension). If no match, skip the binding.
+        for (const binding of namedBindings) {
+          const lowerName = binding.exported.toLowerCase();
+          const matchedFile = files.find(f => {
+            const base = f.replace(/\\/g, '/').split('/').pop() ?? '';
+            const nameWithoutExt = base.substring(0, base.lastIndexOf('.')).toLowerCase();
+            return nameWithoutExt === lowerName;
+          });
+          if (matchedFile) {
+            const existing = fileBindings.get(binding.local);
+            if (existing && existing.sourcePath !== matchedFile) {
+              fileBindings.delete(binding.local);
+            } else {
+              fileBindings.set(binding.local, { sourcePath: matchedFile, exportedName: binding.exported });
+            }
+          }
         }
       }
     }
@@ -188,8 +204,7 @@ export const processImports = async (
 
   // Load language-specific configs once before the file loop
   const configs = await loadImportConfigs(repoRoot || '');
-  const importResolvers = buildImportResolvers(configs);
-  const resolveCtx: ResolveCtx = { allFilePaths, allFileList, normalizedFileList, index, resolveCache };
+  const resolveCtx: ResolveCtx = { allFilePaths, allFileList, normalizedFileList, index, resolveCache, configs };
   const { addImportEdge, addImportGraphEdge, getResolvedCount } = createImportEdgeHelpers(graph, importMap);
 
   for (let i = 0; i < files.length; i++) {
@@ -264,6 +279,7 @@ export const processImports = async (
         }
 
         const rawImportPath = preprocessImportPath(sourceNode.text, captureMap['import'], language);
+        if (!rawImportPath) return;
         totalImportsFound++;
 
         const result = importResolvers[language](rawImportPath, file.path, resolveCtx);
@@ -325,8 +341,7 @@ export const processImportsFromExtracted = async (
   let totalImportsFound = 0;
 
   const configs = await loadImportConfigs(repoRoot || '');
-  const importResolvers = buildImportResolvers(configs);
-  const resolveCtx: ResolveCtx = { allFilePaths, allFileList, normalizedFileList, index, resolveCache };
+  const resolveCtx: ResolveCtx = { allFilePaths, allFileList, normalizedFileList, index, resolveCache, configs };
   const { addImportEdge, addImportGraphEdge, getResolvedCount } = createImportEdgeHelpers(graph, importMap);
 
   // Group by file for progress reporting (users see file count, not import count)

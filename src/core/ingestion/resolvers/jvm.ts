@@ -4,6 +4,7 @@
  */
 
 import type { SuffixIndex } from './utils.js';
+import type { SyntaxNode } from '../utils.js';
 
 /** Kotlin file extensions for JVM resolver reuse */
 export const KOTLIN_EXTENSIONS: readonly string[] = ['.kt', '.kts'];
@@ -12,7 +13,7 @@ export const KOTLIN_EXTENSIONS: readonly string[] = ['.kt', '.kts'];
  * Append .* to a Kotlin import path if the AST has a wildcard_import sibling node.
  * Pure function — returns a new string without mutating the input.
  */
-export const appendKotlinWildcard = (importPath: string, importNode: any): string => {
+export const appendKotlinWildcard = (importPath: string, importNode: SyntaxNode): string => {
   for (let i = 0; i < importNode.childCount; i++) {
     if (importNode.child(i)?.type === 'wildcard_import') {
       return importPath.endsWith('.*') ? importPath : `${importPath}.*`;

@@ -409,6 +409,54 @@ describe('Rust grouped import resolution', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Scoped grouped imports with multi-file resolution:
+// use crate::models::{User, Repo} where User and Repo are in separate files.
+// Verifies IMPORTS edges are created for each file AND namedImportMap entries
+// match bindings to files by basename.
+// ---------------------------------------------------------------------------
+
+describe('Rust scoped grouped imports (multi-file)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'rust-scoped-multi-file'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo structs', () => {
+    const classes = getNodesByLabel(result, 'Struct');
+    expect(classes).toContain('User');
+    expect(classes).toContain('Repo');
+  });
+
+  it('emits IMPORTS edge from main.rs to models/mod.rs', () => {
+    const imports = getRelationships(result, 'IMPORTS');
+    const edge = imports.find(e =>
+      e.sourceFilePath.includes('main') && e.targetFilePath.includes('models'),
+    );
+    expect(edge).toBeDefined();
+  });
+
+  it('resolves user.save() call to User#save in models/user.rs', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'main' && c.targetFilePath.includes('user'),
+    );
+    expect(saveCall).toBeDefined();
+  });
+
+  it('resolves repo.clone_repo() call to Repo#clone_repo in models/repo.rs', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const cloneCall = calls.find(c =>
+      c.target === 'clone_repo' && c.source === 'main' && c.targetFilePath.includes('repo'),
+    );
+    expect(cloneCall).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Constructor-inferred type resolution: let user = User::new(); user.save()
 // Rust scoped_identifier constructor pattern (no explicit type annotations)
 // ---------------------------------------------------------------------------

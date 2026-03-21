@@ -236,8 +236,8 @@ export function detectFrameworkFromPath(filePath: string): FrameworkHint | null 
     return { framework: 'go-mvc', entryPointMultiplier: 2.5, reason: 'go-controller' };
   }
   
-  // Go main.go files (THE entry point)
-  if (p.endsWith('/main.go') || (p.includes('/cmd/') && p.endsWith('.go'))) {
+  // Go main.go files (THE entry point) — only match main.go, not arbitrary .go files under cmd/
+  if (p.endsWith('/main.go')) {
     return { framework: 'go', entryPointMultiplier: 3.0, reason: 'go-main' };
   }
   
@@ -451,7 +451,7 @@ export const FRAMEWORK_AST_PATTERNS = {
   'tokio': ['#[tokio::main]', '#[tokio::test]'],
 
   // C++ patterns (Qt, Boost)
-  'qt': ['Q_OBJECT', 'Q_INVOKABLE', 'Q_PROPERTY', 'Q_SIGNAL', 'Q_SLOT', 'QWidget', 'QApplication'],
+  'qt': ['Q_OBJECT', 'Q_INVOKABLE', 'Q_PROPERTY', 'Q_SIGNALS', 'Q_SLOTS', 'Q_SIGNAL', 'Q_SLOT', 'QWidget', 'QApplication'],
 
   // Swift/iOS
   'uikit': ['viewDidLoad', 'viewWillAppear', 'viewDidAppear', 'UIViewController', '@IBOutlet', '@IBAction', '@objc'],

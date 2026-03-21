@@ -1,6 +1,7 @@
 import type { SyntaxNode } from '../utils.js';
 import type { LanguageTypeConfig, ParameterExtractor, TypeBindingExtractor, InitializerExtractor, ClassNameLookup, ConstructorBindingScanner, ForLoopExtractor, PendingAssignmentExtractor, PatternBindingExtractor, LiteralTypeInferrer, ConstructorTypeDetector } from './types.js';
-import { extractSimpleTypeName, extractVarName, findChildByType, extractGenericTypeArgs, resolveIterableElementType, methodToTypeArgPosition, extractElementTypeFromString, type TypeArgPosition } from './shared.js';
+import { extractSimpleTypeName, extractVarName, extractGenericTypeArgs, resolveIterableElementType, methodToTypeArgPosition, extractElementTypeFromString, type TypeArgPosition } from './shared.js';
+import { findChild } from '../resolvers/utils.js';
 
 // ── Java ──────────────────────────────────────────────────────────────────
 
@@ -73,7 +74,7 @@ const scanJavaConstructorBinding: ConstructorBindingScanner = (node) => {
   const typeNode = node.childForFieldName('type');
   if (!typeNode) return undefined;
   if (typeNode.text !== 'var') return undefined;
-  const declarator = findChildByType(node, 'variable_declarator');
+  const declarator = findChild(node, 'variable_declarator');
   if (!declarator) return undefined;
   const nameNode = declarator.childForFieldName('name');
   const value = declarator.childForFieldName('value');
@@ -325,11 +326,11 @@ const KOTLIN_DECLARATION_NODE_TYPES: ReadonlySet<string> = new Set([
 const extractKotlinDeclaration: TypeBindingExtractor = (node: SyntaxNode, env: Map<string, string>): void => {
   if (node.type === 'property_declaration') {
     // Kotlin property_declaration: name/type are inside a variable_declaration child
-    const varDecl = findChildByType(node, 'variable_declaration');
+    const varDecl = findChild(node, 'variable_declaration');
     if (varDecl) {
-      const nameNode = findChildByType(varDecl, 'simple_identifier');
-      const typeNode = findChildByType(varDecl, 'user_type')
-        ?? findChildByType(varDecl, 'nullable_type');
+      const nameNode = findChild(varDecl, 'simple_identifier');
+      const typeNode = findChild(varDecl, 'user_type')
+        ?? findChild(varDecl, 'nullable_type');
       if (!nameNode || !typeNode) return;
       const varName = extractVarName(nameNode);
       const typeName = extractSimpleTypeName(typeNode);
@@ -338,17 +339,17 @@ const extractKotlinDeclaration: TypeBindingExtractor = (node: SyntaxNode, env: M
     }
     // Fallback: try direct fields
     const nameNode = node.childForFieldName('name')
-      ?? findChildByType(node, 'simple_identifier');
+      ?? findChild(node, 'simple_identifier');
     const typeNode = node.childForFieldName('type')
-      ?? findChildByType(node, 'user_type');
+      ?? findChild(node, 'user_type');
     if (!nameNode || !typeNode) return;
     const varName = extractVarName(nameNode);
     const typeName = extractSimpleTypeName(typeNode);
     if (varName && typeName) env.set(varName, typeName);
   } else if (node.type === 'variable_declaration') {
     // variable_declaration directly inside functions
-    const nameNode = findChildByType(node, 'simple_identifier');
-    const typeNode = findChildByType(node, 'user_type');
+    const nameNode = findChild(node, 'simple_identifier');
+    const typeNode = findChild(node, 'user_type');
     if (nameNode && typeNode) {
       const varName = extractVarName(nameNode);
       const typeName = extractSimpleTypeName(typeNode);
@@ -360,7 +361,7 @@ const extractKotlinDeclaration: TypeBindingExtractor = (node: SyntaxNode, env: M
 /** Kotlin: parameter / formal_parameter → type name.
  *  Kotlin's tree-sitter grammar uses positional children (simple_identifier, user_type)
  *  rather than named fields (name, type) on `parameter` nodes, so we fall back to
- *  findChildByType when childForFieldName returns null. */
+ *  findChild when childForFieldName returns null. */
 const extractKotlinParameter: ParameterExtractor = (node: SyntaxNode, env: Map<string, string>): void => {
   let nameNode: SyntaxNode | null = null;
   let typeNode: SyntaxNode | null = null;
@@ -374,9 +375,9 @@ const extractKotlinParameter: ParameterExtractor = (node: SyntaxNode, env: Map<s
   }
 
   // Fallback: Kotlin `parameter` nodes use positional children, not named fields
-  if (!nameNode) nameNode = findChildByType(node, 'simple_identifier');
-  if (!typeNode) typeNode = findChildByType(node, 'user_type')
-    ?? findChildByType(node, 'nullable_type');
+  if (!nameNode) nameNode = findChild(node, 'simple_identifier');
+  if (!typeNode) typeNode = findChild(node, 'user_type')
+    ?? findChild(node, 'nullable_type');
 
   if (!nameNode || !typeNode) return;
   const varName = extractVarName(nameNode);
@@ -389,7 +390,7 @@ const extractKotlinParameter: ParameterExtractor = (node: SyntaxNode, env: Map<s
 const findKotlinConstructorCallee = (node: SyntaxNode, classNames: ClassNameLookup): string | undefined => {
   if (node.type !== 'property_declaration') return undefined;
   const value = node.childForFieldName('value')
-    ?? findChildByType(node, 'call_expression');
+    ?? findChild(node, 'call_expression');
   if (!value || value.type !== 'call_expression') return undefined;
   const callee = value.firstNamedChild;
   if (!callee || callee.type !== 'simple_identifier') return undefined;
@@ -403,16 +404,16 @@ const findKotlinConstructorCallee = (node: SyntaxNode, classNames: ClassNameLook
  *  against classNames (which may include cross-file SymbolTable lookups). */
 const extractKotlinInitializer: InitializerExtractor = (node: SyntaxNode, env: Map<string, string>, classNames: ClassNameLookup): void => {
   // Skip if there's an explicit type annotation — Tier 0 already handled it
-  const varDecl = findChildByType(node, 'variable_declaration');
-  if (varDecl && findChildByType(varDecl, 'user_type')) return;
+  const varDecl = findChild(node, 'variable_declaration');
+  if (varDecl && findChild(varDecl, 'user_type')) return;
 
   const calleeName = findKotlinConstructorCallee(node, classNames);
   if (!calleeName) return;
 
   // Extract the variable name from the variable_declaration inside property_declaration
   const nameNode = varDecl
-    ? findChildByType(varDecl, 'simple_identifier')
-    : findChildByType(node, 'simple_identifier');
+    ? findChild(varDecl, 'simple_identifier')
+    : findChild(node, 'simple_identifier');
   if (!nameNode) return;
 
   const varName = extractVarName(nameNode);
@@ -430,10 +431,10 @@ const detectKotlinConstructorType: ConstructorTypeDetector = (node, classNames) 
 /** Kotlin: val x = User(...) — constructor binding for property_declaration with call_expression */
 const scanKotlinConstructorBinding: ConstructorBindingScanner = (node) => {
   if (node.type !== 'property_declaration') return undefined;
-  const varDecl = findChildByType(node, 'variable_declaration');
+  const varDecl = findChild(node, 'variable_declaration');
   if (!varDecl) return undefined;
-  if (findChildByType(varDecl, 'user_type')) return undefined;
-  const callExpr = findChildByType(node, 'call_expression');
+  if (findChild(varDecl, 'user_type')) return undefined;
+  const callExpr = findChild(node, 'call_expression');
   if (!callExpr) return undefined;
   const callee = callExpr.firstNamedChild;
   if (!callee) return undefined;
@@ -452,7 +453,7 @@ const scanKotlinConstructorBinding: ConstructorBindingScanner = (node) => {
     }
   }
   if (!calleeName) return undefined;
-  const nameNode = findChildByType(varDecl, 'simple_identifier');
+  const nameNode = findChild(varDecl, 'simple_identifier');
   if (!nameNode) return undefined;
   return { varName: nameNode.text, calleeName };
 };
@@ -466,7 +467,7 @@ const KOTLIN_FOR_LOOP_NODE_TYPES: ReadonlySet<string> = new Set([
  *  Handles the type_projection wrapper that Kotlin uses for generic type arguments. */
 const extractKotlinElementTypeFromTypeNode = (typeNode: SyntaxNode, pos: TypeArgPosition = 'last'): string | undefined => {
   if (typeNode.type === 'user_type') {
-    const argsNode = findChildByType(typeNode, 'type_arguments');
+    const argsNode = findChild(typeNode, 'type_arguments');
     if (argsNode && argsNode.namedChildCount >= 1) {
       const targetArg = pos === 'first'
         ? argsNode.namedChild(0)
@@ -488,14 +489,14 @@ const findKotlinParamElementType = (iterableName: string, startNode: SyntaxNode,
   let current: SyntaxNode | null = startNode.parent;
   while (current) {
     if (current.type === 'function_declaration') {
-      const paramsNode = findChildByType(current, 'function_value_parameters');
+      const paramsNode = findChild(current, 'function_value_parameters');
       if (paramsNode) {
         for (let i = 0; i < paramsNode.namedChildCount; i++) {
           const param = paramsNode.namedChild(i);
           if (!param || param.type !== 'parameter') continue;
-          const nameNode = findChildByType(param, 'simple_identifier');
+          const nameNode = findChild(param, 'simple_identifier');
           if (nameNode?.text !== iterableName) continue;
-          const typeNode = findChildByType(param, 'user_type');
+          const typeNode = findChild(param, 'user_type');
           if (typeNode) return extractKotlinElementTypeFromTypeNode(typeNode, pos);
         }
       }
@@ -510,15 +511,15 @@ const findKotlinParamElementType = (iterableName: string, startNode: SyntaxNode,
  *  Tier 1c: for `for (user in users)` without annotation, resolves from iterable. */
 const extractKotlinForLoopBinding: ForLoopExtractor = (node, ctx): void => {
   const { scopeEnv, declarationTypeNodes, scope, returnTypeLookup } = ctx;
-  const varDecl = findChildByType(node, 'variable_declaration');
+  const varDecl = findChild(node, 'variable_declaration');
   if (!varDecl) return;
-  const nameNode = findChildByType(varDecl, 'simple_identifier');
+  const nameNode = findChild(varDecl, 'simple_identifier');
   if (!nameNode) return;
   const varName = extractVarName(nameNode);
   if (!varName) return;
 
   // Explicit type annotation (existing behavior): for (user: User in users)
-  const typeNode = findChildByType(varDecl, 'user_type');
+  const typeNode = findChild(varDecl, 'user_type');
   if (typeNode) {
     const typeName = extractSimpleTypeName(typeNode);
     if (typeName) scopeEnv.set(varName, typeName);
@@ -544,9 +545,9 @@ const extractKotlinForLoopBinding: ForLoopExtractor = (node, ctx): void => {
     if (child.type === 'navigation_expression') {
       // data.keys → navigation_expression > simple_identifier(data) + navigation_suffix > simple_identifier(keys)
       const obj = child.firstNamedChild;
-      const suffix = findChildByType(child, 'navigation_suffix');
-      const prop = suffix ? findChildByType(suffix, 'simple_identifier') : null;
-      const hasCallSuffix = suffix ? findChildByType(suffix, 'call_suffix') !== null : false;
+      const suffix = findChild(child, 'navigation_suffix');
+      const prop = suffix ? findChild(suffix, 'simple_identifier') : null;
+      const hasCallSuffix = suffix ? findChild(suffix, 'call_suffix') !== null : false;
       // Always try object as iterable + property as method first (handles data.values, data.keys).
       // For bare property access without call_suffix, also save property as fallback
       // (handles this.users, repo.items where the property IS the iterable).
@@ -563,9 +564,9 @@ const extractKotlinForLoopBinding: ForLoopExtractor = (node, ctx): void => {
       if (callee?.type === 'navigation_expression') {
         const obj = callee.firstNamedChild;
         if (obj?.type === 'simple_identifier') iterableName = obj.text;
-        const suffix = findChildByType(callee, 'navigation_suffix');
+        const suffix = findChild(callee, 'navigation_suffix');
         if (suffix) {
-          const prop = findChildByType(suffix, 'simple_identifier');
+          const prop = findChild(suffix, 'simple_identifier');
           if (prop) methodName = prop.text;
         }
       } else if (callee?.type === 'simple_identifier') {
@@ -607,7 +608,7 @@ const extractKotlinForLoopBinding: ForLoopExtractor = (node, ctx): void => {
 const extractKotlinPendingAssignment: PendingAssignmentExtractor = (node, scopeEnv) => {
   if (node.type === 'property_declaration') {
     // Find the variable name from variable_declaration child
-    const varDecl = findChildByType(node, 'variable_declaration');
+    const varDecl = findChild(node, 'variable_declaration');
     if (!varDecl) return undefined;
     const nameNode = varDecl.firstNamedChild;
     if (!nameNode || nameNode.type !== 'simple_identifier') return undefined;
@@ -653,7 +654,7 @@ const extractKotlinPendingAssignment: PendingAssignmentExtractor = (node, scopeE
 
   if (node.type === 'variable_declaration') {
     // variable_declaration directly inside functions: simple_identifier children
-    const nameNode = findChildByType(node, 'simple_identifier');
+    const nameNode = findChild(node, 'simple_identifier');
     if (!nameNode) return undefined;
     const lhs = nameNode.text;
     if (scopeEnv.has(lhs)) return undefined;

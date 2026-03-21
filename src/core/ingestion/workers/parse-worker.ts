@@ -932,6 +932,7 @@ const processFileGroup = (
       // Extract import paths before skipping
       if (captureMap['import'] && captureMap['import.source']) {
         const rawImportPath = preprocessImportPath(captureMap['import.source'].text, captureMap['import'], language);
+        if (!rawImportPath) continue;
         const extractor = namedBindingExtractors[language];
         const namedBindings = extractor ? extractor(captureMap['import']) : undefined;
         result.imports.push({

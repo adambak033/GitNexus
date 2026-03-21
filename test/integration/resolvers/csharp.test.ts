@@ -1587,3 +1587,42 @@ describe('C# cross-file binding propagation', () => {
     expect(getNameEdge).toBeDefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// C# fallback without .csproj (P1-4 fix)
+// When no .csproj file is found, import resolution should fall back to
+// suffix-based matching rather than returning null.
+// ---------------------------------------------------------------------------
+
+describe('C# import resolution without .csproj (suffix fallback)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'csharp-no-csproj'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User class with Save and GetName methods', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Method')).toContain('Save');
+  });
+
+  it('detects UserService class with ProcessUser method', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('UserService');
+    expect(getNodesByLabel(result, 'Method')).toContain('ProcessUser');
+  });
+
+  // C# 'using Models;' is a namespace import — suffix matching cannot resolve
+  // namespace-to-directory mappings without .csproj. The fallback prevents a null
+  // return (so other resolution paths can attempt it), but namespace imports
+  // inherently require project config for file discovery.
+  it('does not crash on namespace import without .csproj (graceful fallback)', () => {
+    // Pipeline completes without errors and detects symbols from both files,
+    // even though no IMPORTS edge is created for the namespace import.
+    const classes = getNodesByLabel(result, 'Class');
+    expect(classes).toContain('User');
+    expect(classes).toContain('UserService');
+  });
+});

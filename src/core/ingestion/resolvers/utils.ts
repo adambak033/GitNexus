@@ -65,11 +65,13 @@ export interface SuffixIndex {
   getFilesInDir(dirSuffix: string, extension: string): string[];
 }
 
+const FROZEN_EMPTY_ARRAY: string[] = Object.freeze([]) as string[];
+
 /** Sentinel index that returns no results. Used to release memory after import resolution. */
 export const EMPTY_INDEX: SuffixIndex = Object.freeze({
   get: () => undefined,
   getInsensitive: () => undefined,
-  getFilesInDir: () => [],
+  getFilesInDir: () => FROZEN_EMPTY_ARRAY,
 });
 
 export function buildSuffixIndex(normalizedFileList: string[], allFileList: string[]): SuffixIndex {

@@ -14,7 +14,7 @@ import { detectFrameworkFromPath } from './framework-detection.js';
 import { SupportedLanguages } from '../../config/supported-languages.js';
 
 // ============================================================================
-// NAME PATTERNS - All 11 supported languages
+// NAME PATTERNS - All 13 supported languages
 // ============================================================================
 
 /**

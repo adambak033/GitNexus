@@ -1247,3 +1247,33 @@ describe('Go cross-file binding propagation', () => {
     expect(getNameEdge).toBeDefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Go cmd/ helper files should NOT get entry-point multiplier (P0-1 fix)
+// Only main.go files should get the 3.0 entry-point boost, not arbitrary
+// .go files under cmd/ subdirectories.
+// ---------------------------------------------------------------------------
+
+describe('Go cmd/ helper files entry-point scoring', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'go-cmd-helper'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects main function and Load function', () => {
+    expect(getNodesByLabel(result, 'Function')).toContain('main');
+    expect(getNodesByLabel(result, 'Function')).toContain('Load');
+  });
+
+  it('emits IMPORTS edge from main.go to config/config.go', () => {
+    const imports = getRelationships(result, 'IMPORTS');
+    const edge = imports.find(e =>
+      e.sourceFilePath.includes('main') && e.targetFilePath.includes('config'),
+    );
+    expect(edge).toBeDefined();
+  });
+});
