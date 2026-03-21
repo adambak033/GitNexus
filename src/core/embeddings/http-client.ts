@@ -162,20 +162,17 @@ export const httpEmbed = async (texts: string[]): Promise<Float32Array[]> => {
     }
 
     for (const item of items) {
-      allVectors.push(new Float32Array(item.embedding));
-    }
-  }
-
-  // Fail fast if the API returned vectors with unexpected dimensions —
-  // inserting them into the FLOAT[N] column would cause a cryptic Kuzu error.
-  if (config.dimensions && allVectors.length > 0) {
-    const actual = allVectors[0].length;
-    if (actual !== config.dimensions) {
-      throw new Error(
-        `Embedding dimension mismatch: endpoint returned ${actual}d vectors, ` +
-        `but GITNEXUS_EMBEDDING_DIMS is set to ${config.dimensions}. ` +
-        `Update GITNEXUS_EMBEDDING_DIMS to match your model output.`,
-      );
+      const vec = new Float32Array(item.embedding);
+      // Fail fast on dimension mismatch rather than inserting bad vectors
+      // into the FLOAT[N] column which would cause a cryptic Kuzu error.
+      if (config.dimensions && vec.length !== config.dimensions) {
+        throw new Error(
+          `Embedding dimension mismatch: endpoint returned ${vec.length}d vector, ` +
+          `but GITNEXUS_EMBEDDING_DIMS is set to ${config.dimensions}. ` +
+          `Update GITNEXUS_EMBEDDING_DIMS to match your model output.`,
+        );
+      }
+      allVectors.push(vec);
     }
   }
 
