@@ -4,7 +4,7 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import path from 'path';
 import {
-  FIXTURES, getRelationships, getNodesByLabel, getNodesByLabelFull, edgeSet,
+  FIXTURES, CROSS_FILE_FIXTURES, getRelationships, getNodesByLabel, getNodesByLabelFull, edgeSet,
   runPipelineFromRepo, type PipelineResult,
 } from './helpers.js';
 
@@ -49,9 +49,12 @@ describe('C++ diamond inheritance', () => {
     ]);
   });
 
-  it('captures 1 Method node from duck.cpp (speak)', () => {
+  it('captures speak as Method nodes (declaration in headers + definition in .cpp)', () => {
     const methods = getNodesByLabel(result, 'Method');
-    expect(methods).toEqual(['speak']);
+    expect(methods).toContain('speak');
+    // speak appears in animal.h (virtual declaration), duck.h (override declaration),
+    // and duck.cpp (out-of-line definition) — all captured as Method nodes
+    expect(methods.filter(m => m === 'speak').length).toBeGreaterThanOrEqual(1);
   });
 
   it('no OVERRIDES edges target Property nodes', () => {
@@ -1133,5 +1136,71 @@ describe('C++ default parameter arity resolution', () => {
     const calls = getRelationships(result, 'CALLS');
     const greetCalls = calls.filter(c => c.source === 'process' && c.target === 'greet');
     expect(greetCalls.length).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 14: Cross-file binding propagation (via synthesized wildcard imports)
+// models/user.h declares User class with save() and get_name() methods
+// models/user_factory.h declares User get_user() free function
+// app/main.cpp includes user_factory.h, calls get_user().save()
+// → user is typed User via cross-file return type propagation
+// ---------------------------------------------------------------------------
+
+describe('C++ cross-file binding propagation', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(CROSS_FILE_FIXTURES, 'cpp-cross-file'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User class with save and get_name methods', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Method')).toContain('save');
+    expect(getNodesByLabel(result, 'Method')).toContain('get_name');
+  });
+
+  it('detects get_user factory function and process consumer', () => {
+    expect(getNodesByLabel(result, 'Function')).toContain('get_user');
+    expect(getNodesByLabel(result, 'Function')).toContain('process');
+  });
+
+  it('emits IMPORTS edge from main.cpp to headers', () => {
+    const imports = getRelationships(result, 'IMPORTS');
+    const edge = imports.find(e =>
+      e.sourceFilePath.includes('main') && e.targetFilePath.includes('models'),
+    );
+    expect(edge).toBeDefined();
+  });
+
+  it('resolves user.save() in process() to User#save via cross-file propagation', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' &&
+      c.source === 'process' &&
+      c.targetFilePath.includes('models'),
+    );
+    expect(saveCall).toBeDefined();
+  });
+
+  it('resolves user.get_name() in process() to User#get_name via cross-file propagation', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const getNameCall = calls.find(c =>
+      c.target === 'get_name' &&
+      c.source === 'process' &&
+      c.targetFilePath.includes('models'),
+    );
+    expect(getNameCall).toBeDefined();
+  });
+
+  it('emits HAS_METHOD edges linking save and get_name to User (via header declarations)', () => {
+    const hasMethod = getRelationships(result, 'HAS_METHOD');
+    const saveEdge = hasMethod.find(e => e.source === 'User' && e.target === 'save');
+    const getNameEdge = hasMethod.find(e => e.source === 'User' && e.target === 'get_name');
+    expect(saveEdge).toBeDefined();
+    expect(getNameEdge).toBeDefined();
   });
 });

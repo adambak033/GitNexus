@@ -420,8 +420,15 @@ export const CPP_QUERIES = `
   declarator: (reference_declarator
     (field_identifier) @name)) @definition.property
 
-; Inline class method declarations (inside class body, no body: void Foo();)
-(field_declaration declarator: (function_declarator declarator: (identifier) @name)) @definition.method
+; Inline class method declarations (inside class body, no body: void save();)
+; tree-sitter-cpp uses field_identifier (not identifier) for names inside class bodies
+(field_declaration declarator: (function_declarator declarator: [(field_identifier) (identifier)] @name)) @definition.method
+
+; Inline class method declarations returning a pointer (User* lookup();)
+(field_declaration declarator: (pointer_declarator declarator: (function_declarator declarator: [(field_identifier) (identifier)] @name))) @definition.method
+
+; Inline class method declarations returning a reference (User& lookup();)
+(field_declaration declarator: (reference_declarator (function_declarator declarator: [(field_identifier) (identifier)] @name))) @definition.method
 
 ; Inline class method definitions (inside class body, with body: void Foo() { ... })
 (field_declaration_list

@@ -165,6 +165,13 @@ export interface FileConstructorBindings {
   bindings: ConstructorBinding[];
 }
 
+/** File-scope type bindings from TypeEnv fixpoint — used for cross-file ExportedTypeMap. */
+export interface FileTypeEnvBindings {
+  filePath: string;
+  /** [varName, typeName] pairs from file scope (scope = '') */
+  bindings: [string, string][];
+}
+
 export interface ParseWorkerResult {
   nodes: ParsedNode[];
   relationships: ParsedRelationship[];
@@ -175,6 +182,8 @@ export interface ParseWorkerResult {
   heritage: ExtractedHeritage[];
   routes: ExtractedRoute[];
   constructorBindings: FileConstructorBindings[];
+  /** File-scope type bindings from TypeEnv fixpoint for exported symbol collection. */
+  typeEnvBindings: FileTypeEnvBindings[];
   skippedLanguages: Record<string, number>;
   fileCount: number;
 }
@@ -303,6 +312,7 @@ const processBatch = (files: ParseWorkerInput[], onProgress?: (filesProcessed: n
     heritage: [],
     routes: [],
     constructorBindings: [],
+    typeEnvBindings: [],
     skippedLanguages: {},
     fileCount: 0,
   };
@@ -936,6 +946,16 @@ const processFileGroup = (
       result.constructorBindings.push({ filePath: file.path, bindings: [...typeEnv.constructorBindings] });
     }
 
+    // Extract file-scope bindings for ExportedTypeMap (closes worker/sequential quality gap).
+    // Sequential path uses collectExportedBindings(typeEnv) directly; worker path serializes
+    // these bindings so the main thread can merge them into ExportedTypeMap.
+    const fileScope = typeEnv.env.get('');
+    if (fileScope && fileScope.size > 0) {
+      const bindings: [string, string][] = [];
+      for (const [name, type] of fileScope) bindings.push([name, type]);
+      result.typeEnvBindings.push({ filePath: file.path, bindings });
+    }
+
     for (const match of matches) {
       const captureMap: Record<string, any> = {};
       for (const c of match.captures) {
@@ -1300,7 +1320,7 @@ const processFileGroup = (
 /** Accumulated result across sub-batches */
 let accumulated: ParseWorkerResult = {
   nodes: [], relationships: [], symbols: [],
-  imports: [], calls: [], assignments: [], heritage: [], routes: [], constructorBindings: [], skippedLanguages: {}, fileCount: 0,
+  imports: [], calls: [], assignments: [], heritage: [], routes: [], constructorBindings: [], typeEnvBindings: [], skippedLanguages: {}, fileCount: 0,
 };
 let cumulativeProcessed = 0;
 
@@ -1314,6 +1334,7 @@ const mergeResult = (target: ParseWorkerResult, src: ParseWorkerResult) => {
   target.heritage.push(...src.heritage);
   target.routes.push(...src.routes);
   target.constructorBindings.push(...src.constructorBindings);
+  target.typeEnvBindings.push(...src.typeEnvBindings);
   for (const [lang, count] of Object.entries(src.skippedLanguages)) {
     target.skippedLanguages[lang] = (target.skippedLanguages[lang] || 0) + count;
   }
@@ -1338,7 +1359,7 @@ parentPort!.on('message', (msg: any) => {
     if (msg && msg.type === 'flush') {
       parentPort!.postMessage({ type: 'result', data: accumulated });
       // Reset for potential reuse
-      accumulated = { nodes: [], relationships: [], symbols: [], imports: [], calls: [], assignments: [], heritage: [], routes: [], constructorBindings: [], skippedLanguages: {}, fileCount: 0 };
+      accumulated = { nodes: [], relationships: [], symbols: [], imports: [], calls: [], assignments: [], heritage: [], routes: [], constructorBindings: [], typeEnvBindings: [], skippedLanguages: {}, fileCount: 0 };
       cumulativeProcessed = 0;
       return;
     }

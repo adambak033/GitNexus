@@ -4,7 +4,7 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import path from 'path';
 import {
-  FIXTURES, getRelationships, getNodesByLabel, edgeSet,
+  FIXTURES, CROSS_FILE_FIXTURES, getRelationships, getNodesByLabel, edgeSet,
   runPipelineFromRepo, type PipelineResult,
 } from './helpers.js';
 
@@ -1180,5 +1180,70 @@ describe('Go inc/dec write access tracking (Phase B)', () => {
     const writes = accesses.filter(e => e.rel.reason === 'write');
     const countDec = writes.find(e => e.target === 'Count' && e.source === 'decrement');
     expect(countDec).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 14: Cross-file binding propagation (via synthesized wildcard imports)
+// models/user.go exports User struct with Save() and GetName() methods
+// models/factory.go exports GetUser() -> User
+// app/main.go imports models package, calls models.GetUser().Save()
+// → user is typed User via cross-file return type propagation
+// ---------------------------------------------------------------------------
+
+describe('Go cross-file binding propagation', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(CROSS_FILE_FIXTURES, 'go-cross-file'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User struct with Save and GetName methods', () => {
+    expect(getNodesByLabel(result, 'Struct')).toContain('User');
+    expect(getNodesByLabel(result, 'Method')).toContain('Save');
+    expect(getNodesByLabel(result, 'Method')).toContain('GetName');
+  });
+
+  it('detects GetUser factory function', () => {
+    expect(getNodesByLabel(result, 'Function')).toContain('GetUser');
+  });
+
+  it('emits IMPORTS edge from main.go to models package files', () => {
+    const imports = getRelationships(result, 'IMPORTS');
+    const edge = imports.find(e =>
+      e.sourceFilePath.includes('main') && e.targetFilePath.includes('models'),
+    );
+    expect(edge).toBeDefined();
+  });
+
+  it('resolves user.Save() in main() to User#Save via cross-file propagation', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'Save' &&
+      c.source === 'main' &&
+      c.targetFilePath.includes('models'),
+    );
+    expect(saveCall).toBeDefined();
+  });
+
+  it('resolves user.GetName() in main() to User#GetName via cross-file propagation', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const getNameCall = calls.find(c =>
+      c.target === 'GetName' &&
+      c.source === 'main' &&
+      c.targetFilePath.includes('models'),
+    );
+    expect(getNameCall).toBeDefined();
+  });
+
+  it('emits HAS_METHOD edges linking Save and GetName to User', () => {
+    const hasMethod = getRelationships(result, 'HAS_METHOD');
+    const saveEdge = hasMethod.find(e => e.source === 'User' && e.target === 'Save');
+    const getNameEdge = hasMethod.find(e => e.source === 'User' && e.target === 'GetName');
+    expect(saveEdge).toBeDefined();
+    expect(getNameEdge).toBeDefined();
   });
 });

@@ -4,8 +4,9 @@ import { topologicalLevelSort } from '../../src/core/ingestion/pipeline.js';
 describe('topologicalLevelSort', () => {
   it('returns empty levels for empty graph', () => {
     const importMap = new Map<string, Set<string>>();
-    const levels = topologicalLevelSort(importMap);
+    const { levels, cycleCount } = topologicalLevelSort(importMap);
     expect(levels).toEqual([]);
+    expect(cycleCount).toBe(0);
   });
 
   it('returns single level for files with no imports', () => {
@@ -13,7 +14,7 @@ describe('topologicalLevelSort', () => {
       ['a.ts', new Set()],
       ['b.ts', new Set()],
     ]);
-    const levels = topologicalLevelSort(importMap);
+    const { levels } = topologicalLevelSort(importMap);
     expect(levels).toHaveLength(1);
     expect(levels[0]).toContain('a.ts');
     expect(levels[0]).toContain('b.ts');
@@ -26,7 +27,7 @@ describe('topologicalLevelSort', () => {
       ['b.ts', new Set(['a.ts'])],
       ['c.ts', new Set(['b.ts'])],
     ]);
-    const levels = topologicalLevelSort(importMap);
+    const { levels } = topologicalLevelSort(importMap);
     expect(levels).toHaveLength(3);
     expect(levels[0]).toContain('a.ts');
     expect(levels[1]).toContain('b.ts');
@@ -40,7 +41,7 @@ describe('topologicalLevelSort', () => {
       ['b.ts', new Set(['a.ts'])],
       ['c.ts', new Set(['a.ts'])],
     ]);
-    const levels = topologicalLevelSort(importMap);
+    const { levels } = topologicalLevelSort(importMap);
     expect(levels).toHaveLength(2);
     expect(levels[0]).toContain('a.ts');
     expect(levels[1]).toContain('b.ts');
@@ -53,11 +54,12 @@ describe('topologicalLevelSort', () => {
       ['a.ts', new Set(['b.ts'])],
       ['b.ts', new Set(['a.ts'])],
     ]);
-    const levels = topologicalLevelSort(importMap);
+    const { levels, cycleCount } = topologicalLevelSort(importMap);
     // Both should appear (in a cycle group)
     const allFiles = levels.flat();
     expect(allFiles).toContain('a.ts');
     expect(allFiles).toContain('b.ts');
+    expect(cycleCount).toBe(2);
   });
 
   it('handles disconnected components', () => {
@@ -68,7 +70,7 @@ describe('topologicalLevelSort', () => {
       ['x.ts', new Set()],
       ['y.ts', new Set(['x.ts'])],
     ]);
-    const levels = topologicalLevelSort(importMap);
+    const { levels } = topologicalLevelSort(importMap);
     // Level 0 has both roots, level 1 has both dependents
     expect(levels[0]).toContain('a.ts');
     expect(levels[0]).toContain('x.ts');
@@ -84,7 +86,7 @@ describe('topologicalLevelSort', () => {
       ['c.ts', new Set(['a.ts'])],
       ['d.ts', new Set(['b.ts', 'c.ts'])],
     ]);
-    const levels = topologicalLevelSort(importMap);
+    const { levels } = topologicalLevelSort(importMap);
     expect(levels).toHaveLength(3);
     expect(levels[0]).toContain('a.ts');
     expect(levels[1]).toContain('b.ts');
@@ -96,7 +98,7 @@ describe('topologicalLevelSort', () => {
     const importMap = new Map<string, Set<string>>([
       ['only.ts', new Set()],
     ]);
-    const levels = topologicalLevelSort(importMap);
+    const { levels } = topologicalLevelSort(importMap);
     expect(levels).toHaveLength(1);
     expect(levels[0]).toContain('only.ts');
   });
@@ -106,7 +108,7 @@ describe('topologicalLevelSort', () => {
     const importMap = new Map<string, Set<string>>([
       ['b.ts', new Set(['external.ts'])],
     ]);
-    const levels = topologicalLevelSort(importMap);
+    const { levels } = topologicalLevelSort(importMap);
     // external.ts has in-degree 0 (no one depends on it as a key), appears first
     // b.ts depends on external.ts so appears after
     const allFiles = levels.flat();
@@ -125,7 +127,7 @@ describe('topologicalLevelSort', () => {
       ['b.ts', new Set(['a.ts'])],
       ['c.ts', new Set(['b.ts'])],
     ]);
-    const levels = topologicalLevelSort(importMap);
+    const { levels } = topologicalLevelSort(importMap);
     // No file has in-degree 0 to start: a needs b, b needs a, c needs b
     // All end up in the cycle group
     const allFiles = levels.flat();
@@ -141,7 +143,7 @@ describe('topologicalLevelSort', () => {
       ['c.ts', new Set(['a.ts'])],
       ['d.ts', new Set(['b.ts', 'c.ts'])],
     ]);
-    const levels = topologicalLevelSort(importMap);
+    const { levels } = topologicalLevelSort(importMap);
     const allFiles = levels.flat();
     const uniqueFiles = new Set(allFiles);
     expect(uniqueFiles.size).toBe(allFiles.length);

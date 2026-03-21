@@ -320,13 +320,22 @@ function applyImportResult(
       addImportEdge(filePath, resolvedFile);
     }
 
-    // Record named bindings for precise Tier 2a resolution
+    // Record named bindings for precise Tier 2a resolution.
+    // If the same local name is imported from multiple files (e.g., Java static imports
+    // of overloaded methods), remove the entry so resolution falls through to Tier 2a
+    // import-scoped which sees all candidates and can apply arity narrowing.
     if (namedBindings && namedImportMap && files.length === 1) {
       const resolvedFile = files[0];
       if (!namedImportMap.has(filePath)) namedImportMap.set(filePath, new Map());
       const fileBindings = namedImportMap.get(filePath)!;
       for (const binding of namedBindings) {
-        fileBindings.set(binding.local, { sourcePath: resolvedFile, exportedName: binding.exported });
+        const existing = fileBindings.get(binding.local);
+        if (existing && existing.sourcePath !== resolvedFile) {
+          // Ambiguous: same name imported from different files — remove to fall through
+          fileBindings.delete(binding.local);
+        } else {
+          fileBindings.set(binding.local, { sourcePath: resolvedFile, exportedName: binding.exported });
+        }
       }
     }
   }

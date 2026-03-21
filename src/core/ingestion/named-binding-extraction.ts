@@ -89,6 +89,15 @@ export function extractNamedBindings(
   if (language === SupportedLanguages.Java) {
     return extractJavaNamedBindings(importNode);
   }
+  // Languages below use whole-module import semantics — the import AST node does not
+  // name specific symbols. namedImportMap entries are synthesized post-parse by
+  // synthesizeWildcardImportBindings() in pipeline.ts, which expands ImportMap edges
+  // into per-symbol bindings using graph-exported symbols.
+  //
+  // Go: `import "pkg"` — all PascalCase symbols available as pkg.Symbol
+  // Ruby: `require 'file'` — all top-level classes/modules available
+  // C/C++: `#include "file.h"` — textual inclusion, all non-static declarations available
+  // Swift: `import Module` — entire module imported (Phase S blocked on tree-sitter-swift Node 22)
   return undefined;
 }
 
@@ -337,23 +346,41 @@ export function extractPhpNamedBindings(importNode: any): { local: string; expor
 }
 
 export function extractCsharpNamedBindings(importNode: any): { local: string; exported: string }[] | undefined {
-  // using_directive with identifier (alias) + qualified_name (target)
+  // using_directive — three forms:
+  //   using Alias = NS.Type;          → aliasIdent + qualifiedName
+  //   using static NS.Type;           → static + qualifiedName (no alias)
+  //   using NS;                       → qualifiedName only (namespace, not capturable)
   if (importNode.type !== 'using_directive') return undefined;
 
   let aliasIdent: any = null;
   let qualifiedName: any = null;
+  let isStatic = false;
+  for (let i = 0; i < importNode.childCount; i++) {
+    const child = importNode.child(i);
+    if (child?.text === 'static') isStatic = true;
+  }
   for (let i = 0; i < importNode.namedChildCount; i++) {
     const child = importNode.namedChild(i);
     if (child?.type === 'identifier' && !aliasIdent) aliasIdent = child;
     else if (child?.type === 'qualified_name') qualifiedName = child;
   }
 
-  if (!aliasIdent || !qualifiedName) return undefined;
+  // Form 1: using Alias = NS.Type;
+  if (aliasIdent && qualifiedName) {
+    const fullText = qualifiedName.text;
+    const exportedName = fullText.includes('.') ? fullText.split('.').pop()! : fullText;
+    return [{ local: aliasIdent.text, exported: exportedName }];
+  }
 
-  const fullText = qualifiedName.text;
-  const exportedName = fullText.includes('.') ? fullText.split('.').pop()! : fullText;
+  // Form 2: using static NS.Type; — last segment is the class name
+  if (isStatic && qualifiedName) {
+    const fullText = qualifiedName.text;
+    const lastSegment = fullText.includes('.') ? fullText.split('.').pop()! : fullText;
+    return [{ local: lastSegment, exported: lastSegment }];
+  }
 
-  return [{ local: aliasIdent.text, exported: exportedName }];
+  // Form 3: using NS; — namespace import, can't resolve to per-symbol bindings
+  return undefined;
 }
 
 export function extractJavaNamedBindings(importNode: any): { local: string; exported: string }[] | undefined {
@@ -361,10 +388,12 @@ export function extractJavaNamedBindings(importNode: any): { local: string; expo
   // Wildcard imports (.*) don't produce named bindings
   if (importNode.type !== 'import_declaration') return undefined;
 
-  // Check for asterisk (wildcard import) — skip those
+  // Check for asterisk (wildcard import) and static modifier
+  let isStatic = false;
   for (let i = 0; i < importNode.childCount; i++) {
     const child = importNode.child(i);
     if (child?.type === 'asterisk') return undefined;
+    if (child?.text === 'static') isStatic = true;
   }
 
   const scopedId = findChild(importNode, 'scoped_identifier');
@@ -374,11 +403,12 @@ export function extractJavaNamedBindings(importNode: any): { local: string; expo
   const lastDot = fullText.lastIndexOf('.');
   if (lastDot === -1) return undefined;
 
-  const className = fullText.slice(lastDot + 1);
-  // Skip lowercase names — those are package imports, not class imports
-  if (className[0] && className[0] === className[0].toLowerCase()) return undefined;
+  const name = fullText.slice(lastDot + 1);
+  // Non-static: skip lowercase names — those are package imports, not class imports.
+  // Static: allow lowercase — `import static models.UserFactory.getUser` imports a method.
+  if (!isStatic && name[0] && name[0] === name[0].toLowerCase()) return undefined;
 
-  return [{ local: className, exported: className }];
+  return [{ local: name, exported: name }];
 }
 
 function findChild(node: any, type: string): any {

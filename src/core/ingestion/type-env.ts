@@ -655,6 +655,10 @@ export interface BuildTypeEnvOptions {
    *  Consulted ONLY when SymbolTable has no unambiguous match.
    *  Local definitions always take precedence (local-first principle). */
   importedReturnTypes?: ReadonlyMap<string, string>;
+  /** Cross-file RAW return types for imported callables (Phase 14 E3).
+   *  Stores raw declared return type strings (e.g., 'User[]', 'List<User>').
+   *  Used by lookupRawReturnType for for-loop element extraction. */
+  importedRawReturnTypes?: ReadonlyMap<string, string>;
 }
 
 /** Seed cross-file type bindings into the file scope.
@@ -718,8 +722,9 @@ export const buildTypeEnv = (
         // Ambiguous (2+) → return undefined (conservative, no cross-file fallback)
         if (callables.length > 1) return undefined;
       }
-      // Cross-file return types are already processed — return as-is
-      return options?.importedReturnTypes?.get(callee);
+      // Cross-file fallback uses importedRawReturnTypes (raw declared types, e.g., 'User[]')
+      // NOT importedReturnTypes (which contains processed/simple types via extractReturnTypeName)
+      return options?.importedRawReturnTypes?.get(callee);
     }
   };
 

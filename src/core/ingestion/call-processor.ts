@@ -60,6 +60,27 @@ export function buildImportedReturnTypes(
   return result;
 }
 
+/** Build cross-file RAW return types for imported callables.
+ *  Unlike buildImportedReturnTypes (which stores extractReturnTypeName output),
+ *  this stores the raw declared return type string (e.g., 'User[]', 'List<User>').
+ *  Used by lookupRawReturnType for for-loop element extraction via extractElementTypeFromString. */
+export function buildImportedRawReturnTypes(
+  filePath: string,
+  namedImportMap: ReadonlyMap<string, ReadonlyMap<string, { sourcePath: string; exportedName: string }>>,
+  symbolTable: { lookupExactFull(filePath: string, name: string): { returnType?: string } | undefined },
+): ReadonlyMap<string, string> {
+  const result = new Map<string, string>();
+  const fileImports = namedImportMap.get(filePath);
+  if (!fileImports) return result;
+
+  for (const [localName, binding] of fileImports) {
+    const def = symbolTable.lookupExactFull(binding.sourcePath, binding.exportedName);
+    if (!def?.returnType) continue;
+    result.set(localName, def.returnType);
+  }
+  return result;
+}
+
 /** Collect resolved type bindings for exported file-scope symbols.
  *  Uses graph node isExported flag — does NOT require isExported on SymbolDefinition. */
 function collectExportedBindings(
@@ -262,6 +283,8 @@ export const processCalls = async (
   /** Phase 14 E3: cross-file return types for imported callables. Keyed by filePath → Map<calleeName, returnType>.
    *  Consulted ONLY when SymbolTable has no unambiguous match (local-first principle). */
   importedReturnTypesMap?: ReadonlyMap<string, ReadonlyMap<string, string>>,
+  /** Phase 14 E3: cross-file RAW return types for for-loop element extraction. Keyed by filePath → Map<calleeName, rawReturnType>. */
+  importedRawReturnTypesMap?: ReadonlyMap<string, ReadonlyMap<string, string>>,
 ): Promise<ExtractedHeritage[]> => {
   const parser = await loadParser();
   const collectedHeritage: ExtractedHeritage[] = [];
@@ -349,7 +372,8 @@ export const processCalls = async (
 
     const importedBindings = importedBindingsMap?.get(file.path);
     const importedReturnTypes = importedReturnTypesMap?.get(file.path);
-    const typeEnv = lang ? buildTypeEnv(tree, lang, { symbolTable: ctx.symbols, parentMap, importedBindings, importedReturnTypes }) : null;
+    const importedRawReturnTypes = importedRawReturnTypesMap?.get(file.path);
+    const typeEnv = lang ? buildTypeEnv(tree, lang, { symbolTable: ctx.symbols, parentMap, importedBindings, importedReturnTypes, importedRawReturnTypes }) : null;
     if (typeEnv && exportedTypeMap) {
       const fileExports = collectExportedBindings(typeEnv, file.path, ctx.symbols, graph);
       if (fileExports) exportedTypeMap.set(file.path, fileExports);
@@ -1094,7 +1118,6 @@ export const processCallsFromExtracted = async (
   ctx: ResolutionContext,
   onProgress?: (current: number, total: number) => void,
   constructorBindings?: FileConstructorBindings[],
-  exportedTypeMap?: ExportedTypeMap,
 ) => {
   // Scope-aware receiver types: keyed by filePath → "funcName\0varName" → typeName.
   // The scope dimension prevents collisions when two functions in the same file

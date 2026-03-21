@@ -6,7 +6,7 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import path from 'path';
 import {
-  FIXTURES, getRelationships, getNodesByLabel, edgeSet,
+  FIXTURES, CROSS_FILE_FIXTURES, getRelationships, getNodesByLabel, edgeSet,
   runPipelineFromRepo, type PipelineResult,
 } from './helpers.js';
 
@@ -1077,5 +1077,71 @@ describe('Ruby default parameter arity resolution', () => {
     const calls = getRelationships(result, 'CALLS');
     const greetCalls = calls.filter(c => c.source === 'process' && c.target === 'greet');
     expect(greetCalls.length).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 14: Cross-file binding propagation (via synthesized wildcard imports)
+// models/user.rb exports User class with save and get_name methods
+// models/user_factory.rb exports UserFactory with self.get_user -> User.new
+// app.rb requires both, calls UserFactory.get_user then .save / .get_name
+// → user is typed User via cross-file return type propagation
+// ---------------------------------------------------------------------------
+
+describe('Ruby cross-file binding propagation', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(CROSS_FILE_FIXTURES, 'rb-cross-file'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User class with save and get_name methods', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Method')).toContain('save');
+    expect(getNodesByLabel(result, 'Method')).toContain('get_name');
+  });
+
+  it('detects UserFactory class and get_user method', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('UserFactory');
+    expect(getNodesByLabel(result, 'Method')).toContain('get_user');
+  });
+
+  it('emits IMPORTS edge from app.rb to models', () => {
+    const imports = getRelationships(result, 'IMPORTS');
+    const edge = imports.find(e =>
+      e.sourceFilePath.includes('app') && e.targetFilePath.includes('models'),
+    );
+    expect(edge).toBeDefined();
+  });
+
+  it('resolves user.save in process to User#save via cross-file propagation', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' &&
+      c.source === 'process' &&
+      c.targetFilePath.includes('models'),
+    );
+    expect(saveCall).toBeDefined();
+  });
+
+  it('resolves user.get_name in process to User#get_name via cross-file propagation', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const getNameCall = calls.find(c =>
+      c.target === 'get_name' &&
+      c.source === 'process' &&
+      c.targetFilePath.includes('models'),
+    );
+    expect(getNameCall).toBeDefined();
+  });
+
+  it('emits HAS_METHOD edges linking save and get_name to User', () => {
+    const hasMethod = getRelationships(result, 'HAS_METHOD');
+    const saveEdge = hasMethod.find(e => e.source === 'User' && e.target === 'save');
+    const getNameEdge = hasMethod.find(e => e.source === 'User' && e.target === 'get_name');
+    expect(saveEdge).toBeDefined();
+    expect(getNameEdge).toBeDefined();
   });
 });

@@ -7,7 +7,7 @@ import {
   processImportsFromExtracted,
   buildImportResolutionContext
 } from './import-processor.js';
-import { processCalls, processCallsFromExtracted, processAssignmentsFromExtracted, processRoutesFromExtracted, seedCrossFileReceiverTypes, buildImportedReturnTypes, type ExportedTypeMap, buildExportedTypeMapFromGraph } from './call-processor.js';
+import { processCalls, processCallsFromExtracted, processAssignmentsFromExtracted, processRoutesFromExtracted, seedCrossFileReceiverTypes, buildImportedReturnTypes, buildImportedRawReturnTypes, type ExportedTypeMap, buildExportedTypeMapFromGraph } from './call-processor.js';
 import { processHeritage, processHeritageFromExtracted } from './heritage-processor.js';
 import { computeMRO } from './mro-processor.js';
 import { processCommunities } from './community-processor.js';
@@ -18,6 +18,7 @@ import { PipelineProgress, PipelineResult } from '../../types/pipeline.js';
 import { walkRepositoryPaths, readFileContents } from './filesystem-walker.js';
 import { getLanguageFromFilename } from './utils.js';
 import { isLanguageAvailable } from '../tree-sitter/parser-loader.js';
+import { SupportedLanguages } from '../../config/supported-languages.js';
 import { createWorkerPool, WorkerPool } from './workers/worker-pool.js';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -33,7 +34,7 @@ type IndependentFileGroup = readonly string[];
  *  Files in cycles are returned as a final group (no cross-cycle propagation). */
 export function topologicalLevelSort(
   importMap: ReadonlyMap<string, ReadonlySet<string>>,
-): readonly IndependentFileGroup[] {
+): { levels: readonly IndependentFileGroup[]; cycleCount: number } {
   // Build in-degree map and reverse dependency map
   const inDegree = new Map<string, number>();
   const reverseDeps = new Map<string, string[]>();
@@ -78,7 +79,7 @@ export function topologicalLevelSort(
     levels.push(cycleFiles);
   }
 
-  return levels;
+  return { levels, cycleCount: cycleFiles.length };
 }
 
 /** Max bytes of source content to load per parse chunk. Each chunk's source +
@@ -94,6 +95,116 @@ const AST_CACHE_CAP = 50;
 const CROSS_FILE_SKIP_THRESHOLD = 0.03;
 /** Hard cap on files re-processed during cross-file propagation. */
 const MAX_CROSS_FILE_REPROCESS = 2000;
+
+/** Node labels that represent top-level importable symbols.
+ *  Excludes Method, Property, Constructor (accessed via receiver, not directly imported),
+ *  and structural labels (File, Folder, Package, Module, Project, etc.). */
+const IMPORTABLE_SYMBOL_LABELS = new Set([
+  'Function', 'Class', 'Interface', 'Struct', 'Enum', 'Trait',
+  'TypeAlias', 'Const', 'Static', 'Record', 'Union', 'Typedef', 'Macro',
+]);
+
+/** Max synthetic bindings per importing file — prevents memory bloat for
+ *  C/C++ files that include many large headers. */
+const MAX_SYNTHETIC_BINDINGS_PER_FILE = 1000;
+
+/** Languages with whole-module import semantics (no per-symbol named imports).
+ *  For these languages, namedImportMap entries are synthesized from graph-exported
+ *  symbols after parsing, enabling Phase 14 cross-file binding propagation. */
+const WILDCARD_IMPORT_LANGUAGES = new Set([
+  SupportedLanguages.Go,
+  SupportedLanguages.Ruby,
+  SupportedLanguages.C,
+  SupportedLanguages.CPlusPlus,
+  SupportedLanguages.Swift,
+]);
+
+/** Synthesize namedImportMap entries for languages with whole-module imports.
+ *  These languages (Go, Ruby, C/C++, Swift) import all exported symbols from a file,
+ *  not specific named symbols. After parsing, we know which symbols each file exports
+ *  (via graph isExported), so we can expand ImportMap edges into per-symbol bindings
+ *  that Phase 14 can use for cross-file type propagation. */
+function synthesizeWildcardImportBindings(
+  graph: ReturnType<typeof createKnowledgeGraph>,
+  ctx: ReturnType<typeof createResolutionContext>,
+): number {
+  // Pre-compute exported symbols per file from graph (single pass)
+  const exportedSymbolsByFile = new Map<string, { name: string; filePath: string }[]>();
+  graph.forEachNode(node => {
+    if (!node.properties?.isExported) return;
+    if (!IMPORTABLE_SYMBOL_LABELS.has(node.label)) return;
+    const fp = node.properties.filePath;
+    const name = node.properties.name;
+    if (!fp || !name) return;
+    let symbols = exportedSymbolsByFile.get(fp);
+    if (!symbols) { symbols = []; exportedSymbolsByFile.set(fp, symbols); }
+    symbols.push({ name, filePath: fp });
+  });
+
+  if (exportedSymbolsByFile.size === 0) return 0;
+
+  // Build a merged import map: ctx.importMap has file-based imports (Ruby, C/C++),
+  // but Go/C# package imports use graph IMPORTS edges + PackageMap instead.
+  // Collect graph-level IMPORTS edges for wildcard languages missing from ctx.importMap.
+  const FILE_PREFIX = 'File:';
+  const graphImports = new Map<string, Set<string>>();
+  graph.forEachRelationship(rel => {
+    if (rel.type !== 'IMPORTS') return;
+    if (!rel.sourceId.startsWith(FILE_PREFIX) || !rel.targetId.startsWith(FILE_PREFIX)) return;
+    const srcFile = rel.sourceId.slice(FILE_PREFIX.length);
+    const tgtFile = rel.targetId.slice(FILE_PREFIX.length);
+    const lang = getLanguageFromFilename(srcFile);
+    if (!lang || !WILDCARD_IMPORT_LANGUAGES.has(lang)) return;
+    // Only add if not already in ctx.importMap (avoid duplicates)
+    if (ctx.importMap.get(srcFile)?.has(tgtFile)) return;
+    let set = graphImports.get(srcFile);
+    if (!set) { set = new Set(); graphImports.set(srcFile, set); }
+    set.add(tgtFile);
+  });
+
+  let totalSynthesized = 0;
+
+  // Helper: synthesize bindings for a file given its imported files
+  const synthesizeForFile = (filePath: string, importedFiles: Iterable<string>) => {
+    let fileBindings = ctx.namedImportMap.get(filePath);
+    let fileCount = fileBindings?.size ?? 0;
+
+    for (const importedFile of importedFiles) {
+      const exportedSymbols = exportedSymbolsByFile.get(importedFile);
+      if (!exportedSymbols) continue;
+
+      for (const sym of exportedSymbols) {
+        if (fileCount >= MAX_SYNTHETIC_BINDINGS_PER_FILE) return;
+        if (fileBindings?.has(sym.name)) continue;
+
+        if (!fileBindings) {
+          fileBindings = new Map();
+          ctx.namedImportMap.set(filePath, fileBindings);
+        }
+        fileBindings.set(sym.name, {
+          sourcePath: importedFile,
+          exportedName: sym.name,
+        });
+        fileCount++;
+        totalSynthesized++;
+      }
+    }
+  };
+
+  // Process files from ctx.importMap (Ruby, C/C++, Swift file-based imports)
+  for (const [filePath, importedFiles] of ctx.importMap) {
+    const lang = getLanguageFromFilename(filePath);
+    if (!lang || !WILDCARD_IMPORT_LANGUAGES.has(lang)) continue;
+    synthesizeForFile(filePath, importedFiles);
+  }
+
+  // Process files from graph IMPORTS edges (Go package imports)
+  for (const [filePath, importedFiles] of graphImports) {
+    synthesizeForFile(filePath, importedFiles);
+  }
+
+  return totalSynthesized;
+}
 
 /** Phase 14: Cross-file binding propagation.
  *  Seeds downstream files with resolved type bindings from upstream exports.
@@ -119,14 +230,11 @@ async function runCrossFileBindingPropagation(
   if (exportedTypeMap.size === 0 || ctx.namedImportMap.size === 0) return;
 
   const allPathSet = new Set(allPaths);
-  const levels = topologicalLevelSort(ctx.importMap);
+  const { levels, cycleCount } = topologicalLevelSort(ctx.importMap);
 
-  // Cycle diagnostic: Kahn's dumps cycle files in the last level (positive in-degree)
-  if (isDev && levels.length > 0) {
-    const lastLevel = levels[levels.length - 1];
-    if (lastLevel.length > 1) {
-      console.log(`🔄 ${lastLevel.length} files in import cycles (skipped for cross-file propagation)`);
-    }
+  // Cycle diagnostic: only log when actual cycles detected (cycleCount from Kahn's BFS)
+  if (isDev && cycleCount > 0) {
+    console.log(`🔄 ${cycleCount} files in import cycles (skipped for cross-file propagation)`);
   }
 
   // Quick count of files with cross-file binding gaps (early exit once threshold exceeded)
@@ -166,7 +274,7 @@ async function runCrossFileBindingPropagation(
   let astCache = createASTCache(AST_CACHE_CAP);
 
   for (const level of levels) {
-    const levelCandidates: { filePath: string; seeded: Map<string, string>; importedReturns: ReadonlyMap<string, string> }[] = [];
+    const levelCandidates: { filePath: string; seeded: Map<string, string>; importedReturns: ReadonlyMap<string, string>; importedRawReturns: ReadonlyMap<string, string> }[] = [];
     for (const filePath of level) {
       if (crossFileResolved + levelCandidates.length >= MAX_CROSS_FILE_REPROCESS) break;
       const imports = ctx.namedImportMap.get(filePath);
@@ -182,13 +290,14 @@ async function runCrossFileBindingPropagation(
       }
 
       const importedReturns = buildImportedReturnTypes(filePath, ctx.namedImportMap, ctx.symbols);
+      const importedRawReturns = buildImportedRawReturnTypes(filePath, ctx.namedImportMap, ctx.symbols);
       if (seeded.size === 0 && importedReturns.size === 0) continue;
       if (!allPathSet.has(filePath)) continue;
 
       const lang = getLanguageFromFilename(filePath);
       if (!lang || !isLanguageAvailable(lang)) continue;
 
-      levelCandidates.push({ filePath, seeded, importedReturns });
+      levelCandidates.push({ filePath, seeded, importedReturns, importedRawReturns });
     }
 
     if (levelCandidates.length === 0) continue;
@@ -196,7 +305,7 @@ async function runCrossFileBindingPropagation(
     const levelPaths = levelCandidates.map(c => c.filePath);
     const contentMap = await readFileContents(repoPath, levelPaths);
 
-    for (const { filePath, seeded, importedReturns } of levelCandidates) {
+    for (const { filePath, seeded, importedReturns, importedRawReturns } of levelCandidates) {
       const content = contentMap.get(filePath);
       if (!content) continue;
 
@@ -209,7 +318,12 @@ async function runCrossFileBindingPropagation(
         importedReturnTypesMap.set(filePath, importedReturns);
       }
 
-      await processCalls(graph, reFile, astCache, ctx, undefined, exportedTypeMap, bindings.size > 0 ? bindings : undefined, importedReturnTypesMap.size > 0 ? importedReturnTypesMap : undefined);
+      const importedRawReturnTypesMap = new Map<string, ReadonlyMap<string, string>>();
+      if (importedRawReturns.size > 0) {
+        importedRawReturnTypesMap.set(filePath, importedRawReturns);
+      }
+
+      await processCalls(graph, reFile, astCache, ctx, undefined, exportedTypeMap, bindings.size > 0 ? bindings : undefined, importedReturnTypesMap.size > 0 ? importedReturnTypesMap : undefined, importedRawReturnTypesMap.size > 0 ? importedRawReturnTypesMap : undefined);
       crossFileResolved++;
     }
 
@@ -418,6 +532,8 @@ export const runPipelineFromRepo = async (
     const sequentialChunkPaths: string[][] = [];
     // Phase 14: Collect exported type bindings for cross-file propagation
     const exportedTypeMap: ExportedTypeMap = new Map();
+    // Accumulate file-scope TypeEnv bindings from workers (closes worker/sequential quality gap)
+    const workerTypeEnvBindings: { filePath: string; bindings: [string, string][] }[] = [];
 
     try {
       for (let chunkIdx = 0; chunkIdx < numChunks; chunkIdx++) {
@@ -461,6 +577,9 @@ export const runPipelineFromRepo = async (
           }, repoPath, importCtx);
           // Phase 14 E1: Seed cross-file receiver types from ExportedTypeMap
           // before call resolution — eliminates re-parse for single-hop imported receivers.
+          // NOTE: In the worker path, exportedTypeMap is empty during chunk processing
+          // (populated later in runCrossFileBindingPropagation). This block is latent —
+          // it activates only if incremental export collection is added per-chunk.
           if (exportedTypeMap.size > 0 && ctx.namedImportMap.size > 0) {
             const { enrichedCount } = seedCrossFileReceiverTypes(
               chunkWorkerData.calls, ctx.namedImportMap, exportedTypeMap,
@@ -487,7 +606,6 @@ export const runPipelineFromRepo = async (
                 });
               },
               chunkWorkerData.constructorBindings,
-              exportedTypeMap,
             ),
             processHeritageFromExtracted(
               graph,
@@ -521,6 +639,10 @@ export const runPipelineFromRepo = async (
           // Process field write assignments (synchronous, runs after calls resolve)
           if (chunkWorkerData.assignments?.length) {
             processAssignmentsFromExtracted(graph, chunkWorkerData.assignments, ctx, chunkWorkerData.constructorBindings);
+          }
+          // Collect TypeEnv file-scope bindings for exported type enrichment
+          if (chunkWorkerData.typeEnvBindings?.length) {
+            workerTypeEnvBindings.push(...chunkWorkerData.typeEnvBindings);
           }
         } else {
           await processImports(graph, chunkFiles, astCache, ctx, undefined, repoPath, allPaths);
@@ -558,6 +680,44 @@ export const runPipelineFromRepo = async (
       const total = rcStats.cacheHits + rcStats.cacheMisses;
       const hitRate = total > 0 ? ((rcStats.cacheHits / total) * 100).toFixed(1) : '0';
       console.log(`🔍 Resolution cache: ${rcStats.cacheHits} hits, ${rcStats.cacheMisses} misses (${hitRate}% hit rate)`);
+    }
+
+    // ── Worker path quality enrichment: merge TypeEnv file-scope bindings into ExportedTypeMap ──
+    // Workers return file-scope bindings from their TypeEnv fixpoint (includes inferred types
+    // like `const config = getConfig()` → Config). Filter by graph isExported to match
+    // the sequential path's collectExportedBindings behavior.
+    if (workerTypeEnvBindings.length > 0) {
+      let enriched = 0;
+      for (const { filePath, bindings } of workerTypeEnvBindings) {
+        for (const [name, type] of bindings) {
+          // Verify the symbol is exported via graph node
+          const nodeId = `Function:${filePath}:${name}`;
+          const varNodeId = `Variable:${filePath}:${name}`;
+          const constNodeId = `Const:${filePath}:${name}`;
+          const node = graph.getNode(nodeId) ?? graph.getNode(varNodeId) ?? graph.getNode(constNodeId);
+          if (!node?.properties?.isExported) continue;
+
+          let fileExports = exportedTypeMap.get(filePath);
+          if (!fileExports) { fileExports = new Map(); exportedTypeMap.set(filePath, fileExports); }
+          // Don't overwrite existing entries (Tier 0 from SymbolTable is authoritative)
+          if (!fileExports.has(name)) {
+            fileExports.set(name, type);
+            enriched++;
+          }
+        }
+      }
+      if (isDev && enriched > 0) {
+        console.log(`🔗 Worker TypeEnv enrichment: ${enriched} fixpoint-inferred exports added to ExportedTypeMap`);
+      }
+    }
+
+    // ── Phase 14 pre-pass: Synthesize namedImportMap for whole-module-import languages ──
+    // Go, Ruby, C/C++, Swift import all exported symbols from a file.
+    // Expand ImportMap edges into per-symbol namedImportMap entries so Phase 14 can
+    // propagate types cross-file for these languages.
+    const synthesized = synthesizeWildcardImportBindings(graph, ctx);
+    if (isDev && synthesized > 0) {
+      console.log(`🔗 Synthesized ${synthesized} wildcard import bindings (Go/Ruby/C++/Swift)`);
     }
 
     // ── Phase 14: Cross-file binding propagation ──────────────────────
