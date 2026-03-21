@@ -5,12 +5,11 @@ import { LANGUAGE_QUERIES } from './tree-sitter-queries.js';
 import { generateId } from '../../lib/utils.js';
 import { SymbolTable } from './symbol-table.js';
 import { ASTCache } from './ast-cache.js';
-import { getLanguageFromFilename, yieldToEventLoop, getDefinitionNodeFromCaptures, findEnclosingClassId, extractMethodSignature, isKotlinClassMethod } from './utils.js';
+import { getLanguageFromFilename, yieldToEventLoop, getDefinitionNodeFromCaptures, findEnclosingClassId, extractMethodSignature, getLabelFromCaptures } from './utils.js';
 import { extractPropertyDeclaredType } from './type-extractors/shared.js';
 import { isNodeExported } from './export-detection.js';
 import { detectFrameworkFromAST } from './framework-detection.js';
 import { typeConfigs } from './type-extractors/index.js';
-import { SupportedLanguages } from '../../config/supported-languages.js';
 import { WorkerPool } from './workers/worker-pool.js';
 import type { ParseWorkerResult, ParseWorkerInput, ExtractedImport, ExtractedCall, ExtractedAssignment, ExtractedHeritage, ExtractedRoute, FileConstructorBindings, FileTypeEnvBindings } from './workers/parse-worker.js';
 import { getTreeSitterBufferSize, TREE_SITTER_MAX_BUFFER } from './constants.js';
@@ -26,10 +25,6 @@ export interface WorkerExtractedData {
   constructorBindings: FileConstructorBindings[];
   typeEnvBindings: FileTypeEnvBindings[];
 }
-
-// isNodeExported imported from ./export-detection.js (shared module)
-// Re-export for backward compatibility with any external consumers
-export { isNodeExported } from './export-detection.js';
 
 // ============================================================================
 // Worker-based parallel parsing
@@ -196,64 +191,13 @@ const processParsingSequential = async (
         captureMap[c.name] = c.node;
       });
 
-      if (captureMap['import']) {
-        return;
-      }
-
-      if (captureMap['call']) {
-        return;
-      }
+      const nodeLabel = getLabelFromCaptures(captureMap, language);
+      if (!nodeLabel) return;
 
       const nameNode = captureMap['name'];
       // Synthesize name for constructors without explicit @name capture (e.g. Swift init)
-      if (!nameNode && !captureMap['definition.constructor']) return;
+      if (!nameNode && nodeLabel !== 'Constructor') return;
       const nodeName = nameNode ? nameNode.text : 'init';
-
-      let nodeLabel: NodeLabel = 'CodeElement';
-
-      if (captureMap['definition.function']) {
-        // C/C++: @definition.function is broad and also matches inline class methods (inside
-        // a class/struct body). Those are already captured by @definition.method, so skip
-        // the duplicate Function entry to prevent double-indexing in globalIndex.
-        if (language === SupportedLanguages.CPlusPlus || language === SupportedLanguages.C) {
-          let ancestor = captureMap['definition.function']?.parent;
-          while (ancestor) {
-            if (ancestor.type === 'class_specifier' || ancestor.type === 'struct_specifier') {
-              break;
-            }
-            ancestor = ancestor.parent;
-          }
-          if (ancestor) return; // inside a class body — handled by @definition.method
-        }
-
-        // Kotlin: function_declaration inside a class_body is a method, not a top-level function.
-        if (language === SupportedLanguages.Kotlin &&
-            isKotlinClassMethod(captureMap['definition.function'])) {
-          nodeLabel = 'Method';
-        }
-        if (nodeLabel !== 'Method') nodeLabel = 'Function';
-      }
-      else if (captureMap['definition.class']) nodeLabel = 'Class';
-      else if (captureMap['definition.interface']) nodeLabel = 'Interface';
-      else if (captureMap['definition.method']) nodeLabel = 'Method';
-      else if (captureMap['definition.struct']) nodeLabel = 'Struct';
-      else if (captureMap['definition.enum']) nodeLabel = 'Enum';
-      else if (captureMap['definition.namespace']) nodeLabel = 'Namespace';
-      else if (captureMap['definition.module']) nodeLabel = 'Module';
-      else if (captureMap['definition.trait']) nodeLabel = 'Trait';
-      else if (captureMap['definition.impl']) nodeLabel = 'Impl';
-      else if (captureMap['definition.type']) nodeLabel = 'TypeAlias';
-      else if (captureMap['definition.const']) nodeLabel = 'Const';
-      else if (captureMap['definition.static']) nodeLabel = 'Static';
-      else if (captureMap['definition.typedef']) nodeLabel = 'Typedef';
-      else if (captureMap['definition.macro']) nodeLabel = 'Macro';
-      else if (captureMap['definition.union']) nodeLabel = 'Union';
-      else if (captureMap['definition.property']) nodeLabel = 'Property';
-      else if (captureMap['definition.record']) nodeLabel = 'Record';
-      else if (captureMap['definition.delegate']) nodeLabel = 'Delegate';
-      else if (captureMap['definition.annotation']) nodeLabel = 'Annotation';
-      else if (captureMap['definition.constructor']) nodeLabel = 'Constructor';
-      else if (captureMap['definition.template']) nodeLabel = 'Template';
 
       const definitionNodeForRange = getDefinitionNodeFromCaptures(captureMap);
       const startLine = definitionNodeForRange ? definitionNodeForRange.startPosition.row : (nameNode ? nameNode.startPosition.row : 0);

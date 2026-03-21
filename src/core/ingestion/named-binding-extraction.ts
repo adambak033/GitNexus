@@ -1,6 +1,8 @@
-import { SupportedLanguages } from '../../config/supported-languages.js';
 import type { SymbolTable, SymbolDefinition } from './symbol-table.js';
 import type { NamedImportMap } from './import-processor.js';
+import type { NamedBinding } from './import-resolution.js';
+import type { SyntaxNode } from './utils.js';
+import { findChild } from './resolvers/utils.js';
 
 /**
  * Walk a named-binding re-export chain through NamedImportMap.
@@ -54,61 +56,14 @@ export function walkBindingChain(
   return null;
 }
 
-/**
- * Extract named bindings from an import AST node.
- * Returns undefined if the import is not a named import (e.g., import * or default).
- *
- * TS: import { User, Repo as R } from './models'
- *   → [{local:'User', exported:'User'}, {local:'R', exported:'Repo'}]
- *
- * Python: from models import User, Repo as R
- *   → [{local:'User', exported:'User'}, {local:'R', exported:'Repo'}]
- */
-export function extractNamedBindings(
-  importNode: any,
-  language: SupportedLanguages,
-): { local: string; exported: string }[] | undefined {
-  if (language === SupportedLanguages.TypeScript || language === SupportedLanguages.JavaScript) {
-    return extractTsNamedBindings(importNode);
-  }
-  if (language === SupportedLanguages.Python) {
-    return extractPythonNamedBindings(importNode);
-  }
-  if (language === SupportedLanguages.Kotlin) {
-    return extractKotlinNamedBindings(importNode);
-  }
-  if (language === SupportedLanguages.Rust) {
-    return extractRustNamedBindings(importNode);
-  }
-  if (language === SupportedLanguages.PHP) {
-    return extractPhpNamedBindings(importNode);
-  }
-  if (language === SupportedLanguages.CSharp) {
-    return extractCsharpNamedBindings(importNode);
-  }
-  if (language === SupportedLanguages.Java) {
-    return extractJavaNamedBindings(importNode);
-  }
-  // Languages below use whole-module import semantics — the import AST node does not
-  // name specific symbols. namedImportMap entries are synthesized post-parse by
-  // synthesizeWildcardImportBindings() in pipeline.ts, which expands ImportMap edges
-  // into per-symbol bindings using graph-exported symbols.
-  //
-  // Go: `import "pkg"` — all PascalCase symbols available as pkg.Symbol
-  // Ruby: `require 'file'` — all top-level classes/modules available
-  // C/C++: `#include "file.h"` — textual inclusion, all non-static declarations available
-  // Swift: `import Module` — entire module imported (Phase S blocked on tree-sitter-swift Node 22)
-  return undefined;
-}
-
-export function extractTsNamedBindings(importNode: any): { local: string; exported: string }[] | undefined {
+export function extractTsNamedBindings(importNode: SyntaxNode): NamedBinding[] | undefined {
   // import_statement > import_clause > named_imports > import_specifier*
   const importClause = findChild(importNode, 'import_clause');
   if (importClause) {
     const namedImports = findChild(importClause, 'named_imports');
     if (!namedImports) return undefined; // default import, namespace import, or side-effect
 
-    const bindings: { local: string; exported: string }[] = [];
+    const bindings: NamedBinding[] = [];
     for (let i = 0; i < namedImports.namedChildCount; i++) {
       const specifier = namedImports.namedChild(i);
       if (specifier?.type !== 'import_specifier') continue;
@@ -132,7 +87,7 @@ export function extractTsNamedBindings(importNode: any): { local: string; export
   // Re-export: export { X } from './y' → export_statement > export_clause > export_specifier
   const exportClause = findChild(importNode, 'export_clause');
   if (exportClause) {
-    const bindings: { local: string; exported: string }[] = [];
+    const bindings: NamedBinding[] = [];
     for (let i = 0; i < exportClause.namedChildCount; i++) {
       const specifier = exportClause.namedChild(i);
       if (specifier?.type !== 'export_specifier') continue;
@@ -159,11 +114,11 @@ export function extractTsNamedBindings(importNode: any): { local: string; export
   return undefined;
 }
 
-export function extractPythonNamedBindings(importNode: any): { local: string; exported: string }[] | undefined {
+export function extractPythonNamedBindings(importNode: SyntaxNode): NamedBinding[] | undefined {
   // Only from import_from_statement, not plain import_statement
   if (importNode.type !== 'import_from_statement') return undefined;
 
-  const bindings: { local: string; exported: string }[] = [];
+  const bindings: NamedBinding[] = [];
   for (let i = 0; i < importNode.namedChildCount; i++) {
     const child = importNode.namedChild(i);
     if (!child) continue;
@@ -191,7 +146,7 @@ export function extractPythonNamedBindings(importNode: any): { local: string; ex
   return bindings.length > 0 ? bindings : undefined;
 }
 
-export function extractKotlinNamedBindings(importNode: any): { local: string; exported: string }[] | undefined {
+export function extractKotlinNamedBindings(importNode: SyntaxNode): NamedBinding[] | undefined {
   // import_header > identifier + import_alias > simple_identifier
   if (importNode.type !== 'import_header') return undefined;
 
@@ -226,16 +181,16 @@ export function extractKotlinNamedBindings(importNode: any): { local: string; ex
   return [{ local: exportedName, exported: exportedName }];
 }
 
-export function extractRustNamedBindings(importNode: any): { local: string; exported: string }[] | undefined {
+export function extractRustNamedBindings(importNode: SyntaxNode): NamedBinding[] | undefined {
   // use_declaration may contain use_as_clause at any depth
   if (importNode.type !== 'use_declaration') return undefined;
 
-  const bindings: { local: string; exported: string }[] = [];
+  const bindings: NamedBinding[] = [];
   collectRustBindings(importNode, bindings);
   return bindings.length > 0 ? bindings : undefined;
 }
 
-function collectRustBindings(node: any, bindings: { local: string; exported: string }[]): void {
+function collectRustBindings(node: SyntaxNode, bindings: NamedBinding[]): void {
   if (node.type === 'use_as_clause') {
     // First identifier = exported name, second identifier = local alias
     const idents: string[] = [];
@@ -293,15 +248,15 @@ function collectRustBindings(node: any, bindings: { local: string; exported: str
   }
 }
 
-export function extractPhpNamedBindings(importNode: any): { local: string; exported: string }[] | undefined {
+export function extractPhpNamedBindings(importNode: SyntaxNode): NamedBinding[] | undefined {
   // namespace_use_declaration > namespace_use_clause* (flat)
   // namespace_use_declaration > namespace_use_group > namespace_use_clause* (grouped)
   if (importNode.type !== 'namespace_use_declaration') return undefined;
 
-  const bindings: { local: string; exported: string }[] = [];
+  const bindings: NamedBinding[] = [];
 
   // Collect all clauses — from direct children AND from namespace_use_group
-  const clauses: any[] = [];
+  const clauses: SyntaxNode[] = [];
   for (let i = 0; i < importNode.namedChildCount; i++) {
     const child = importNode.namedChild(i);
     if (child?.type === 'namespace_use_clause') {
@@ -316,8 +271,8 @@ export function extractPhpNamedBindings(importNode: any): { local: string; expor
 
   for (const clause of clauses) {
     // Flat imports: qualified_name + name (alias)
-    let qualifiedName: any = null;
-    const names: any[] = [];
+    let qualifiedName: SyntaxNode | null = null;
+    const names: SyntaxNode[] = [];
     for (let j = 0; j < clause.namedChildCount; j++) {
       const child = clause.namedChild(j);
       if (child?.type === 'qualified_name') qualifiedName = child;
@@ -345,15 +300,15 @@ export function extractPhpNamedBindings(importNode: any): { local: string; expor
   return bindings.length > 0 ? bindings : undefined;
 }
 
-export function extractCsharpNamedBindings(importNode: any): { local: string; exported: string }[] | undefined {
+export function extractCsharpNamedBindings(importNode: SyntaxNode): NamedBinding[] | undefined {
   // using_directive — three forms:
   //   using Alias = NS.Type;          → aliasIdent + qualifiedName
   //   using static NS.Type;           → static + qualifiedName (no alias)
   //   using NS;                       → qualifiedName only (namespace, not capturable)
   if (importNode.type !== 'using_directive') return undefined;
 
-  let aliasIdent: any = null;
-  let qualifiedName: any = null;
+  let aliasIdent: SyntaxNode | null = null;
+  let qualifiedName: SyntaxNode | null = null;
   let isStatic = false;
   for (let i = 0; i < importNode.childCount; i++) {
     const child = importNode.child(i);
@@ -383,7 +338,7 @@ export function extractCsharpNamedBindings(importNode: any): { local: string; ex
   return undefined;
 }
 
-export function extractJavaNamedBindings(importNode: any): { local: string; exported: string }[] | undefined {
+export function extractJavaNamedBindings(importNode: SyntaxNode): NamedBinding[] | undefined {
   // import_declaration > scoped_identifier "com.example.models.User"
   // Wildcard imports (.*) don't produce named bindings
   if (importNode.type !== 'import_declaration') return undefined;
@@ -411,10 +366,3 @@ export function extractJavaNamedBindings(importNode: any): { local: string; expo
   return [{ local: name, exported: name }];
 }
 
-function findChild(node: any, type: string): any {
-  for (let i = 0; i < node.namedChildCount; i++) {
-    const child = node.namedChild(i);
-    if (child?.type === type) return child;
-  }
-  return null;
-}

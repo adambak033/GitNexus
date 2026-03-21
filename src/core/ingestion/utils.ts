@@ -1,5 +1,6 @@
 import type Parser from 'tree-sitter';
 import { SupportedLanguages } from '../../config/supported-languages.js';
+import type { NodeLabel } from '../graph/types.js';
 import { generateId } from '../../lib/utils.js';
 import { extractSimpleTypeName } from './type-extractors/shared.js';
 
@@ -270,6 +271,67 @@ export function isKotlinClassMethod(captureNode: { parent?: any } | null | undef
     ancestor = ancestor.parent;
   }
   return false;
+}
+
+/**
+ * C/C++: check if a Function capture is inside a class/struct body.
+ * If true, the function is already captured by @definition.method and should be skipped
+ * to prevent double-indexing in globalIndex.
+ */
+export function isCppDuplicateClassFunction(
+  functionNode: { parent?: any } | null | undefined,
+  nodeLabel: string,
+  language: SupportedLanguages,
+): boolean {
+  if (nodeLabel !== 'Function') return false;
+  if (language !== SupportedLanguages.CPlusPlus && language !== SupportedLanguages.C) return false;
+  let ancestor = functionNode?.parent;
+  while (ancestor) {
+    if (ancestor.type === 'class_specifier' || ancestor.type === 'struct_specifier') return true;
+    ancestor = ancestor.parent;
+  }
+  return false;
+}
+
+/**
+ * Determine the graph node label from a tree-sitter capture map.
+ * Handles language-specific reclassification (C/C++ duplicate skipping, Kotlin Method promotion).
+ * Returns null if the capture should be skipped (import, call, C/C++ duplicate, missing name).
+ */
+export function getLabelFromCaptures(
+  captureMap: Record<string, any>,
+  language: SupportedLanguages,
+): NodeLabel | null {
+  if (captureMap['import'] || captureMap['call']) return null;
+  if (!captureMap['name'] && !captureMap['definition.constructor']) return null;
+
+  if (captureMap['definition.function']) {
+    if (isCppDuplicateClassFunction(captureMap['definition.function'], 'Function', language)) return null;
+    if (language === SupportedLanguages.Kotlin && isKotlinClassMethod(captureMap['definition.function'])) return 'Method';
+    return 'Function';
+  }
+  if (captureMap['definition.class']) return 'Class';
+  if (captureMap['definition.interface']) return 'Interface';
+  if (captureMap['definition.method']) return 'Method';
+  if (captureMap['definition.struct']) return 'Struct';
+  if (captureMap['definition.enum']) return 'Enum';
+  if (captureMap['definition.namespace']) return 'Namespace';
+  if (captureMap['definition.module']) return 'Module';
+  if (captureMap['definition.trait']) return 'Trait';
+  if (captureMap['definition.impl']) return 'Impl';
+  if (captureMap['definition.type']) return 'TypeAlias';
+  if (captureMap['definition.const']) return 'Const';
+  if (captureMap['definition.static']) return 'Static';
+  if (captureMap['definition.typedef']) return 'Typedef';
+  if (captureMap['definition.macro']) return 'Macro';
+  if (captureMap['definition.union']) return 'Union';
+  if (captureMap['definition.property']) return 'Property';
+  if (captureMap['definition.record']) return 'Record';
+  if (captureMap['definition.delegate']) return 'Delegate';
+  if (captureMap['definition.annotation']) return 'Annotation';
+  if (captureMap['definition.constructor']) return 'Constructor';
+  if (captureMap['definition.template']) return 'Template';
+  return 'CodeElement';
 }
 
 /** AST node types that represent a class-like container (for HAS_METHOD edge extraction) */

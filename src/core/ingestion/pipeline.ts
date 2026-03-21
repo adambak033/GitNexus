@@ -7,6 +7,7 @@ import {
   processImportsFromExtracted,
   buildImportResolutionContext
 } from './import-processor.js';
+import { EMPTY_INDEX } from './resolvers/index.js';
 import { processCalls, processCallsFromExtracted, processAssignmentsFromExtracted, processRoutesFromExtracted, seedCrossFileReceiverTypes, buildImportedReturnTypes, buildImportedRawReturnTypes, type ExportedTypeMap, buildExportedTypeMapFromGraph } from './call-processor.js';
 import { processHeritage, processHeritageFromExtracted } from './heritage-processor.js';
 import { computeMRO } from './mro-processor.js';
@@ -729,7 +730,8 @@ export const runPipelineFromRepo = async (
     // (allPathObjects and importCtx hold ~94MB+ for large repos)
     allPathObjects.length = 0;
     importCtx.resolveCache.clear();
-    importCtx.dispose();
+    importCtx.index = EMPTY_INDEX; // Release suffix index memory (~30MB for large repos)
+    importCtx.normalizedFileList = [];
 
     let communityResult: Awaited<ReturnType<typeof processCommunities>> | undefined;
     let processResult: Awaited<ReturnType<typeof processProcesses>> | undefined;

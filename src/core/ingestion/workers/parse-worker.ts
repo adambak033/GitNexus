@@ -31,7 +31,7 @@ import {
   isBuiltInOrNoise,
   getDefinitionNodeFromCaptures,
   findEnclosingClassId,
-  isKotlinClassMethod,
+  getLabelFromCaptures,
   extractMethodSignature,
   countCallArguments,
   inferCallForm,
@@ -46,8 +46,8 @@ import { isNodeExported } from '../export-detection.js';
 import { detectFrameworkFromAST } from '../framework-detection.js';
 import { typeConfigs } from '../type-extractors/index.js';
 import { generateId } from '../../../lib/utils.js';
-import { extractNamedBindings } from '../named-binding-extraction.js';
-import { appendKotlinWildcard } from '../resolvers/index.js';
+import { namedBindingExtractors, preprocessImportPath } from '../import-resolution.js';
+import type { NamedBinding } from '../import-resolution.js';
 import { callRouters } from '../call-routing.js';
 import { extractPropertyDeclaredType } from '../type-extractors/shared.js';
 import type { NodeLabel } from '../../graph/types.js';
@@ -102,7 +102,7 @@ export interface ExtractedImport {
   rawImportPath: string;
   language: SupportedLanguages;
   /** Named bindings from the import (e.g., import {User as U} → [{local:'U', exported:'User'}]) */
-  namedBindings?: { local: string; exported: string }[];
+  namedBindings?: NamedBinding[];
 }
 
 export interface ExtractedCall {
@@ -259,40 +259,7 @@ const findEnclosingFunctionId = (node: any, filePath: string): string | null => 
   return null;
 };
 
-// ============================================================================
-// Label detection from capture map
-// ============================================================================
-
-const getLabelFromCaptures = (captureMap: Record<string, any>): NodeLabel | null => {
-  // Skip imports (handled separately) and calls
-  if (captureMap['import'] || captureMap['call']) return null;
-  // Allow constructors without explicit @name capture (e.g. Swift init) — name synthesized downstream
-  if (!captureMap['name'] && !captureMap['definition.constructor']) return null;
-
-  if (captureMap['definition.function']) return 'Function';
-  if (captureMap['definition.class']) return 'Class';
-  if (captureMap['definition.interface']) return 'Interface';
-  if (captureMap['definition.method']) return 'Method';
-  if (captureMap['definition.struct']) return 'Struct';
-  if (captureMap['definition.enum']) return 'Enum';
-  if (captureMap['definition.namespace']) return 'Namespace';
-  if (captureMap['definition.module']) return 'Module';
-  if (captureMap['definition.trait']) return 'Trait';
-  if (captureMap['definition.impl']) return 'Impl';
-  if (captureMap['definition.type']) return 'TypeAlias';
-  if (captureMap['definition.const']) return 'Const';
-  if (captureMap['definition.static']) return 'Static';
-  if (captureMap['definition.typedef']) return 'Typedef';
-  if (captureMap['definition.macro']) return 'Macro';
-  if (captureMap['definition.union']) return 'Union';
-  if (captureMap['definition.property']) return 'Property';
-  if (captureMap['definition.record']) return 'Record';
-  if (captureMap['definition.delegate']) return 'Delegate';
-  if (captureMap['definition.annotation']) return 'Annotation';
-  if (captureMap['definition.constructor']) return 'Constructor';
-  if (captureMap['definition.template']) return 'Template';
-  return 'CodeElement';
-};
+// Label detection moved to shared getLabelFromCaptures in utils.ts
 
 // DEFINITION_CAPTURE_KEYS and getDefinitionNodeFromCaptures imported from ../utils.js
 
@@ -964,10 +931,9 @@ const processFileGroup = (
 
       // Extract import paths before skipping
       if (captureMap['import'] && captureMap['import.source']) {
-        const rawImportPath = language === SupportedLanguages.Kotlin
-          ? appendKotlinWildcard(captureMap['import.source'].text.replace(/['"<>]/g, ''), captureMap['import'])
-          : captureMap['import.source'].text.replace(/['"<>]/g, '');
-        const namedBindings = extractNamedBindings(captureMap['import'], language);
+        const rawImportPath = preprocessImportPath(captureMap['import.source'].text, captureMap['import'], language);
+        const extractor = namedBindingExtractors[language];
+        const namedBindings = extractor ? extractor(captureMap['import']) : undefined;
         result.imports.push({
           filePath: file.path,
           rawImportPath,
@@ -1166,31 +1132,8 @@ const processFileGroup = (
         }
       }
 
-      let nodeLabel = getLabelFromCaptures(captureMap);
+      const nodeLabel = getLabelFromCaptures(captureMap, language);
       if (!nodeLabel) continue;
-
-      // C/C++: @definition.function is broad and also matches inline class methods (inside
-      // a class/struct body). Those are already captured by @definition.method, so skip
-      // the duplicate Function entry to prevent double-indexing in globalIndex.
-      if (
-        (language === SupportedLanguages.CPlusPlus || language === SupportedLanguages.C) &&
-        nodeLabel === 'Function'
-      ) {
-        let ancestor = captureMap['definition.function']?.parent;
-        while (ancestor) {
-          if (ancestor.type === 'class_specifier' || ancestor.type === 'struct_specifier') {
-            break; // inside a class body — duplicate of @definition.method
-          }
-          ancestor = ancestor.parent;
-        }
-        if (ancestor) continue; // found a class/struct ancestor → skip
-      }
-
-      // Kotlin: function_declaration inside a class_body is a method, not a top-level function.
-      if (language === SupportedLanguages.Kotlin && nodeLabel === 'Function' &&
-          isKotlinClassMethod(captureMap['definition.function'])) {
-        nodeLabel = 'Method';
-      }
 
       const nameNode = captureMap['name'];
       // Synthesize name for constructors without explicit @name capture (e.g. Swift init)
