@@ -133,6 +133,8 @@ const httpEmbedBatch = async (
   return data.data;
 };
 
+let dimsMismatchWarned = false;
+
 /**
  * Embed texts via the HTTP backend, splitting into batches.
  * Reads config from env vars on every call.
@@ -141,6 +143,8 @@ const httpEmbedBatch = async (
  * @returns Array of Float32Array embedding vectors
  */
 export const httpEmbed = async (texts: string[]): Promise<Float32Array[]> => {
+  if (texts.length === 0) return [];
+
   const config = readConfig();
   if (!config) throw new Error('HTTP embedding not configured');
 
@@ -154,6 +158,18 @@ export const httpEmbed = async (texts: string[]): Promise<Float32Array[]> => {
 
     for (const item of items) {
       allVectors.push(new Float32Array(item.embedding));
+    }
+  }
+
+  // Warn once if the API returned a different dimension than configured
+  if (config.dimensions && allVectors.length > 0 && !dimsMismatchWarned) {
+    const actual = allVectors[0].length;
+    if (actual !== config.dimensions) {
+      console.warn(
+        `⚠️  HTTP embeddings returned ${actual}d vectors, expected ${config.dimensions}d (GITNEXUS_EMBEDDING_DIMS). ` +
+        `Update GITNEXUS_EMBEDDING_DIMS to match your model.`,
+      );
+      dimsMismatchWarned = true;
     }
   }
 
