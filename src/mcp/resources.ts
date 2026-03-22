@@ -327,6 +327,8 @@ node_properties:
   Function: "parameterCount (INT32), returnType (STRING), isVariadic (BOOL)"
   Property: "declaredType (STRING) — the field's type annotation (e.g., 'Address', 'City'). Used for field-access chain resolution."
   Constructor: "parameterCount (INT32)"
+  Community: "heuristicLabel (STRING), cohesion (DOUBLE), symbolCount (INT32), keywords (STRING[]), description (STRING), enrichedBy (STRING)"
+  Process: "heuristicLabel (STRING), processType (STRING — 'intra_community' or 'cross_community'), stepCount (INT32), communities (STRING[]), entryPointId (STRING), terminalId (STRING)"
 
 relationships:
   - CONTAINS: File/Folder contains child

@@ -110,8 +110,8 @@ OUTPUT: Returns { markdown, row_count } — results formatted as a Markdown tabl
 
 TIPS:
 - All relationships use single CodeRelation table — filter with {type: 'CALLS'} etc.
-- Community = auto-detected functional area (Leiden algorithm)
-- Process = execution flow trace from entry point to terminal
+- Community = auto-detected functional area (Leiden algorithm). Properties: heuristicLabel, cohesion, symbolCount, keywords, description, enrichedBy
+- Process = execution flow trace from entry point to terminal. Properties: heuristicLabel, processType, stepCount, communities, entryPointId, terminalId
 - Use heuristicLabel (not label) for human-readable community/process names`,
     inputSchema: {
       type: 'object',
