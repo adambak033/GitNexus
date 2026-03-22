@@ -827,7 +827,15 @@ const resolveCallTarget = (
   const tiered = ctx.resolve(call.calledName, currentFile);
   if (!tiered) return null;
 
-  const filteredCandidates = filterCallableCandidates(tiered.candidates, call.argCount, call.callForm);
+  let filteredCandidates = filterCallableCandidates(tiered.candidates, call.argCount, call.callForm);
+
+  // Module-qualified constructor pattern: e.g. Python `import models; models.User()`.
+  // The attribute access gives callForm='member', but the callee may be a Class — a valid
+  // constructor target. Re-try with constructor-form filtering so that `module.ClassName()`
+  // emits a CALLS edge to the class node.
+  if (filteredCandidates.length === 0 && call.callForm === 'member') {
+    filteredCandidates = filterCallableCandidates(tiered.candidates, call.argCount, 'constructor');
+  }
 
   // D. Receiver-type filtering: for member calls with a known receiver type,
   // resolve the type through the same tiered import infrastructure, then

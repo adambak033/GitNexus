@@ -1564,3 +1564,55 @@ describe('Python cross-file binding propagation', () => {
     expect(getNameEdge).toBeDefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Module import: `import models; models.User()` should produce CALLS edges
+// even when multiple imported modules export a class with the same name.
+// Without wildcard synthesis, Tier 2a returns candidates from both imported
+// files (models.User + auth.User) → resolveCallTarget returns null → 0 CALLS.
+// ---------------------------------------------------------------------------
+
+describe('Python module import CALLS resolution (Issue #337)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'python-module-import'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User (×2) and Admin classes', () => {
+    const classes = getNodesByLabel(result, 'Class');
+    expect(classes.filter(c => c === 'User').length).toBe(2);
+    expect(classes).toContain('Admin');
+  });
+
+  it('resolves `import models` and `import auth` IMPORTS edges from app.py', () => {
+    const imports = getRelationships(result, 'IMPORTS');
+    const toModels = imports.find(e =>
+      e.sourceFilePath === 'app.py' && e.targetFilePath === 'models.py',
+    );
+    const toAuth = imports.find(e =>
+      e.sourceFilePath === 'app.py' && e.targetFilePath === 'auth.py',
+    );
+    expect(toModels).toBeDefined();
+    expect(toAuth).toBeDefined();
+  });
+
+  it('resolves models.User() CALLS edge to models.py:User (not 0 edges despite name collision)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userCall = calls.find(c =>
+      c.target === 'User' && c.targetFilePath === 'models.py',
+    );
+    expect(userCall).toBeDefined();
+  });
+
+  it('resolves auth.Admin() CALLS edge to auth.py:Admin', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const adminCall = calls.find(c =>
+      c.target === 'Admin' && c.targetFilePath === 'auth.py',
+    );
+    expect(adminCall).toBeDefined();
+  });
+});

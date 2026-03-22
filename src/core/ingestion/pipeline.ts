@@ -118,13 +118,14 @@ const WILDCARD_IMPORT_LANGUAGES = new Set([
   SupportedLanguages.C,
   SupportedLanguages.CPlusPlus,
   SupportedLanguages.Swift,
+  SupportedLanguages.Python, // `import models` imports all exported symbols from modules
 ]);
 
 /** Synthesize namedImportMap entries for languages with whole-module imports.
- *  These languages (Go, Ruby, C/C++, Swift) import all exported symbols from a file,
- *  not specific named symbols. After parsing, we know which symbols each file exports
- *  (via graph isExported), so we can expand ImportMap edges into per-symbol bindings
- *  that Phase 14 can use for cross-file type propagation. */
+ *  These languages (Go, Ruby, C/C++, Swift, Python) import all exported symbols from a
+ *  file, not specific named symbols. After parsing, we know which symbols each file
+ *  exports (via graph isExported), so we can expand ImportMap edges into per-symbol
+ *  bindings that Phase 14 can use for cross-file type propagation. */
 function synthesizeWildcardImportBindings(
   graph: ReturnType<typeof createKnowledgeGraph>,
   ctx: ReturnType<typeof createResolutionContext>,
@@ -576,6 +577,12 @@ export const runPipelineFromRepo = async (
               stats: { filesProcessed: filesParsedSoFar, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
             });
           }, repoPath, importCtx);
+          // ── Wildcard-import synthesis (Python / Ruby / C/C++ / Swift / Go) ──────────────
+          // Synthesize namedImportMap entries for module-qualified calls like Python's
+          // `models.User()`. Must run after imports are resolved (importMap is populated)
+          // but BEFORE call resolution so Tier 2a-named can disambiguate `module.Name()`.
+          // Idempotent: first-seen semantics prevents double-counting across chunks.
+          synthesizeWildcardImportBindings(graph, ctx);
           // Phase 14 E1: Seed cross-file receiver types from ExportedTypeMap
           // before call resolution — eliminates re-parse for single-hop imported receivers.
           // NOTE: In the worker path, exportedTypeMap is empty during chunk processing
@@ -661,6 +668,9 @@ export const runPipelineFromRepo = async (
     }
 
     // Sequential fallback chunks: re-read source for call/heritage resolution
+    // Synthesize wildcard import bindings once after ALL imports are processed,
+    // before any call resolution — same rationale as the worker-path inline synthesis.
+    if (sequentialChunkPaths.length > 0) synthesizeWildcardImportBindings(graph, ctx);
     for (const chunkPaths of sequentialChunkPaths) {
       const chunkContents = await readFileContents(repoPath, chunkPaths);
       const chunkFiles = chunkPaths
@@ -712,13 +722,13 @@ export const runPipelineFromRepo = async (
       }
     }
 
-    // ── Phase 14 pre-pass: Synthesize namedImportMap for whole-module-import languages ──
-    // Go, Ruby, C/C++, Swift import all exported symbols from a file.
-    // Expand ImportMap edges into per-symbol namedImportMap entries so Phase 14 can
-    // propagate types cross-file for these languages.
+    // ── Phase 14 pre-pass: Final synthesis pass for whole-module-import languages ──
+    // Per-chunk synthesis (above) already ran incrementally. This final pass ensures
+    // any remaining files whose imports were not covered inline are also synthesized,
+    // and that Phase 14 type propagation has complete namedImportMap data.
     const synthesized = synthesizeWildcardImportBindings(graph, ctx);
     if (isDev && synthesized > 0) {
-      console.log(`🔗 Synthesized ${synthesized} wildcard import bindings (Go/Ruby/C++/Swift)`);
+      console.log(`🔗 Synthesized ${synthesized} additional wildcard import bindings (Go/Ruby/C++/Swift/Python)`);
     }
 
     // ── Phase 14: Cross-file binding propagation ──────────────────────
