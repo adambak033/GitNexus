@@ -15,7 +15,7 @@ import { initLbug, loadGraphToLbug, getLbugStats, executeQuery, executeWithReuse
 // versions whose ABI is not yet supported by the native binary (#89).
 // disposeEmbedder intentionally not called — ONNX Runtime segfaults on cleanup (see #38)
 import { getStoragePaths, saveMeta, loadMeta, addToGitignore, registerRepo, getGlobalRegistryPath, cleanupOldKuzuFiles } from '../storage/repo-manager.js';
-import { getCurrentCommit, isGitRepo, getGitRoot } from '../storage/git.js';
+import { getCurrentCommit, isGitRepo, getGitRoot, hasGitDir } from '../storage/git.js';
 import { generateAIContextFiles } from './ai-context.js';
 import { generateSkillFiles, type GeneratedSkillInfo } from './skill-gen.js';
 import fs from 'fs/promises';
@@ -48,6 +48,8 @@ export interface AnalyzeOptions {
   embeddings?: boolean;
   skills?: boolean;
   verbose?: boolean;
+  /** Index the folder even when no .git directory is present. */
+  noGit?: boolean;
 }
 
 /** Threshold: auto-skip embeddings for repos with more nodes than this */
@@ -87,17 +89,26 @@ export const analyzeCommand = async (
   } else {
     const gitRoot = getGitRoot(process.cwd());
     if (!gitRoot) {
-      console.log('  Not inside a git repository\n');
-      process.exitCode = 1;
-      return;
+      if (!options?.noGit) {
+        console.log('  Not inside a git repository.\n  Tip: pass --no-git to index any folder without a .git directory.\n');
+        process.exitCode = 1;
+        return;
+      }
+      // --no-git: fall back to cwd as the root
+      repoPath = path.resolve(process.cwd());
+    } else {
+      repoPath = gitRoot;
     }
-    repoPath = gitRoot;
   }
 
-  if (!isGitRepo(repoPath)) {
-    console.log('  Not a git repository\n');
+  const repoHasGit = isGitRepo(repoPath);
+  if (!repoHasGit && !options?.noGit) {
+    console.log('  Not a git repository.\n  Tip: pass --no-git to index any folder without a .git directory.\n');
     process.exitCode = 1;
     return;
+  }
+  if (!repoHasGit) {
+    console.log('  Warning: no .git directory found — commit-tracking and incremental updates disabled.\n');
   }
 
   const { storagePath, lbugPath } = getStoragePaths(repoPath);
@@ -109,7 +120,7 @@ export const analyzeCommand = async (
     console.log('  Migrating from KuzuDB to LadybugDB — rebuilding index...\n');
   }
 
-  const currentCommit = getCurrentCommit(repoPath);
+  const currentCommit = repoHasGit ? getCurrentCommit(repoPath) : '';
   const existingMeta = await loadMeta(storagePath);
 
   if (existingMeta && !options?.force && !options?.skills && existingMeta.lastCommit === currentCommit) {
@@ -317,7 +328,10 @@ export const analyzeCommand = async (
   };
   await saveMeta(storagePath, meta);
   await registerRepo(repoPath, meta);
-  await addToGitignore(repoPath);
+  // Only attempt to update .gitignore when a git repository is present
+  if (repoHasGit) {
+    await addToGitignore(repoPath);
+  }
 
   const projectName = path.basename(repoPath);
   let aggregatedClusterCount = 0;
