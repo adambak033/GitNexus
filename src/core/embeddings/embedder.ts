@@ -38,7 +38,9 @@ function hasOrtCudaProvider(): boolean {
     const transformersDir = dirname(require.resolve('@huggingface/transformers/package.json'));
     const ortRequire = createRequire(join(transformersDir, 'package.json'));
     const ortPath = dirname(ortRequire.resolve('onnxruntime-node/package.json'));
-    const arch = process.arch; // x64, arm64, etc.
+    // ORT 1.24.x only ships CUDA binaries for linux/x64 (downloaded from NuGet
+    // at postinstall). arm64 will correctly return false here until ORT adds support.
+    const arch = process.arch;
     return existsSync(join(ortPath, 'bin', 'napi-v6', 'linux', arch, 'libonnxruntime_providers_cuda.so'));
   } catch {
     return false;
