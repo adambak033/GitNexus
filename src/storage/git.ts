@@ -1,4 +1,5 @@
 import { execSync } from 'child_process';
+import { statSync } from 'fs';
 import path from 'path';
 
 // Git utilities for repository detection, commit tracking, and diff analysis
@@ -47,7 +48,6 @@ export const getGitRoot = (fromPath: string): string | null => {
  */
 export const hasGitDir = (dirPath: string): boolean => {
   try {
-    const { statSync } = require('fs') as typeof import('fs');
     statSync(path.join(dirPath, '.git'));
     return true;
   } catch {

@@ -328,8 +328,10 @@ export const analyzeCommand = async (
   };
   await saveMeta(storagePath, meta);
   await registerRepo(repoPath, meta);
-  // Only attempt to update .gitignore when a git repository is present
-  if (repoHasGit) {
+  // Only attempt to update .gitignore when a .git directory is present.
+  // Use hasGitDir (filesystem check) rather than isGitRepo (shells out to git)
+  // so we skip correctly for --no-git folders even if git CLI is available.
+  if (hasGitDir(repoPath)) {
     await addToGitignore(repoPath);
   }
 
