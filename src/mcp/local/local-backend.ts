@@ -49,6 +49,44 @@ export const VALID_NODE_LABELS = new Set([
 /** Valid relation types for impact analysis filtering */
 export const VALID_RELATION_TYPES = new Set(['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'HAS_METHOD', 'HAS_PROPERTY', 'OVERRIDES', 'ACCESSES']);
 
+/**
+ * Per-relation-type confidence floor for impact analysis.
+ *
+ * When the graph stores a relation with a confidence value, that stored
+ * value is used as-is (it reflects resolution-tier accuracy from analysis
+ * time).  This map provides the floor for each edge type when no stored
+ * confidence is available, and is also used for display / tooltip hints.
+ *
+ * Rationale:
+ *   CALLS / IMPORTS  – direct, strongly-typed references → 0.9
+ *   EXTENDS          – class hierarchy, statically verifiable → 0.85
+ *   IMPLEMENTS       – interface contract, statically verifiable → 0.85
+ *   OVERRIDES        – method override, statically verifiable → 0.85
+ *   HAS_METHOD       – structural containment → 0.95
+ *   HAS_PROPERTY     – structural containment → 0.95
+ *   ACCESSES         – field read/write, may be indirect → 0.8
+ *   CONTAINS         – folder/file containment → 0.95
+ *   (unknown type)   – conservative fallback → 0.5
+ */
+export const IMPACT_RELATION_CONFIDENCE: Readonly<Record<string, number>> = {
+  CALLS: 0.9,
+  IMPORTS: 0.9,
+  EXTENDS: 0.85,
+  IMPLEMENTS: 0.85,
+  OVERRIDES: 0.85,
+  HAS_METHOD: 0.95,
+  HAS_PROPERTY: 0.95,
+  ACCESSES: 0.8,
+  CONTAINS: 0.95,
+};
+
+/**
+ * Return the confidence floor for a given relation type.
+ * Falls back to 0.5 for unknown types so they are not silently elevated.
+ */
+const confidenceForRelType = (relType: string | undefined): number =>
+  IMPACT_RELATION_CONFIDENCE[relType ?? ''] ?? 0.5;
+
 /** Regex to detect write operations in user-supplied Cypher queries */
 export const CYPHER_WRITE_RE = /\b(CREATE|DELETE|SET|MERGE|REMOVE|DROP|ALTER|COPY|DETACH)\b/i;
 
@@ -1445,14 +1483,22 @@ export class LocalBackend {
           if (!visited.has(relId)) {
             visited.add(relId);
             nextFrontier.push(relId);
+            const storedConfidence = rel.confidence ?? rel[6];
+            const relationType = rel.relType || rel[5];
+            // Prefer the stored confidence from the graph (set at analysis time);
+            // fall back to the per-type floor for edges without a stored value.
+            const effectiveConfidence =
+              typeof storedConfidence === 'number' && storedConfidence > 0
+                ? storedConfidence
+                : confidenceForRelType(relationType);
             impacted.push({
               depth,
               id: relId,
               name: rel.name || rel[2],
               type: rel.type || rel[3],
               filePath,
-              relationType: rel.relType || rel[5],
-              confidence: rel.confidence || rel[6] || 1.0,
+              relationType,
+              confidence: effectiveConfidence,
             });
           }
         }
