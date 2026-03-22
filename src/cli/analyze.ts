@@ -15,7 +15,7 @@ import { initLbug, loadGraphToLbug, getLbugStats, executeQuery, executeWithReuse
 // versions whose ABI is not yet supported by the native binary (#89).
 // disposeEmbedder intentionally not called — ONNX Runtime segfaults on cleanup (see #38)
 import { getStoragePaths, saveMeta, loadMeta, addToGitignore, registerRepo, getGlobalRegistryPath, cleanupOldKuzuFiles } from '../storage/repo-manager.js';
-import { getCurrentCommit, isGitRepo, getGitRoot, hasGitDir } from '../storage/git.js';
+import { getCurrentCommit, getGitRoot, hasGitDir } from '../storage/git.js';
 import { generateAIContextFiles } from './ai-context.js';
 import { generateSkillFiles, type GeneratedSkillInfo } from './skill-gen.js';
 import fs from 'fs/promises';
@@ -49,7 +49,7 @@ export interface AnalyzeOptions {
   skills?: boolean;
   verbose?: boolean;
   /** Index the folder even when no .git directory is present. */
-  noGit?: boolean;
+  skipGit?: boolean;
 }
 
 /** Threshold: auto-skip embeddings for repos with more nodes than this */
@@ -89,26 +89,26 @@ export const analyzeCommand = async (
   } else {
     const gitRoot = getGitRoot(process.cwd());
     if (!gitRoot) {
-      if (!options?.noGit) {
-        console.log('  Not inside a git repository.\n  Tip: pass --no-git to index any folder without a .git directory.\n');
+      if (!options?.skipGit) {
+        console.log('  Not inside a git repository.\n  Tip: pass --skip-git to index any folder without a .git directory.\n');
         process.exitCode = 1;
         return;
       }
-      // --no-git: fall back to cwd as the root
+      // --skip-git: fall back to cwd as the root
       repoPath = path.resolve(process.cwd());
     } else {
       repoPath = gitRoot;
     }
   }
 
-  const repoHasGit = isGitRepo(repoPath);
-  if (!repoHasGit && !options?.noGit) {
-    console.log('  Not a git repository.\n  Tip: pass --no-git to index any folder without a .git directory.\n');
+  const repoHasGit = hasGitDir(repoPath);
+  if (!repoHasGit && !options?.skipGit) {
+    console.log('  Not a git repository.\n  Tip: pass --skip-git to index any folder without a .git directory.\n');
     process.exitCode = 1;
     return;
   }
   if (!repoHasGit) {
-    console.log('  Warning: no .git directory found — commit-tracking and incremental updates disabled.\n');
+    console.log('  Warning: no .git directory found \u2014 commit-tracking and incremental updates disabled.\n');
   }
 
   const { storagePath, lbugPath } = getStoragePaths(repoPath);
@@ -124,8 +124,11 @@ export const analyzeCommand = async (
   const existingMeta = await loadMeta(storagePath);
 
   if (existingMeta && !options?.force && !options?.skills && existingMeta.lastCommit === currentCommit) {
-    console.log('  Already up to date\n');
-    return;
+    // Non-git folders have currentCommit = '' — always rebuild since we can't detect changes
+    if (currentCommit !== '') {
+      console.log('  Already up to date\n');
+      return;
+    }
   }
 
   if (process.env.GITNEXUS_NO_GITIGNORE) {
@@ -329,8 +332,8 @@ export const analyzeCommand = async (
   await saveMeta(storagePath, meta);
   await registerRepo(repoPath, meta);
   // Only attempt to update .gitignore when a .git directory is present.
-  // Use hasGitDir (filesystem check) rather than isGitRepo (shells out to git)
-  // so we skip correctly for --no-git folders even if git CLI is available.
+  // Use hasGitDir (filesystem check) rather than git CLI subprocess
+  // so we skip correctly for --skip-git folders even if git CLI is available.
   if (hasGitDir(repoPath)) {
     await addToGitignore(repoPath);
   }
