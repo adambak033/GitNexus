@@ -25,6 +25,26 @@ export const getDatabase = (): lbug.Database | null => db;
 // This guarantees no DB switch can happen while an operation is running.
 let sessionLock: Promise<void> = Promise.resolve();
 
+/** Number of times to retry on a BUSY / lock-held error before giving up. */
+const DB_LOCK_RETRY_ATTEMPTS = 3;
+/** Base back-off in ms between BUSY retries (multiplied by attempt number). */
+const DB_LOCK_RETRY_DELAY_MS = 500;
+
+/**
+ * Return true when the error message indicates that another process holds
+ * an exclusive lock on the LadybugDB file (e.g. `gitnexus analyze` or
+ * `gitnexus serve` running at the same time).
+ */
+export const isDbBusyError = (err: unknown): boolean => {
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  return (
+    msg.includes('busy')
+    || msg.includes('lock')
+    || msg.includes('already in use')
+    || msg.includes('could not set lock')
+  );
+};
+
 const runWithSessionLock = async <T>(operation: () => Promise<T>): Promise<T> => {
   const previous = sessionLock;
   let release: (() => void) | null = null;
@@ -49,12 +69,41 @@ export const initLbug = async (dbPath: string) => {
 /**
  * Execute multiple queries against one repo DB atomically.
  * While the callback runs, no other request can switch the active DB.
+ *
+ * Automatically retries up to DB_LOCK_RETRY_ATTEMPTS times when the
+ * database is busy (e.g. `gitnexus analyze` holds the write lock).
+ * Each retry waits DB_LOCK_RETRY_DELAY_MS * attempt milliseconds.
  */
 export const withLbugDb = async <T>(dbPath: string, operation: () => Promise<T>): Promise<T> => {
-  return runWithSessionLock(async () => {
-    await ensureLbugInitialized(dbPath);
-    return operation();
-  });
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= DB_LOCK_RETRY_ATTEMPTS; attempt++) {
+    try {
+      return await runWithSessionLock(async () => {
+        await ensureLbugInitialized(dbPath);
+        return operation();
+      });
+    } catch (err) {
+      lastError = err;
+      if (!isDbBusyError(err) || attempt === DB_LOCK_RETRY_ATTEMPTS) {
+        throw err;
+      }
+      // Close stale connection inside the session lock to prevent race conditions
+      // with concurrent operations that might acquire the lock between cleanup steps
+      await runWithSessionLock(async () => {
+        try { if (conn) await conn.close(); } catch { /* best-effort */ }
+        try { if (db) await db.close(); } catch { /* best-effort */ }
+        conn = null;
+        db = null;
+        currentDbPath = null;
+        ftsLoaded = false;
+      });
+      // Sleep outside the lock — no need to block others while waiting
+      await new Promise(resolve => setTimeout(resolve, DB_LOCK_RETRY_DELAY_MS * attempt));
+    }
+  }
+  // This line is unreachable — the loop either returns or throws inside,
+  // but TypeScript needs an explicit throw to satisfy the return type.
+  throw lastError;
 };
 
 const ensureLbugInitialized = async (dbPath: string) => {
