@@ -889,6 +889,9 @@ export const SWIFT_QUERIES = `
 ; Properties (stored and computed)
 (property_declaration (pattern (simple_identifier) @name)) @definition.property
 
+; Enum cases
+(enum_entry (simple_identifier) @name) @definition.property
+
 ; Imports
 (import_declaration (identifier (simple_identifier) @import.source)) @import
 

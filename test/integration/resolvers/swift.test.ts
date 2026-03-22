@@ -61,7 +61,7 @@ describe.skipIf(!swiftAvailable)('Swift constructor-inferred type resolution', (
 // The self/super resolution code already exists in type-env.ts lookupInEnv (lines 56-66).
 // ---------------------------------------------------------------------------
 
-describe.skip('Swift self resolution', () => {
+describe.skipIf(!swiftAvailable)('Swift self resolution', () => {
   let result: PipelineResult;
 
   beforeAll(async () => {
@@ -91,7 +91,7 @@ describe.skip('Swift self resolution', () => {
 // findEnclosingParentClassName in type-env.ts already has Swift inheritance_specifier handler.
 // ---------------------------------------------------------------------------
 
-describe.skip('Swift parent resolution', () => {
+describe.skipIf(!swiftAvailable)('Swift parent resolution', () => {
   let result: PipelineResult;
 
   beforeAll(async () => {
