@@ -115,35 +115,65 @@ export function extractTsNamedBindings(importNode: SyntaxNode): NamedBinding[] |
 }
 
 export function extractPythonNamedBindings(importNode: SyntaxNode): NamedBinding[] | undefined {
-  // Only from import_from_statement, not plain import_statement
-  if (importNode.type !== 'import_from_statement') return undefined;
+  // Handle: from x import User, Repo as R
+  if (importNode.type === 'import_from_statement') {
+    const bindings: NamedBinding[] = [];
+    for (let i = 0; i < importNode.namedChildCount; i++) {
+      const child = importNode.namedChild(i);
+      if (!child) continue;
 
-  const bindings: NamedBinding[] = [];
-  for (let i = 0; i < importNode.namedChildCount; i++) {
-    const child = importNode.namedChild(i);
-    if (!child) continue;
+      if (child.type === 'dotted_name') {
+        // Skip the module_name (first dotted_name is the source module)
+        const fieldName = importNode.childForFieldName?.('module_name');
+        if (fieldName && child.startIndex === fieldName.startIndex) continue;
 
-    if (child.type === 'dotted_name') {
-      // Skip the module_name (first dotted_name is the source module)
-      const fieldName = importNode.childForFieldName?.('module_name');
-      if (fieldName && child.startIndex === fieldName.startIndex) continue;
+        // This is an imported name: from x import User
+        const name = child.text;
+        if (name) bindings.push({ local: name, exported: name });
+      }
 
-      // This is an imported name: from x import User
-      const name = child.text;
-      if (name) bindings.push({ local: name, exported: name });
-    }
-
-    if (child.type === 'aliased_import') {
-      // from x import Repo as R
-      const dottedName = findChild(child, 'dotted_name');
-      const aliasIdent = findChild(child, 'identifier');
-      if (dottedName && aliasIdent) {
-        bindings.push({ local: aliasIdent.text, exported: dottedName.text });
+      if (child.type === 'aliased_import') {
+        // from x import Repo as R
+        const dottedName = findChild(child, 'dotted_name');
+        const aliasIdent = findChild(child, 'identifier');
+        if (dottedName && aliasIdent) {
+          bindings.push({ local: aliasIdent.text, exported: dottedName.text });
+        }
       }
     }
+
+    return bindings.length > 0 ? bindings : undefined;
   }
 
-  return bindings.length > 0 ? bindings : undefined;
+  // Handle: import numpy as np  (import_statement with aliased_import child)
+  // Records local alias "np" → exported module name "numpy" so that call sites
+  // like np.array() resolve correctly via namedImportMap.
+  if (importNode.type === 'import_statement') {
+    const bindings: NamedBinding[] = [];
+    for (let i = 0; i < importNode.namedChildCount; i++) {
+      const child = importNode.namedChild(i);
+      if (!child) continue;
+
+      if (child.type === 'aliased_import') {
+        // import numpy as np  →  name=(dotted_name "numpy"), alias=(identifier "np")
+        const dottedName = findChild(child, 'dotted_name');
+        const aliasIdent = findChild(child, 'identifier');
+        if (dottedName && aliasIdent) {
+          // exported = last segment of dotted module path (e.g. "numpy" from "numpy")
+          // local    = alias used at call sites (e.g. "np")
+          const moduleName = dottedName.text;
+          const lastSegment = moduleName.includes('.')
+            ? moduleName.split('.').pop()!
+            : moduleName;
+          bindings.push({ local: aliasIdent.text, exported: lastSegment });
+        }
+      }
+    }
+
+    return bindings.length > 0 ? bindings : undefined;
+  }
+
+  return undefined;
 }
 
 export function extractKotlinNamedBindings(importNode: SyntaxNode): NamedBinding[] | undefined {
