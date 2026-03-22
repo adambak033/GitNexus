@@ -340,8 +340,11 @@ const extractForLoopBinding: ForLoopExtractor = (node, { scopeEnv, declarationTy
     if (!child) continue;
     if (child.type === 'pattern' || child.type === 'simple_identifier') {
       if (!loopVarName) {
-        // The loop variable - may be inside a pattern node or a direct simple_identifier
-        loopVarName = child.type === 'pattern' ? child.text : child.text;
+        // Extract a simple identifier from the pattern. Skip non-trivial patterns
+        // (e.g. tuple destructuring `for (a, b) in ...`) to avoid polluting scopeEnv.
+        const varName = extractVarName(child) ?? (child.type === 'simple_identifier' ? child.text : undefined);
+        if (!varName) return; // Non-simple pattern — bail out
+        loopVarName = varName;
         continue;
       }
     }

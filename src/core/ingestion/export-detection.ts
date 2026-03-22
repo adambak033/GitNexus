@@ -205,7 +205,9 @@ const swiftExportChecker: ExportChecker = (node, _name) => {
   while (current) {
     if (current.type === 'modifiers' || current.type === 'visibility_modifier') {
       const text = current.text || '';
-      if (/\bprivate\b|\bfileprivate\b/.test(text)) return false;
+      // Exclude private(set)/fileprivate(set) — only the setter is restricted,
+      // the symbol itself is still readable cross-file.
+      if (/\b(private|fileprivate)\b(?!\s*\()/.test(text)) return false;
     }
     current = current.parent;
   }
