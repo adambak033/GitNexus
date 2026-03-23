@@ -45,7 +45,7 @@
     "test:integration": "vitest run test/integration",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
-    "prepare": "npm run build && cd .. && husky",
+    "prepare": "node scripts/prepare.cjs",
     "postinstall": "node scripts/patch-tree-sitter-swift.cjs",
     "prepack": "npm run build && chmod +x dist/cli/index.js"
   },
