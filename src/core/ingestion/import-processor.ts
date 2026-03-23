@@ -143,15 +143,17 @@ function groupSwiftFilesByTarget(
  * Swift has no file-level imports — all files in a module see each other.
  */
 function addSwiftImplicitImports(
-  files: { path: string }[],
+  files: string[] | { path: string }[],
   swiftPackageConfig: SwiftPackageConfig | null,
   importMap: Map<string, Set<string>>,
   addImportEdge: (src: string, target: string) => void,
   logSuffix = '',
 ): void {
-  const swiftFiles = files
-    .filter(f => getLanguageFromFilename(f.path) === SupportedLanguages.Swift)
-    .map(f => f.path);
+  const paths = typeof files[0] === 'string'
+    ? files as string[]
+    : (files as { path: string }[]).map(f => f.path);
+  const swiftFiles = paths
+    .filter(f => getLanguageFromFilename(f) === SupportedLanguages.Swift);
 
   if (swiftFiles.length <= 1) return;
 
@@ -382,7 +384,7 @@ export const processImports = async (
     // Tree is now owned by the LRU cache — no manual delete needed
   }
 
-  addSwiftImplicitImports(allFileList.map(p => ({ path: p })), configs.swiftPackageConfig, importMap, addImportEdge);
+  addSwiftImplicitImports(allFileList, configs.swiftPackageConfig, importMap, addImportEdge);
 
   if (skippedByLang && skippedByLang.size > 0) {
     for (const [lang, count] of skippedByLang.entries()) {

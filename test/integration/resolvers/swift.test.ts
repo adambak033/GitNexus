@@ -468,12 +468,6 @@ describe.skipIf(!swiftAvailable)('Swift await / try expression unwrapping', () =
 });
 
 // ---------------------------------------------------------------------------
-// for-in loop element type inference:
-// extractForLoopBinding derives element type from the iterable's declared
-// type annotation (e.g., [User] → User).
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
 // For-in loop element type inference: extractForLoopBinding derives element
 // type from the iterable's declared type annotation (e.g., [User] → User).
 //

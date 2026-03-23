@@ -872,9 +872,7 @@ export const buildTypeEnv = (
           ?? node.childForFieldName('left')
           ?? node.childForFieldName('pattern');
         if (nameNode) {
-          // Swift: pattern node wraps a simple_identifier — unwrap it
-          const varName = extractVarName(nameNode)
-            ?? (nameNode.type === 'pattern' ? extractVarName(nameNode.firstNamedChild!) ?? nameNode.text : undefined);
+          const varName = extractVarName(nameNode);
           if (varName && !declarationTypeNodes.has(`${scope}\0${varName}`)) {
             declarationTypeNodes.set(`${scope}\0${varName}`, typeNode);
           }

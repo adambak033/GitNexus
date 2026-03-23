@@ -317,6 +317,11 @@ export const extractVarName = (node: SyntaxNode): string | undefined => {
     const inner = node.firstNamedChild;
     if (inner) return extractVarName(inner);
   }
+  // Swift: pattern node wraps a simple_identifier
+  if (node.type === 'pattern') {
+    const inner = node.firstNamedChild;
+    if (inner) return extractVarName(inner);
+  }
   return undefined;
 };
 
