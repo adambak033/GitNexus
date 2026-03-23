@@ -125,6 +125,10 @@ const WILDCARD_IMPORT_LANGUAGES = new Set([
   SupportedLanguages.Swift,
 ]);
 
+/** Languages that require synthesizeWildcardImportBindings to run before call resolution.
+ *  Superset of WILDCARD_IMPORT_LANGUAGES — includes Python for moduleAliasMap building. */
+const SYNTHESIS_LANGUAGES = new Set([...WILDCARD_IMPORT_LANGUAGES, SupportedLanguages.Python]);
+
 /** Synthesize namedImportMap entries for languages with whole-module imports.
  *  These languages (Go, Ruby, C/C++, Swift, Python) import all exported symbols from a
  *  file, not specific named symbols. After parsing, we know which symbols each file
@@ -561,6 +565,13 @@ export const runPipelineFromRepo = async (
     // are already registered). This trades ~5% cross-chunk resolution accuracy for
     // 200-400MB less memory — critical for Linux-kernel-scale repos.
     const sequentialChunkPaths: string[][] = [];
+    // Pre-compute which chunks need synthesis — O(1) lookup per chunk.
+    const chunkNeedsSynthesis = chunks.map(paths =>
+      paths.some(p => { 
+        const lang = getLanguageFromFilename(p); 
+        return lang != null && SYNTHESIS_LANGUAGES.has(lang); 
+      }),
+    );
     // Phase 14: Collect exported type bindings for cross-file propagation
     const exportedTypeMap: ExportedTypeMap = new Map();
     // Accumulate file-scope TypeEnv bindings from workers (closes worker/sequential quality gap)
@@ -610,13 +621,7 @@ export const runPipelineFromRepo = async (
           // Synthesize namedImportMap entries for wildcard-import languages and build
           // moduleAliasMap for Python namespace imports. Must run after imports are resolved
           // (importMap is populated) but BEFORE call resolution.
-          // Guard: skip for chunks with only non-wildcard/non-Python files to avoid
-          // O(chunks × graph_size) repeated traversals on large TypeScript/JS repos.
-          const chunkHasWildcardOrPython = chunkFiles.some(f => {
-            const lang = getLanguageFromFilename(f.path);
-            return lang && (WILDCARD_IMPORT_LANGUAGES.has(lang) || lang === SupportedLanguages.Python);
-          });
-          if (chunkHasWildcardOrPython) synthesizeWildcardImportBindings(graph, ctx);
+          if (chunkNeedsSynthesis[chunkIdx]) synthesizeWildcardImportBindings(graph, ctx);
           // Phase 14 E1: Seed cross-file receiver types from ExportedTypeMap
           // before call resolution — eliminates re-parse for single-hop imported receivers.
           // NOTE: In the worker path, exportedTypeMap is empty during chunk processing
