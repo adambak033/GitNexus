@@ -9,6 +9,7 @@ const HTTP_TIMEOUT_MS = 30_000;
 const HTTP_MAX_RETRIES = 2;
 const HTTP_RETRY_BACKOFF_MS = 1_000;
 const HTTP_BATCH_SIZE = 64;
+const DEFAULT_DIMS = 384;
 
 interface HttpConfig {
   baseUrl: string;
@@ -105,7 +106,15 @@ const httpEmbedBatch = async (
       body: JSON.stringify({ input: batch, model }),
     });
   } catch (err) {
-    // DNS, timeout, connection errors — add context without leaking the key
+    // Timeouts should not be retried — the server is unresponsive.
+    // AbortSignal.timeout() throws DOMException with name 'TimeoutError'.
+    const isTimeout = err instanceof DOMException && err.name === 'TimeoutError';
+    if (isTimeout) {
+      throw new Error(
+        `Embedding request timed out after ${HTTP_TIMEOUT_MS}ms (${safeUrl(url)}, batch ${batchIndex})`,
+      );
+    }
+    // DNS, connection errors — retry with backoff
     if (attempt < HTTP_MAX_RETRIES) {
       const delay = HTTP_RETRY_BACKOFF_MS * (attempt + 1);
       await new Promise(r => setTimeout(r, delay));
@@ -165,13 +174,17 @@ export const httpEmbed = async (texts: string[]): Promise<Float32Array[]> => {
       const vec = new Float32Array(item.embedding);
       // Fail fast on dimension mismatch rather than inserting bad vectors
       // into the FLOAT[N] column which would cause a cryptic Kuzu error.
-      if (config.dimensions && vec.length !== config.dimensions) {
+      const expected = config.dimensions ?? DEFAULT_DIMS;
+      if (vec.length !== expected) {
+        const hint = config.dimensions
+          ? 'Update GITNEXUS_EMBEDDING_DIMS to match your model output.'
+          : `Set GITNEXUS_EMBEDDING_DIMS=${vec.length} to match your model output.`;
         throw new Error(
           `Embedding dimension mismatch: endpoint returned ${vec.length}d vector, ` +
-          `but GITNEXUS_EMBEDDING_DIMS is set to ${config.dimensions}. ` +
-          `Update GITNEXUS_EMBEDDING_DIMS to match your model output.`,
+          `but expected ${expected}d. ${hint}`,
         );
       }
+
       allVectors.push(vec);
     }
   }
@@ -195,5 +208,19 @@ export const httpEmbedQuery = async (text: string): Promise<number[]> => {
   if (!items.length) {
     throw new Error(`Embedding endpoint returned empty response (${safeUrl(url)})`);
   }
-  return items[0].embedding;
+
+  const embedding = items[0].embedding;
+  // Same dimension checks as httpEmbed — catch mismatches before they
+  // reach the Kuzu FLOAT[N] cast in search queries.
+  const expected = config.dimensions ?? DEFAULT_DIMS;
+  if (embedding.length !== expected) {
+    const hint = config.dimensions
+      ? 'Update GITNEXUS_EMBEDDING_DIMS to match your model output.'
+      : `Set GITNEXUS_EMBEDDING_DIMS=${embedding.length} to match your model output.`;
+    throw new Error(
+      `Embedding dimension mismatch: endpoint returned ${embedding.length}d vector, ` +
+      `but expected ${expected}d. ${hint}`,
+    );
+  }
+  return embedding;
 };
