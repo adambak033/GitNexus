@@ -2,6 +2,66 @@
 
 All notable changes to GitNexus will be documented in this file.
 
+## [1.4.8] - 2026-03-23
+
+### Added
+- **Type resolution Milestone D — Phases 10–13** consolidated into a single milestone with full integration test coverage across 11 languages (#387)
+  - Phase A/B/C: overload disambiguation via argument literal types, constructor-visible virtual dispatch via `constructorTypeMap`, `parameterTypes` extraction in `extractMethodSignature`
+  - Phase 14 enhancements: single-pass seeding, Tarjan's SCC for cyclic resolution, cross-file return types
+  - Optional parameter arity resolution
+  - Per-language cross-file binding tests and resolver fixes
+  - Store all overloads in `fileIndex` instead of last-write-wins
+- **Cross-file binding propagation** for multiple languages
+- **HTTP embedding backend** for self-hosted/remote endpoints with dynamic dimensions, batch guards, and dimension mismatch handling (#395)
+- **Markdown file indexing** — headings and cross-links as graph nodes (#399)
+- **MiniMax provider support** (#224)
+- **Codex MCP and skills support** with CLI setup flow and e2e tests
+- **HelpPanel UI** — built-in help for the web interface (#465)
+- **Section node type** registered in `NODE_TABLES` and `NODE_SCHEMA_QUERIES` (#401)
+- **Community and Process node properties** documented in cypher tool description (#411)
+- **Server-mode hydration regression tests**
+- **Pre-commit hooks** via husky for typecheck + unit tests
+
+### Fixed
+- **Python import alias resolution** — `import X as Y` now routes module aliases directly to `moduleAliasMap` in import processor (#417, #461)
+- **Python module-qualified calls** resolved via `moduleAliasMap` (#337)
+- **Python module-qualified constructor calls** (Issue #337)
+- **Heritage/MRO edges** now calculate confidence per resolution tier (#412)
+- **LadybugDB lock** — retry on DB lock with session-safe cleanup (#325)
+- **CORS** — allow private/LAN network origins (#390)
+- **Analyze without git** — allow indexing folders without a `.git` directory (#384)
+- **Web: LadybugDB** — `getAllRows`, `loadServerGraph`, BM25, highlight clearing (#474)
+- **Server-mode hydration** — await server connect hydration flow (#398, #404)
+- **Embedding dimensions** — validate on every vector, not just the first; hard-throw on mismatch
+- **Timeout detection** — always-on dim validation, test hardening
+- **ONNX CUDA** — prevent uncatchable native crash when CUDA libs present but ORT lacks CUDA provider; clarify linux/x64-only
+- **CLI** — run codex mcp add via shell on Windows; write tool output to stdout via fd 1
+- **Stale progress, cross-platform prepare, DEV log** fixes
+- **Import resolution API** simplified per PR #409 review findings (P0–P3)
+- **Auto-labeling** — switched from clustering to z-score method; multi-dim aware Mahalanobis threshold
+- **PR/issue filtering** — fixed prop cutoff issue
+- **Sequential enrichment queries** + stale data detection
+- **package-lock.json** synced with `onnxruntime-node ^1.24.0`
+
+### Changed
+- **Unified language dispatch** with compile-time exhaustive tables
+- **Prepare script simplified** — removed `scripts/prepare.cjs`
+- **Switched from .githooks to husky** for pre-commit hooks
+- **`@claude` workflow** restricted to maintainers and above via `author_association` check
+
+### Performance
+- **O(1) per-chunk synthesis guard** using `boolean[]` instead of Set
+- **`sizeBefore` optimization** in type resolution
+- **Token truncation** improvements
+
+### Chore
+- Strengthened Python module-import tests, un-skipped match/case, added perf guard
+- Added positive and negative tests for all 4 bug fixes
+- E2e tests for stale detection, sequential enrichment, stability (#396)
+- Integration tests for Milestone D across all 11 languages
+- `gitnexus-stable-ops` added to community integrations
+- `.env.example` added for embedding backend configuration
+
 ## [1.4.7] - 2026-03-19
 
 ### Added

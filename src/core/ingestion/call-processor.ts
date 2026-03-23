@@ -600,6 +600,7 @@ export const processCalls = async (
         argCount: countCallArguments(callNode),
         callForm,
         receiverTypeName,
+        receiverName,
       }, file.path, ctx, hints);
 
       if (!resolved) return;
@@ -819,7 +820,7 @@ const tryOverloadDisambiguation = (
  * If filtering still leaves multiple candidates, refuse to emit a CALLS edge.
  */
 const resolveCallTarget = (
-  call: Pick<ExtractedCall, 'calledName' | 'argCount' | 'callForm' | 'receiverTypeName'>,
+  call: Pick<ExtractedCall, 'calledName' | 'argCount' | 'callForm' | 'receiverTypeName' | 'receiverName'>,
   currentFile: string,
   ctx: ResolutionContext,
   overloadHints?: OverloadHints,
@@ -838,6 +839,28 @@ const resolveCallTarget = (
     );
     if (hasTypeTarget) {
       filteredCandidates = filterCallableCandidates(tiered.candidates, call.argCount, 'constructor');
+    }
+  }
+
+  // Module-qualified constructor pattern: e.g. Python `import models; models.User()`.
+  // The attribute access gives callForm='member', but the callee may be a Class — a valid
+  // constructor target. Re-try with constructor-form filtering so that `module.ClassName()`
+  // emits a CALLS edge to the class node.
+  if (filteredCandidates.length === 0 && call.callForm === 'member') {
+    filteredCandidates = filterCallableCandidates(tiered.candidates, call.argCount, 'constructor');
+  }
+
+  // Module-alias disambiguation: Python `import auth; auth.User()` — when both models.py and
+  // auth.py export User, receiverName='auth' selects auth.py via moduleAliasMap.
+  // Runs when multiple candidates survive filtering and the receiver is a known module alias.
+  if (filteredCandidates.length > 1 && call.callForm === 'member' && call.receiverName) {
+    const aliasMap = ctx.moduleAliasMap?.get(currentFile);
+    if (aliasMap) {
+      const moduleFile = aliasMap.get(call.receiverName);
+      if (moduleFile) {
+        const aliasFiltered = filteredCandidates.filter(c => c.filePath === moduleFile);
+        if (aliasFiltered.length > 0) filteredCandidates = aliasFiltered;
+      }
     }
   }
 

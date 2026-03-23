@@ -12,7 +12,7 @@ import { getTreeSitterBufferSize } from './constants.js';
 import { loadImportConfigs } from './language-config.js';
 import { buildSuffixIndex } from './resolvers/index.js';
 import { callRouters } from './call-routing.js';
-import type { ResolutionContext } from './resolution-context.js';
+import type { ResolutionContext, ModuleAliasMap } from './resolution-context.js';
 import type { SuffixIndex } from './resolvers/index.js';
 import { importResolvers, namedBindingExtractors, preprocessImportPath } from './import-resolution.js';
 import type { ImportResult, ResolveCtx, NamedBinding } from './import-resolution.js';
@@ -179,6 +179,7 @@ function addSwiftImplicitImports(
  * Apply an ImportResult: emit graph edges and update ImportMap/PackageMap.
  * If namedBindings are provided and the import resolves to a single file,
  * also populate the NamedImportMap for precise Tier 2a resolution.
+ * Bindings tagged with `isModuleAlias` are routed to moduleAliasMap instead.
  */
 function applyImportResult(
   result: ImportResult,
@@ -189,6 +190,7 @@ function applyImportResult(
   addImportGraphEdge: (from: string, to: string) => void,
   namedBindings?: NamedBinding[],
   namedImportMap?: NamedImportMap,
+  moduleAliasMap?: ModuleAliasMap,
 ): void {
   if (!result) return;
 
@@ -206,6 +208,21 @@ function applyImportResult(
       addImportEdge(filePath, resolvedFile);
     }
 
+    // Route module aliases (import X as Y) directly to moduleAliasMap.
+    // These are module-level aliases, not symbol bindings — they don't belong in namedImportMap.
+    if (namedBindings && moduleAliasMap && files.length === 1) {
+      const resolvedFile = files[0];
+      for (const binding of namedBindings) {
+        if (!binding.isModuleAlias) continue;
+        let aliasMap = moduleAliasMap.get(filePath);
+        if (!aliasMap) {
+          aliasMap = new Map();
+          moduleAliasMap.set(filePath, aliasMap);
+        }
+        aliasMap.set(binding.local, resolvedFile);
+      }
+    }
+
     // Record named bindings for precise Tier 2a resolution.
     // If the same local name is imported from multiple files (e.g., Java static imports
     // of overloaded methods), remove the entry so resolution falls through to Tier 2a
@@ -217,6 +234,7 @@ function applyImportResult(
       if (files.length === 1) {
         const resolvedFile = files[0];
         for (const binding of namedBindings) {
+          if (binding.isModuleAlias) continue; // already routed to moduleAliasMap
           const existing = fileBindings.get(binding.local);
           if (existing && existing.sourcePath !== resolvedFile) {
             fileBindings.delete(binding.local);
@@ -229,6 +247,7 @@ function applyImportResult(
         // Match each binding to a resolved file by comparing the lowercase binding name
         // to the file's basename (without extension). If no match, skip the binding.
         for (const binding of namedBindings) {
+          if (binding.isModuleAlias) continue;
           const lowerName = binding.exported.toLowerCase();
           const matchedFile = files.find(f => {
             const base = f.replace(/\\/g, '/').split('/').pop() ?? '';
@@ -265,6 +284,7 @@ export const processImports = async (
   const importMap = ctx.importMap;
   const packageMap = ctx.packageMap;
   const namedImportMap = ctx.namedImportMap;
+  const moduleAliasMap = ctx.moduleAliasMap;
   // Use allPaths (full repo) when available for cross-chunk resolution, else fall back to chunk files
   const allFileList = allPaths ?? files.map(f => f.path);
   const allFilePaths = new Set(allFileList);
@@ -363,7 +383,7 @@ export const processImports = async (
         const result = importResolvers[language](rawImportPath, file.path, resolveCtx);
         const extractor = namedBindingExtractors[language];
         const bindings = namedImportMap && extractor ? extractor(captureMap['import']) : undefined;
-        applyImportResult(result, file.path, importMap, packageMap, addImportEdge, addImportGraphEdge, bindings, namedImportMap);
+        applyImportResult(result, file.path, importMap, packageMap, addImportEdge, addImportGraphEdge, bindings, namedImportMap, moduleAliasMap);
       }
 
       // ---- Language-specific call-as-import routing (Ruby require, etc.) ----
@@ -415,6 +435,7 @@ export const processImportsFromExtracted = async (
   const importMap = ctx.importMap;
   const packageMap = ctx.packageMap;
   const namedImportMap = ctx.namedImportMap;
+  const moduleAliasMap = ctx.moduleAliasMap;
   const importCtx = prebuiltCtx ?? buildImportResolutionContext(files.map(f => f.path));
   const { allFilePaths, allFileList, normalizedFileList, index, resolveCache } = importCtx;
 
@@ -449,7 +470,7 @@ export const processImportsFromExtracted = async (
       totalImportsFound++;
 
       const result = importResolvers[imp.language](imp.rawImportPath, filePath, resolveCtx);
-      applyImportResult(result, filePath, importMap, packageMap, addImportEdge, addImportGraphEdge, imp.namedBindings, namedImportMap);
+      applyImportResult(result, filePath, importMap, packageMap, addImportEdge, addImportGraphEdge, imp.namedBindings, namedImportMap, moduleAliasMap);
     }
   }
 
