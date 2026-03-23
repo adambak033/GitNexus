@@ -83,8 +83,10 @@ export type ImportResolverFn = (
   resolveCtx: ResolveCtx,
 ) => ImportResult;
 
-/** A single named import binding: local name in the importing file and exported name from the source. */
-export interface NamedBinding { local: string; exported: string }
+/** A single named import binding: local name in the importing file and exported name from the source.
+ *  When `isModuleAlias` is true, the binding represents a Python `import X as Y` module alias
+ *  and is routed to moduleAliasMap instead of namedImportMap during import processing. */
+export interface NamedBinding { local: string; exported: string; isModuleAlias?: boolean }
 
 /** Per-language named binding extractor -- optional (returns undefined if language has no named imports). */
 type NamedBindingExtractorFn = (importNode: SyntaxNode) => NamedBinding[] | undefined;

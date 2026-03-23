@@ -146,27 +146,18 @@ export function extractPythonNamedBindings(importNode: SyntaxNode): NamedBinding
   }
 
   // Handle: import numpy as np  (import_statement with aliased_import child)
-  // Records local alias "np" → exported module name "numpy" so that call sites
-  // like np.array() resolve correctly via namedImportMap.
+  // Tagged with isModuleAlias so applyImportResult routes these directly to
+  // moduleAliasMap (e.g. "np" → "numpy.py") instead of namedImportMap.
   if (importNode.type === 'import_statement') {
     const bindings: NamedBinding[] = [];
     for (let i = 0; i < importNode.namedChildCount; i++) {
       const child = importNode.namedChild(i);
-      if (!child) continue;
+      if (!child || child.type !== 'aliased_import') continue;
 
-      if (child.type === 'aliased_import') {
-        // import numpy as np  →  name=(dotted_name "numpy"), alias=(identifier "np")
-        const dottedName = findChild(child, 'dotted_name');
-        const aliasIdent = findChild(child, 'identifier');
-        if (dottedName && aliasIdent) {
-          // exported = last segment of dotted module path (e.g. "numpy" from "numpy")
-          // local    = alias used at call sites (e.g. "np")
-          const moduleName = dottedName.text;
-          const lastSegment = moduleName.includes('.')
-            ? moduleName.split('.').pop()!
-            : moduleName;
-          bindings.push({ local: aliasIdent.text, exported: lastSegment });
-        }
+      const dottedName = findChild(child, 'dotted_name');
+      const aliasIdent = findChild(child, 'identifier');
+      if (dottedName && aliasIdent) {
+        bindings.push({ local: aliasIdent.text, exported: dottedName.text, isModuleAlias: true });
       }
     }
 

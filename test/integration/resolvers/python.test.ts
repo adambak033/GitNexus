@@ -286,6 +286,57 @@ describe('Python alias import resolution', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Plain import alias: import models as m → m.User() resolves to models.py
+// ---------------------------------------------------------------------------
+
+describe('Python plain import alias resolution (import X as Y)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'python-plain-import-alias'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User classes in both models.py and auth.py', () => {
+    const classes = getNodesByLabel(result, 'Class');
+    expect(classes).toContain('User');
+    expect(classes).toContain('Repo');
+  });
+
+  it('emits IMPORTS edges: app.py → models.py and app.py → auth.py', () => {
+    const imports = getRelationships(result, 'IMPORTS');
+    const importFiles = imports
+      .filter(i => i.sourceFilePath === 'app.py')
+      .map(i => i.targetFilePath)
+      .sort();
+    expect(importFiles).toEqual(['auth.py', 'models.py']);
+  });
+
+  it('resolves m.User() and u.save() to models.py via alias', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c => c.target === 'save' && c.source === 'main');
+    expect(saveCall).toBeDefined();
+    expect(saveCall!.targetFilePath).toBe('models.py');
+  });
+
+  it('resolves m.Repo() and r.persist() to models.py via alias', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const persistCall = calls.find(c => c.target === 'persist' && c.source === 'main');
+    expect(persistCall).toBeDefined();
+    expect(persistCall!.targetFilePath).toBe('models.py');
+  });
+
+  it('resolves a.User() and v.login() to auth.py via alias (disambiguation)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const loginCall = calls.find(c => c.target === 'login' && c.source === 'main');
+    expect(loginCall).toBeDefined();
+    expect(loginCall!.targetFilePath).toBe('auth.py');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Re-export chain: from .base import X barrel pattern via __init__.py
 // ---------------------------------------------------------------------------
 
