@@ -51,7 +51,7 @@
   },
   "dependencies": {
     "@huggingface/transformers": "^3.0.0",
-    "onnxruntime-node": "^1.24.0",
+    "@ladybugdb/core": "^0.15.2",
     "@modelcontextprotocol/sdk": "^1.0.0",
     "cli-progress": "^3.12.0",
     "commander": "^12.0.0",
@@ -61,10 +61,10 @@
     "graphology": "^0.25.4",
     "graphology-indices": "^0.17.0",
     "graphology-utils": "^2.3.0",
-    "@ladybugdb/core": "^0.15.2",
     "ignore": "^7.0.5",
     "lru-cache": "^11.0.0",
     "mnemonist": "^0.39.0",
+    "onnxruntime-node": "^1.24.0",
     "pandemonium": "^2.4.0",
     "tree-sitter": "^0.21.0",
     "tree-sitter-c": "^0.21.0",
@@ -91,6 +91,7 @@
     "@types/node": "^20.0.0",
     "@types/uuid": "^10.0.0",
     "@vitest/coverage-v8": "^4.0.18",
+    "husky": "^9.1.7",
     "tsx": "^4.0.0",
     "typescript": "^5.4.5",
     "vitest": "^4.0.18"
