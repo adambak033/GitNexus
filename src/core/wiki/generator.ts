@@ -65,9 +65,6 @@ import { shouldIgnorePath } from '../../config/ignore-service.js';
 
 export interface WikiOptions {
   force?: boolean;
-  model?: string;
-  baseUrl?: string;
-  apiKey?: string;
   maxTokensPerModule?: number;
   concurrency?: number;
   /** If true, stop after building module tree for user review */

@@ -25,17 +25,22 @@ function verboseLog(...args: unknown[]): void {
   }
 }
 
+let cachedCursorBin: string | null | undefined;
+
 /**
  * Detect if Cursor CLI is available in PATH.
  * Returns the binary name if found ('agent'), null otherwise.
+ * Result is cached after the first call.
  */
 export function detectCursorCLI(): string | null {
+  if (cachedCursorBin !== undefined) return cachedCursorBin;
   try {
     execSync('agent --version', { stdio: 'ignore' });
-    return 'agent';
+    cachedCursorBin = 'agent';
   } catch {
-    return null;
+    cachedCursorBin = null;
   }
+  return cachedCursorBin;
 }
 
 /**
@@ -52,10 +57,8 @@ export function resolveCursorConfig(overrides?: Partial<CursorConfig>): CursorCo
 /**
  * Call the Cursor CLI in print mode.
  * 
- * Uses `agent -p --output-format text` for non-streaming.
- * Uses `agent -p --output-format stream-json` for streaming with progress.
- * 
- * The prompt is passed via stdin for safety (avoids shell escaping issues).
+ * Uses `agent -p --output-format text` for clean non-streaming output.
+ * The prompt is passed as the final CLI argument.
  */
 export async function callCursorLLM(
   prompt: string,

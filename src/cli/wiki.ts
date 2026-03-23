@@ -285,8 +285,6 @@ export const wikiCommand = async (
   // ── Run generator ───────────────────────────────────────────────────
   const wikiOptions: WikiOptions = {
     force: options?.force,
-    model: options?.model,
-    baseUrl: options?.baseUrl,
     concurrency: options?.concurrency ? parseInt(options.concurrency, 10) : undefined,
     reviewOnly: options?.review,
   };
@@ -383,8 +381,8 @@ export const wikiCommand = async (
         continueOptions,
         (phase, percent, detail) => {
           const label = detail || phase;
-          if (phase !== lastPhase) {
-            lastPhase = phase;
+          if (label !== lastPhase) {
+            lastPhase = label;
             phaseStart = Date.now();
           }
           bar.update(percent, { phase: label });
