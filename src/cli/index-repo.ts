@@ -14,6 +14,7 @@ import fs from "fs/promises";
 import {
   getStoragePaths,
   loadMeta,
+  addToGitignore,
   registerRepo,
 } from "../storage/repo-manager.js";
 import { getGitRoot, isGitRepo } from "../storage/git.js";
@@ -32,6 +33,20 @@ export const indexCommand = async (
   const inputPath = inputPathParts?.length
     ? inputPathParts.join(" ")
     : undefined;
+
+  if (inputPathParts && inputPathParts.length > 1) {
+    const resolvedCombinedPath = path.resolve(inputPath);
+    try {
+      await fs.access(resolvedCombinedPath);
+    } catch {
+      console.log("  The `index` command accepts a single path only.");
+      console.log("  If your path contains spaces, wrap it in quotes.");
+      console.log(`  Received multiple path parts: ${inputPathParts.join(", ")}`);
+      console.log("");
+      process.exitCode = 1;
+      return;
+    }
+  }
 
   let repoPath: string;
   if (inputPath) {
@@ -98,6 +113,7 @@ export const indexCommand = async (
 
   // ── Register in global registry ───────────────────────────────────
   await registerRepo(repoPath, meta);
+  await addToGitignore(repoPath);
 
   const projectName = path.basename(repoPath);
   const { stats } = meta;
