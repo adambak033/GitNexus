@@ -111,7 +111,12 @@ const MAX_SYNTHETIC_BINDINGS_PER_FILE = 1000;
 
 /** Languages with whole-module import semantics (no per-symbol named imports).
  *  For these languages, namedImportMap entries are synthesized from graph-exported
- *  symbols after parsing, enabling Phase 14 cross-file binding propagation. */
+ *  symbols after parsing, enabling Phase 14 cross-file binding propagation.
+ *
+ *  Note: Python is intentionally excluded here. `import models` is a namespace import
+ *  (not wildcard symbol expansion) — expanding all exported symbols produces ambiguous
+ *  bindings when multiple modules export the same name (e.g. models.User vs auth.User).
+ *  Python module aliases are built in synthesizeWildcardImportBindings via moduleAliasMap. */
 const WILDCARD_IMPORT_LANGUAGES = new Set([
   SupportedLanguages.Go,
   SupportedLanguages.Ruby,
@@ -120,11 +125,15 @@ const WILDCARD_IMPORT_LANGUAGES = new Set([
   SupportedLanguages.Swift,
 ]);
 
+/** Languages that require synthesizeWildcardImportBindings to run before call resolution.
+ *  Superset of WILDCARD_IMPORT_LANGUAGES — includes Python for moduleAliasMap building. */
+const SYNTHESIS_LANGUAGES = new Set([...WILDCARD_IMPORT_LANGUAGES, SupportedLanguages.Python]);
+
 /** Synthesize namedImportMap entries for languages with whole-module imports.
- *  These languages (Go, Ruby, C/C++, Swift) import all exported symbols from a file,
- *  not specific named symbols. After parsing, we know which symbols each file exports
- *  (via graph isExported), so we can expand ImportMap edges into per-symbol bindings
- *  that Phase 14 can use for cross-file type propagation. */
+ *  These languages (Go, Ruby, C/C++, Swift, Python) import all exported symbols from a
+ *  file, not specific named symbols. After parsing, we know which symbols each file
+ *  exports (via graph isExported), so we can expand ImportMap edges into per-symbol
+ *  bindings that Phase 14 can use for cross-file type propagation. */
 function synthesizeWildcardImportBindings(
   graph: ReturnType<typeof createKnowledgeGraph>,
   ctx: ReturnType<typeof createResolutionContext>,
@@ -199,9 +208,34 @@ function synthesizeWildcardImportBindings(
     synthesizeForFile(filePath, importedFiles);
   }
 
-  // Process files from graph IMPORTS edges (Go package imports)
+  // Process files from graph IMPORTS edges (Go and other wildcard-import languages)
   for (const [filePath, importedFiles] of graphImports) {
     synthesizeForFile(filePath, importedFiles);
+  }
+
+  // Build module alias map for Python namespace imports.
+  // `import models` in app.py → ctx.moduleAliasMap['app.py']['models'] = 'models.py'
+  // Enables `models.User()` to resolve to models.py:User without ambiguous symbol expansion.
+  const buildPythonModuleAliasForFile = (callerFile: string, importedFiles: Iterable<string>) => {
+    let aliasMap = ctx.moduleAliasMap.get(callerFile);
+    for (const importedFile of importedFiles) {
+      // Derive the module alias from the imported filename stem (e.g. "models.py" → "models")
+      const lastSlash = importedFile.lastIndexOf('/');
+      const base = lastSlash >= 0 ? importedFile.slice(lastSlash + 1) : importedFile;
+      const dot = base.lastIndexOf('.');
+      const stem = dot >= 0 ? base.slice(0, dot) : base;
+      if (!stem) continue;
+      if (!aliasMap) {
+        aliasMap = new Map();
+        ctx.moduleAliasMap.set(callerFile, aliasMap);
+      }
+      aliasMap.set(stem, importedFile);
+    }
+  };
+
+  for (const [filePath, importedFiles] of ctx.importMap) {
+    if (getLanguageFromFilename(filePath) !== SupportedLanguages.Python) continue;
+    buildPythonModuleAliasForFile(filePath, importedFiles);
   }
 
   return totalSynthesized;
@@ -531,6 +565,13 @@ export const runPipelineFromRepo = async (
     // are already registered). This trades ~5% cross-chunk resolution accuracy for
     // 200-400MB less memory — critical for Linux-kernel-scale repos.
     const sequentialChunkPaths: string[][] = [];
+    // Pre-compute which chunks need synthesis — O(1) lookup per chunk.
+    const chunkNeedsSynthesis = chunks.map(paths =>
+      paths.some(p => { 
+        const lang = getLanguageFromFilename(p); 
+        return lang != null && SYNTHESIS_LANGUAGES.has(lang); 
+      }),
+    );
     // Phase 14: Collect exported type bindings for cross-file propagation
     const exportedTypeMap: ExportedTypeMap = new Map();
     // Accumulate file-scope TypeEnv bindings from workers (closes worker/sequential quality gap)
@@ -576,6 +617,11 @@ export const runPipelineFromRepo = async (
               stats: { filesProcessed: filesParsedSoFar, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
             });
           }, repoPath, importCtx);
+          // ── Wildcard-import synthesis (Ruby / C/C++ / Swift / Go) + Python module aliases ─
+          // Synthesize namedImportMap entries for wildcard-import languages and build
+          // moduleAliasMap for Python namespace imports. Must run after imports are resolved
+          // (importMap is populated) but BEFORE call resolution.
+          if (chunkNeedsSynthesis[chunkIdx]) synthesizeWildcardImportBindings(graph, ctx);
           // Phase 14 E1: Seed cross-file receiver types from ExportedTypeMap
           // before call resolution — eliminates re-parse for single-hop imported receivers.
           // NOTE: In the worker path, exportedTypeMap is empty during chunk processing
@@ -661,6 +707,9 @@ export const runPipelineFromRepo = async (
     }
 
     // Sequential fallback chunks: re-read source for call/heritage resolution
+    // Synthesize wildcard import bindings once after ALL imports are processed,
+    // before any call resolution — same rationale as the worker-path inline synthesis.
+    if (sequentialChunkPaths.length > 0) synthesizeWildcardImportBindings(graph, ctx);
     for (const chunkPaths of sequentialChunkPaths) {
       const chunkContents = await readFileContents(repoPath, chunkPaths);
       const chunkFiles = chunkPaths
@@ -712,13 +761,13 @@ export const runPipelineFromRepo = async (
       }
     }
 
-    // ── Phase 14 pre-pass: Synthesize namedImportMap for whole-module-import languages ──
-    // Go, Ruby, C/C++, Swift import all exported symbols from a file.
-    // Expand ImportMap edges into per-symbol namedImportMap entries so Phase 14 can
-    // propagate types cross-file for these languages.
+    // ── Phase 14 pre-pass: Final synthesis pass for whole-module-import languages ──
+    // Per-chunk synthesis (above) already ran incrementally. This final pass ensures
+    // any remaining files whose imports were not covered inline are also synthesized,
+    // and that Phase 14 type propagation has complete namedImportMap data.
     const synthesized = synthesizeWildcardImportBindings(graph, ctx);
     if (isDev && synthesized > 0) {
-      console.log(`🔗 Synthesized ${synthesized} wildcard import bindings (Go/Ruby/C++/Swift)`);
+      console.log(`🔗 Synthesized ${synthesized} additional wildcard import bindings (Go/Ruby/C++/Swift/Python)`);
     }
 
     // ── Phase 14: Cross-file binding propagation ──────────────────────
