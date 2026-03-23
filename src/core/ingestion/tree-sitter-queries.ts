@@ -196,6 +196,12 @@ export const PYTHON_QUERIES = `
 (import_statement
   name: (dotted_name) @import.source) @import
 
+; import numpy as np  →  aliased_import captures the module name so the
+; import path is resolved and named-binding extraction stores "np" → "numpy".
+(import_statement
+  name: (aliased_import
+    name: (dotted_name) @import.source)) @import
+
 (import_from_statement
   module_name: (dotted_name) @import.source) @import
 
