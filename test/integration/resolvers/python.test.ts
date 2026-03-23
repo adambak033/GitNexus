@@ -1615,4 +1615,14 @@ describe('Python module import CALLS resolution (Issue #337)', () => {
     );
     expect(adminCall).toBeDefined();
   });
+
+  it('resolves auth.User() CALLS edge to auth.py:User (not models.py:User) when both modules export User', () => {
+    // Both models.py and auth.py export a class named User.
+    // auth.User() must resolve to auth.py:User — the receiver module disambiguates.
+    const calls = getRelationships(result, 'CALLS');
+    const authUserCall = calls.find(c =>
+      c.target === 'User' && c.targetFilePath === 'auth.py',
+    );
+    expect(authUserCall).toBeDefined();
+  });
 });

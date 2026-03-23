@@ -3,3 +3,4 @@ import auth
 
 u = models.User()
 a = auth.Admin()
+au = auth.User()

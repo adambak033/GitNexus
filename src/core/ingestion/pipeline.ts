@@ -111,14 +111,18 @@ const MAX_SYNTHETIC_BINDINGS_PER_FILE = 1000;
 
 /** Languages with whole-module import semantics (no per-symbol named imports).
  *  For these languages, namedImportMap entries are synthesized from graph-exported
- *  symbols after parsing, enabling Phase 14 cross-file binding propagation. */
+ *  symbols after parsing, enabling Phase 14 cross-file binding propagation.
+ *
+ *  Note: Python is intentionally excluded here. `import models` is a namespace import
+ *  (not wildcard symbol expansion) — expanding all exported symbols produces ambiguous
+ *  bindings when multiple modules export the same name (e.g. models.User vs auth.User).
+ *  Python module aliases are built in synthesizeWildcardImportBindings via moduleAliasMap. */
 const WILDCARD_IMPORT_LANGUAGES = new Set([
   SupportedLanguages.Go,
   SupportedLanguages.Ruby,
   SupportedLanguages.C,
   SupportedLanguages.CPlusPlus,
   SupportedLanguages.Swift,
-  SupportedLanguages.Python, // `import models` imports all exported symbols from modules
 ]);
 
 /** Synthesize namedImportMap entries for languages with whole-module imports.
@@ -203,6 +207,31 @@ function synthesizeWildcardImportBindings(
   // Process files from graph IMPORTS edges (Go package imports)
   for (const [filePath, importedFiles] of graphImports) {
     synthesizeForFile(filePath, importedFiles);
+  }
+
+  // Build module alias map for Python namespace imports.
+  // `import models` in app.py → ctx.moduleAliasMap['app.py']['models'] = 'models.py'
+  // Enables `models.User()` to resolve to models.py:User without ambiguous symbol expansion.
+  const buildPythonModuleAliasForFile = (callerFile: string, importedFiles: Iterable<string>) => {
+    let aliasMap = ctx.moduleAliasMap.get(callerFile);
+    for (const importedFile of importedFiles) {
+      // Derive the module alias from the imported filename stem (e.g. "models.py" → "models")
+      const lastSlash = importedFile.lastIndexOf('/');
+      const base = lastSlash >= 0 ? importedFile.slice(lastSlash + 1) : importedFile;
+      const dot = base.lastIndexOf('.');
+      const stem = dot >= 0 ? base.slice(0, dot) : base;
+      if (!stem) continue;
+      if (!aliasMap) {
+        aliasMap = new Map();
+        ctx.moduleAliasMap.set(callerFile, aliasMap);
+      }
+      aliasMap.set(stem, importedFile);
+    }
+  };
+
+  for (const [filePath, importedFiles] of ctx.importMap) {
+    if (getLanguageFromFilename(filePath) !== SupportedLanguages.Python) continue;
+    buildPythonModuleAliasForFile(filePath, importedFiles);
   }
 
   return totalSynthesized;
