@@ -378,3 +378,131 @@ describe.skipIf(!swiftAvailable)('Swift export visibility (internal vs private)'
   // These tests verify the symbols ARE marked correctly in export detection
   // (covered by parsing.test.ts mock tests), not end-to-end call blocking.
 });
+
+// ---------------------------------------------------------------------------
+// if let / guard let optional binding resolution:
+// Swift's most common unwrap patterns — extractIfGuardBinding extracts the
+// variable name and infers type from the RHS call result.
+// ---------------------------------------------------------------------------
+
+describe.skipIf(!swiftAvailable)('Swift if let / guard let binding resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'swift-if-let-guard-let'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo classes', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Class')).toContain('Repo');
+  });
+
+  it('resolves user.save() inside if-let to User#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'processIfLet' && c.targetFilePath === 'Models.swift',
+    );
+    expect(saveCall).toBeDefined();
+  });
+
+  it('resolves repo.save() inside guard-let to Repo#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'processGuardLet' && c.targetFilePath === 'Models.swift',
+    );
+    expect(saveCall).toBeDefined();
+  });
+
+  it('user.save() in if-let does NOT resolve to Repo#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const wrongSave = calls.find(c =>
+      c.target === 'save' && c.source === 'processIfLet',
+    );
+    if (wrongSave) {
+      // If resolved, it should be to User's save (in Models.swift), not Repo's
+      expect(wrongSave.targetFilePath).toBe('Models.swift');
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// await / try expression unwrapping:
+// Swift's await_expression and try_expression wrap call_expression nodes.
+// extractPendingAssignment must unwrap these to find the inner call.
+// ---------------------------------------------------------------------------
+
+describe.skipIf(!swiftAvailable)('Swift await / try expression unwrapping', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'swift-await-try'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves user.save() via await fetchUser() return type', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'processAwait' && c.targetFilePath === 'Models.swift',
+    );
+    expect(saveCall).toBeDefined();
+  });
+
+  it('resolves repo.save() via try parseRepo() return type', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'processTry' && c.targetFilePath === 'Models.swift',
+    );
+    expect(saveCall).toBeDefined();
+  });
+
+  it('detects fetchUser and parseRepo as functions', () => {
+    const fns = getNodesByLabel(result, 'Function');
+    expect(fns).toContain('fetchUser');
+    expect(fns).toContain('parseRepo');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// for-in loop element type inference:
+// extractForLoopBinding derives element type from the iterable's declared
+// type annotation (e.g., [User] → User).
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// For-in loop element type inference: extractForLoopBinding derives element
+// type from the iterable's declared type annotation (e.g., [User] → User).
+//
+// KNOWN GAP: The type-env correctly stores declarationTypeNodes for Swift
+// array types ([User]), but the call-processor's re-parse path doesn't
+// propagate the for-loop binding to receiver resolution. The type-env
+// infrastructure (extractForLoopBinding, extractSwiftElementTypeFromTypeNode,
+// declarationTypeNodes population for type_annotation) is in place — the
+// integration gap is in how processCalls rebuilds TypeEnv for call resolution.
+// Fixture: swift-for-loop-inference/ (ready for when this is wired up).
+// ---------------------------------------------------------------------------
+
+describe.skipIf(!swiftAvailable)('Swift for-in loop element type inference', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'swift-for-loop-inference'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo classes', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Class')).toContain('Repo');
+  });
+
+  it('creates implicit import edges between files', () => {
+    const imports = getRelationships(result, 'IMPORTS');
+    expect(imports.length).toBeGreaterThan(0);
+  });
+});

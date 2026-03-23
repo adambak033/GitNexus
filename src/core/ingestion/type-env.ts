@@ -854,13 +854,27 @@ export const buildTypeEnv = (
             }
           }
         }
+        // Swift: property_declaration has type_annotation as a direct child (not a 'type' field).
+        // Extract the inner type node (array_type, user_type, etc.) for declarationTypeNodes.
+        if (!typeNode) {
+          for (let i = 0; i < node.namedChildCount; i++) {
+            const c = node.namedChild(i);
+            if (c?.type === 'type_annotation') {
+              // Use the inner type (array_type, user_type) rather than the annotation wrapper
+              typeNode = c.firstNamedChild ?? c;
+              break;
+            }
+          }
+        }
       }
       if (typeNode) {
         const nameNode = node.childForFieldName('name')
           ?? node.childForFieldName('left')
           ?? node.childForFieldName('pattern');
         if (nameNode) {
-          const varName = extractVarName(nameNode);
+          // Swift: pattern node wraps a simple_identifier — unwrap it
+          const varName = extractVarName(nameNode)
+            ?? (nameNode.type === 'pattern' ? extractVarName(nameNode.firstNamedChild!) ?? nameNode.text : undefined);
           if (varName && !declarationTypeNodes.has(`${scope}\0${varName}`)) {
             declarationTypeNodes.set(`${scope}\0${varName}`, typeNode);
           }

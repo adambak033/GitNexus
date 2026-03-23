@@ -382,7 +382,7 @@ export const processImports = async (
     // Tree is now owned by the LRU cache — no manual delete needed
   }
 
-  addSwiftImplicitImports(files, configs.swiftPackageConfig, importMap, addImportEdge);
+  addSwiftImplicitImports(allFileList.map(p => ({ path: p })), configs.swiftPackageConfig, importMap, addImportEdge);
 
   if (skippedByLang && skippedByLang.size > 0) {
     for (const [lang, count] of skippedByLang.entries()) {
