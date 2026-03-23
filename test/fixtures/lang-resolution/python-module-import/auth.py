@@ -1,5 +1,5 @@
 class User:
-    def check(self):
+    def verify(self):
         pass
 
 class Admin:

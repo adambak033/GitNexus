@@ -204,7 +204,7 @@ function synthesizeWildcardImportBindings(
     synthesizeForFile(filePath, importedFiles);
   }
 
-  // Process files from graph IMPORTS edges (Go package imports)
+  // Process files from graph IMPORTS edges (Go and other wildcard-import languages)
   for (const [filePath, importedFiles] of graphImports) {
     synthesizeForFile(filePath, importedFiles);
   }
@@ -606,12 +606,17 @@ export const runPipelineFromRepo = async (
               stats: { filesProcessed: filesParsedSoFar, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
             });
           }, repoPath, importCtx);
-          // ── Wildcard-import synthesis (Python / Ruby / C/C++ / Swift / Go) ──────────────
-          // Synthesize namedImportMap entries for module-qualified calls like Python's
-          // `models.User()`. Must run after imports are resolved (importMap is populated)
-          // but BEFORE call resolution so Tier 2a-named can disambiguate `module.Name()`.
-          // Idempotent: first-seen semantics prevents double-counting across chunks.
-          synthesizeWildcardImportBindings(graph, ctx);
+          // ── Wildcard-import synthesis (Ruby / C/C++ / Swift / Go) + Python module aliases ─
+          // Synthesize namedImportMap entries for wildcard-import languages and build
+          // moduleAliasMap for Python namespace imports. Must run after imports are resolved
+          // (importMap is populated) but BEFORE call resolution.
+          // Guard: skip for chunks with only non-wildcard/non-Python files to avoid
+          // O(chunks × graph_size) repeated traversals on large TypeScript/JS repos.
+          const chunkHasWildcardOrPython = chunkFiles.some(f => {
+            const lang = getLanguageFromFilename(f.path);
+            return lang && (WILDCARD_IMPORT_LANGUAGES.has(lang) || lang === SupportedLanguages.Python);
+          });
+          if (chunkHasWildcardOrPython) synthesizeWildcardImportBindings(graph, ctx);
           // Phase 14 E1: Seed cross-file receiver types from ExportedTypeMap
           // before call resolution — eliminates re-parse for single-hop imported receivers.
           // NOTE: In the worker path, exportedTypeMap is empty during chunk processing
