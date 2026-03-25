@@ -4,7 +4,7 @@
 import { describe, it, expect } from 'vitest';
 import { nextjsFileToRouteURL, normalizeFetchURL, routeMatches } from '../../src/core/ingestion/route-extractors/nextjs.js';
 import { phpFileToRouteURL } from '../../src/core/ingestion/route-extractors/php.js';
-import { extractMiddlewareChain } from '../../src/core/ingestion/route-extractors/middleware.js';
+import { extractMiddlewareChain, extractNextjsMiddlewareConfig, middlewareMatcherMatchesRoute } from '../../src/core/ingestion/route-extractors/middleware.js';
 import { detectStatusCode, extractResponseShapes, extractPHPResponseShapes } from '../../src/core/ingestion/route-extractors/response-shapes.js';
 
 // ---------------------------------------------------------------------------
@@ -466,6 +466,137 @@ describe('error response shape separation', () => {
     const shapes = extractResponseShapes(content);
     expect(shapes.responseKeys).toEqual(['created', 'id']);
     expect(shapes.errorKeys).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Next.js project-level middleware config extraction
+// ---------------------------------------------------------------------------
+
+describe('extractNextjsMiddlewareConfig', () => {
+  it('extracts matcher array and named function export', () => {
+    const content = `
+      import { NextResponse, type NextRequest } from "next/server";
+      export function middleware(request: NextRequest) {
+        return NextResponse.next();
+      }
+      export const config = {
+        matcher: ["/api/:path*", "/dashboard/:path*"],
+      };
+    `;
+    const result = extractNextjsMiddlewareConfig(content);
+    expect(result).toBeDefined();
+    expect(result!.matchers).toEqual(['/api/:path*', '/dashboard/:path*']);
+    expect(result!.exportedName).toBe('middleware');
+  });
+
+  it('extracts single string matcher', () => {
+    const content = `
+      export function middleware(req) {}
+      export const config = { matcher: '/dashboard/:path*' };
+    `;
+    const result = extractNextjsMiddlewareConfig(content);
+    expect(result!.matchers).toEqual(['/dashboard/:path*']);
+  });
+
+  it('extracts default export name as wrappedFunction', () => {
+    const content = `
+      import { auth } from '@/lib/auth';
+      export default auth;
+      export const config = { matcher: ['/api/:path*'] };
+    `;
+    const result = extractNextjsMiddlewareConfig(content);
+    expect(result!.exportedName).toBe('auth');
+    expect(result!.wrappedFunctions).toContain('auth');
+    expect(result!.matchers).toEqual(['/api/:path*']);
+  });
+
+  it('extracts chain composition', () => {
+    const content = `
+      export default chain([withAuth, withI18n]);
+      export const config = { matcher: ['/((?!api|_next).*)'] };
+    `;
+    const result = extractNextjsMiddlewareConfig(content);
+    expect(result!.wrappedFunctions).toEqual(['withAuth', 'withI18n']);
+  });
+
+  it('extracts nested wrapper composition from default export', () => {
+    const content = `
+      export default withRateLimit(withAuth(handler));
+      export const config = { matcher: ['/api/:path*'] };
+    `;
+    const result = extractNextjsMiddlewareConfig(content);
+    expect(result!.wrappedFunctions).toEqual(['withRateLimit', 'withAuth']);
+  });
+
+  it('extracts regex-style negative lookahead matcher', () => {
+    const content = `
+      export function middleware(req) {}
+      export const config = {
+        matcher: ["/((?!api|_next/static|_next/image|favicon.ico|.*\\\\..*$).*)"],
+      };
+    `;
+    const result = extractNextjsMiddlewareConfig(content);
+    expect(result!.matchers).toHaveLength(1);
+    expect(result!.matchers[0]).toContain('(?!api|_next');
+  });
+
+  it('treats middleware without config.matcher as match-all', () => {
+    const content = `export function middleware(req) { return NextResponse.next(); }`;
+    const result = extractNextjsMiddlewareConfig(content);
+    expect(result).toBeDefined();
+    expect(result!.matchers).toEqual([]);
+    expect(result!.exportedName).toBe('middleware');
+  });
+
+  it('detects arrow function const export', () => {
+    const content = `
+      export const middleware = (req) => {
+        return NextResponse.next();
+      };
+      export const config = { matcher: ['/dashboard/:path*'] };
+    `;
+    const result = extractNextjsMiddlewareConfig(content);
+    expect(result).toBeDefined();
+    expect(result!.exportedName).toBe('middleware');
+    expect(result!.matchers).toEqual(['/dashboard/:path*']);
+  });
+
+  it('handles export default function middleware(...)', () => {
+    const content = `export default function middleware(req) { return NextResponse.next(); }`;
+    const result = extractNextjsMiddlewareConfig(content);
+    expect(result).toBeDefined();
+    expect(result!.exportedName).toBe('middleware');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Middleware matcher to route matching
+// ---------------------------------------------------------------------------
+
+describe('middlewareMatcherMatchesRoute', () => {
+  it('matches prefix pattern with :path*', () => {
+    expect(middlewareMatcherMatchesRoute('/api/:path*', '/api/users')).toBe(true);
+    expect(middlewareMatcherMatchesRoute('/api/:path*', '/api/auth/login')).toBe(true);
+    expect(middlewareMatcherMatchesRoute('/api/:path*', '/api')).toBe(true);
+  });
+
+  it('does not match unrelated routes with :path*', () => {
+    expect(middlewareMatcherMatchesRoute('/dashboard/:path*', '/api/users')).toBe(false);
+    expect(middlewareMatcherMatchesRoute('/api/:path*', '/v1/users')).toBe(false);
+  });
+
+  it('matches exact route', () => {
+    expect(middlewareMatcherMatchesRoute('/login', '/login')).toBe(true);
+    expect(middlewareMatcherMatchesRoute('/login', '/login/callback')).toBe(false);
+  });
+
+  it('matches regex-style negative lookahead pattern', () => {
+    const matcher = '/((?!api|_next).*)';
+    expect(middlewareMatcherMatchesRoute(matcher, '/dashboard')).toBe(true);
+    expect(middlewareMatcherMatchesRoute(matcher, '/settings/profile')).toBe(true);
+    expect(middlewareMatcherMatchesRoute(matcher, '/api')).toBe(false);
+    expect(middlewareMatcherMatchesRoute(matcher, '/api/users')).toBe(false);
   });
 });
 

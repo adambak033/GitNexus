@@ -13,7 +13,7 @@ import { nextjsFileToRouteURL, normalizeFetchURL } from './route-extractors/next
 import { expoFileToRouteURL } from './route-extractors/expo.js';
 import { phpFileToRouteURL } from './route-extractors/php.js';
 import { extractResponseShapes, extractPHPResponseShapes } from './route-extractors/response-shapes.js';
-import { extractMiddlewareChain } from './route-extractors/middleware.js';
+import { extractMiddlewareChain, extractNextjsMiddlewareConfig, compileMatcher, compiledMatcherMatchesRoute } from './route-extractors/middleware.js';
 import { generateId } from '../../lib/utils.js';
 import type { ExtractedFetchCall, ExtractedRoute, ExtractedDecoratorRoute, ExtractedToolDef } from './workers/parse-worker.js';
 import { processHeritage, processHeritageFromExtracted } from './heritage-processor.js';
@@ -1181,6 +1181,47 @@ export const runPipelineFromRepo = async (
 
       if (isDev) {
         console.log(`🗺️ Route registry: ${routeRegistry.size} routes${duplicateRoutes > 0 ? ` (${duplicateRoutes} duplicate URLs skipped)` : ''}`);
+      }
+    }
+
+
+    // ── Phase 3.5b: Link Next.js project-level middleware.ts to routes ──
+    if (routeRegistry.size > 0) {
+      const middlewareCandidates = allPaths.filter(p =>
+        p === 'middleware.ts' || p === 'middleware.js' || p === 'middleware.tsx' || p === 'middleware.jsx' ||
+        p === 'src/middleware.ts' || p === 'src/middleware.js' || p === 'src/middleware.tsx' || p === 'src/middleware.jsx'
+      );
+      if (middlewareCandidates.length > 0) {
+        const mwContents = await readFileContents(repoPath, middlewareCandidates);
+        for (const [mwPath, mwContent] of mwContents) {
+          const config = extractNextjsMiddlewareConfig(mwContent);
+          if (!config) continue;
+          const mwLabel = config.wrappedFunctions.length > 0
+            ? config.wrappedFunctions
+            : [config.exportedName];
+
+          // Pre-compile matchers once per middleware file
+          const compiled = config.matchers.map(compileMatcher).filter((m): m is NonNullable<typeof m> => m !== null);
+
+          let linkedCount = 0;
+          for (const [routeURL] of routeRegistry) {
+            const matches = compiled.length === 0 ||
+              compiled.some(cm => compiledMatcherMatchesRoute(cm, routeURL));
+            if (!matches) continue;
+
+            const routeNodeId = generateId('Route', routeURL);
+            const existing = graph.getNode(routeNodeId);
+            if (!existing) continue;
+
+            const currentMw = (existing.properties.middleware as string[] | undefined) ?? [];
+            // Prepend project-level middleware (runs before handler-level wrappers)
+            existing.properties.middleware = [...mwLabel, ...currentMw.filter(m => !mwLabel.includes(m))];
+            linkedCount++;
+          }
+          if (isDev && linkedCount > 0) {
+            console.log(`🛡️ Linked ${mwPath} middleware [${mwLabel.join(', ')}] to ${linkedCount} routes`);
+          }
+        }
       }
     }
 
