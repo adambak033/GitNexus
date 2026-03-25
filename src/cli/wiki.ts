@@ -339,8 +339,13 @@ export const wikiCommand = async (
       console.log(`\n  Tree saved to: ${treeFile}`);
       console.log('  You can edit this file to remove/rename modules.\n');
       
-      // Ask for confirmation
-      const answer = await prompt('  Continue with generation? (Y/n/edit): ');
+      // Ask for confirmation (auto-continue in non-interactive environments)
+      if (!process.stdin.isTTY) {
+        console.log('  Non-interactive mode — auto-continuing with generation.\n');
+      }
+      const answer = process.stdin.isTTY
+        ? await prompt('  Continue with generation? (Y/n/edit): ')
+        : 'y';
       const choice = answer.trim().toLowerCase();
       
       if (choice === 'n' || choice === 'no') {
@@ -465,7 +470,7 @@ export const wikiCommand = async (
       }
     } else {
       console.log(`\n  Error: ${err.message}\n`);
-      if (process.env.DEBUG) {
+      if (process.env.GITNEXUS_VERBOSE) {
         console.error(err);
       }
     }

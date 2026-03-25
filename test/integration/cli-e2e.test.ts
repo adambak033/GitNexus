@@ -305,13 +305,11 @@ describe('CLI end-to-end', () => {
       expect(combined).not.toMatch(/API key:/);
     });
 
-    it('wiki --verbose sets GITNEXUS_VERBOSE env', () => {
-      // --verbose should be accepted as a valid flag (not rejected by Commander)
+    it('wiki --help includes --verbose flag description', () => {
       const result = runCliRaw(['wiki', '--help'], repoRoot);
       if (result.status === null) return;
 
       expect(result.status).toBe(0);
-      // Confirm the flag description is present
       expect(result.stdout).toMatch(/verbose/i);
     });
   });
