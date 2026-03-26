@@ -1426,13 +1426,30 @@ export const processRoutesFromExtracted = async (
  */
 
 /** Common method names on response/data objects that are NOT property accesses */
-const RESPONSE_METHOD_BLOCKLIST = new Set([
-  'json', 'text', 'blob', 'arrayBuffer', 'formData', 'ok', 'status', 'headers',
-  'then', 'catch', 'finally', 'clone',
+// Properties/methods to ignore when extracting consumer accessed keys from `data.X` patterns.
+// Avoids false positives from Fetch API, Array, Object, Promise, and DOM access on variables
+// that happen to share names with response variables (data, result, response, etc.).
+const RESPONSE_ACCESS_BLOCKLIST = new Set([
+  // Fetch/Response API
+  'json', 'text', 'blob', 'arrayBuffer', 'formData', 'ok', 'status', 'headers', 'clone',
+  // Promise
+  'then', 'catch', 'finally',
+  // Array
   'map', 'filter', 'forEach', 'reduce', 'find', 'some', 'every',
-  'length', 'toString', 'valueOf',
   'push', 'pop', 'shift', 'unshift', 'splice', 'slice', 'concat', 'join',
-  'sort', 'reverse', 'includes', 'indexOf', 'keys', 'values', 'entries',
+  'sort', 'reverse', 'includes', 'indexOf',
+  // Object
+  'length', 'toString', 'valueOf', 'keys', 'values', 'entries',
+  // DOM methods — file-download patterns often reuse `data`/`response` variable names
+  'appendChild', 'removeChild', 'insertBefore', 'replaceChild', 'replaceChildren',
+  'createElement', 'getElementById', 'querySelector', 'querySelectorAll',
+  'setAttribute', 'getAttribute', 'removeAttribute', 'hasAttribute',
+  'addEventListener', 'removeEventListener', 'dispatchEvent',
+  'classList', 'className',
+  'parentNode', 'parentElement', 'childNodes', 'children',
+  'nextSibling', 'previousSibling', 'firstChild', 'lastChild',
+  'click', 'focus', 'blur', 'submit', 'reset',
+  'innerHTML', 'outerHTML', 'textContent', 'innerText',
 ]);
 
 export const extractConsumerAccessedKeys = (content: string): string[] => {
@@ -1471,7 +1488,7 @@ export const extractConsumerAccessedKeys = (content: string): string[] => {
   while ((match = propAccessPattern.exec(content)) !== null) {
     const key = match[1];
     // Skip common method calls that aren't property accesses
-    if (!RESPONSE_METHOD_BLOCKLIST.has(key)) {
+    if (!RESPONSE_ACCESS_BLOCKLIST.has(key)) {
       keys.add(key);
     }
   }

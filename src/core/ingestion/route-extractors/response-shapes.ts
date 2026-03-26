@@ -76,7 +76,31 @@ export function extractResponseShapes(content: string): { responseKeys?: string[
         if (ch === inString) inString = null;
         continue;
       }
-      if (ch === '"' || ch === "'" || ch === '`') { inString = ch; continue; }
+      if (ch === '"' || ch === "'" || ch === '`') {
+        // Quoted string at depth 1 before ':' is a property key (e.g., { 'courses': data })
+        // The original parser only handled unquoted identifiers.
+        if (depth === 1 && keyStart === -1) {
+          const quote = ch;
+          const strStart = j + 1;
+          let strEnd = -1;
+          for (let s = strStart; s < content.length; s++) {
+            if (content[s] === '\\') { s++; continue; }
+            if (content[s] === quote) { strEnd = s; break; }
+          }
+          if (strEnd !== -1) {
+            // Scan forward for ':' without allocating a substring
+            let p = strEnd + 1;
+            while (p < content.length && (content[p] === ' ' || content[p] === '\t' || content[p] === '\n' || content[p] === '\r')) p++;
+            if (content[p] === ':') {
+              callKeys.push(content.slice(strStart, strEnd));
+            }
+            j = strEnd;
+            continue;
+          }
+        }
+        inString = ch;
+        continue;
+      }
       if (ch === '{') { depth++; continue; }
       if (ch === '}') { depth--; if (depth === 0) { closingBracePos = j; break; } continue; }
       if (depth !== 1) continue;
