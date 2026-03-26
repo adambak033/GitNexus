@@ -2,6 +2,39 @@
 
 All notable changes to GitNexus will be documented in this file.
 
+## [1.4.9] - 2026-03-26
+
+### Added
+- **COBOL language support** — standalone regex processor for fixed-format and free-format COBOL, JCL, COPY/REPLACING with pseudotext (#498)
+  - 95% language feature coverage: CALL USING, EXEC SQL/CICS/DLI, DECLARATIVES, SET, INSPECT, INITIALIZE, STRING/UNSTRING, SORT/MERGE with INPUT/OUTPUT PROCEDURE, GO TO DEPENDING ON, MOVE CORRESPONDING, nested programs with per-program scoping
+  - 90+ review findings resolved across 20 review cycles with 241 tests (180 unit + 61 integration)
+  - Benchmarked: CardDemo 12,349 nodes / 9,773 edges in 7.4s; ACAS 14,017 nodes / 15,659 edges in 9.3s
+- **Dart language support** — tree-sitter grammar, type extractors, import/call resolution, Flutter/Riverpod framework detection (#204)
+- **Field type extraction** — Phase 8 & 9: per-language field extractors with generic table-driven factory + TypeScript hand-written extractor, return-type binding in call-processor (#494)
+  - 14 language configs (TS/JS, Python, Go, Rust, C/C++, C#, Java, Kotlin, PHP, Ruby, Swift, Dart)
+  - `FieldVisibility` union type, `extractNames` hook for Ruby multi-attribute
+  - 46 field extraction tests across 5 languages
+- **ORM dataflow detection** for Prisma and Supabase (#511)
+- **Expo Router** file-based route detection (#503)
+- **PHP response shape extraction** for `json_encode` patterns (#502)
+- **Next.js middleware.ts** linked to routes at project level (#504)
+- **Filter panel** — additional node types (#519)
+
+### Changed
+- **BUILT_IN_NAMES** split into per-language provider fields (#523)
+- **tree-sitter** upgraded to 0.25.0 with all grammar packages (#516)
+- **Impact tool** — batched chunking and entry-point grouping for enrichment (#507)
+
+### Fixed
+- **COBOL CRLF** — all `split('\n')` calls use `/\r?\n/` for Windows compatibility
+- **COBOL nested programs** — all graph edges (CALL, CANCEL, CICS, ENTRY, SQL, SEARCH) use `owningModuleId()` for correct attribution
+- **COBOL callAccum** — multi-line CALL USING with verb boundary detection, Area A paragraph guard, EXEC entry flush, division/END PROGRAM flush
+- **Dart language gaps** closed (#524)
+- **Shape check false positives** — quoted keys, DOM leaks, errorKeys (#501)
+- **Python alias gaps** resolved (#505)
+- **Cypher write-detection regex** false positive fixed (#507)
+- **CI** — shape-check-regression test moved to lbug-db project (#518)
+
 ## [1.4.8] - 2026-03-23
 
 ### Added
