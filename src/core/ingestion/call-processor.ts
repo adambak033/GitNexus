@@ -389,6 +389,7 @@ export const processCalls = async (
     const receiverIndex = buildReceiverTypeIndex(verifiedReceivers);
 
     ctx.enableCache(file.path);
+    const widenCache: WidenCache = new Map();
 
     matches.forEach(match => {
       const captureMap: Record<string, any> = {};
@@ -604,7 +605,7 @@ export const processCalls = async (
         callForm,
         receiverTypeName,
         receiverName,
-      }, file.path, ctx, hints);
+      }, file.path, ctx, hints, widenCache);
 
       if (!resolved) return;
       const relId = generateId('CALLS', `${sourceId}:${calledName}->${resolved.nodeId}`);
@@ -822,11 +823,15 @@ const tryOverloadDisambiguation = (
  *
  * If filtering still leaves multiple candidates, refuse to emit a CALLS edge.
  */
+/** Per-file cache for the widen path's lookupFuzzy calls. Cleared between files. */
+type WidenCache = Map<string, readonly SymbolDefinition[]>;
+
 const resolveCallTarget = (
   call: Pick<ExtractedCall, 'calledName' | 'argCount' | 'callForm' | 'receiverTypeName' | 'receiverName'>,
   currentFile: string,
   ctx: ResolutionContext,
   overloadHints?: OverloadHints,
+  widenCache?: WidenCache,
 ): ResolveResult | null => {
   const tiered = ctx.resolve(call.calledName, currentFile);
   if (!tiered) return null;
@@ -853,16 +858,33 @@ const resolveCallTarget = (
     filteredCandidates = filterCallableCandidates(tiered.candidates, call.argCount, 'constructor');
   }
 
-  // Module-alias disambiguation: Python `import auth; auth.User()` — when both models.py and
-  // auth.py export User, receiverName='auth' selects auth.py via moduleAliasMap.
-  // Runs when multiple candidates survive filtering and the receiver is a known module alias.
-  if (filteredCandidates.length > 1 && call.callForm === 'member' && call.receiverName) {
+  // Module-alias disambiguation: Python `import auth; auth.User()` — receiverName='auth'
+  // selects auth.py via moduleAliasMap. Runs for ALL member calls with a known module alias,
+  // not just ambiguous ones — same-file tier may shadow the correct cross-module target when
+  // the caller defines a function with the same name as the callee (Issue #417).
+  if (call.callForm === 'member' && call.receiverName) {
     const aliasMap = ctx.moduleAliasMap?.get(currentFile);
     if (aliasMap) {
       const moduleFile = aliasMap.get(call.receiverName);
       if (moduleFile) {
         const aliasFiltered = filteredCandidates.filter(c => c.filePath === moduleFile);
-        if (aliasFiltered.length > 0) filteredCandidates = aliasFiltered;
+        if (aliasFiltered.length > 0) {
+          filteredCandidates = aliasFiltered;
+        } else {
+          // Same-file tier returned a local match, but the alias points elsewhere.
+          // Widen to global candidates and filter to the aliased module's file.
+          // Use per-file widenCache to avoid repeated lookupFuzzy for the same
+          // calledName+moduleFile from multiple call sites in the same file.
+          const cacheKey = `${call.calledName}\0${moduleFile}`;
+          let fuzzyDefs = widenCache?.get(cacheKey);
+          if (!fuzzyDefs) {
+            fuzzyDefs = ctx.symbols.lookupFuzzy(call.calledName);
+            widenCache?.set(cacheKey, fuzzyDefs);
+          }
+          const widened = filterCallableCandidates(fuzzyDefs, call.argCount, call.callForm)
+            .filter(c => c.filePath === moduleFile);
+          if (widened.length > 0) filteredCandidates = widened;
+        }
       }
     }
   }
@@ -1200,6 +1222,7 @@ export const processCallsFromExtracted = async (
     }
 
     ctx.enableCache(filePath);
+    const widenCache: WidenCache = new Map();
     const receiverMap = fileReceiverTypes.get(filePath);
 
     for (const call of calls) {
@@ -1253,7 +1276,7 @@ export const processCallsFromExtracted = async (
         }
       }
 
-      const resolved = resolveCallTarget(effectiveCall, effectiveCall.filePath, ctx);
+      const resolved = resolveCallTarget(effectiveCall, effectiveCall.filePath, ctx, undefined, widenCache);
       if (!resolved) continue;
 
       const relId = generateId('CALLS', `${effectiveCall.sourceId}:${effectiveCall.calledName}->${resolved.nodeId}`);

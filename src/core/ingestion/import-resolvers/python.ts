@@ -18,7 +18,7 @@ import { resolveStandard } from './standard.js';
  *    Checks package (__init__.py) before module (.py), matching CPython's finder order (PEP 451 §4).
  *    Coexistence of both is physically impossible (same name = file vs directory), so the order
  *    only matters for spec compliance.
- *    Note: namespace packages (PEP 420, directory without __init__.py) are not handled.
+ *    Note: implicit namespace packages (Python 3.3+, directory without __init__.py) are not handled.
  *
  * Returns null to let the caller fall through to suffixResolve.
  */
@@ -58,6 +58,19 @@ export function resolvePythonImportInternal(
   if (allFiles.has(`${importerDir}/${pathLike}/__init__.py`)) return `${importerDir}/${pathLike}/__init__.py`;
   if (allFiles.has(`${importerDir}/${pathLike}.py`)) return `${importerDir}/${pathLike}.py`;
 
+  // Ancestor directory walk — Python resolves bare imports against sys.path entries,
+  // which typically includes the project root and package directories. Walk up from the
+  // importer's directory to find the module in an ancestor, preferring the closest match.
+  // This prevents cross-language misresolution (e.g., Python `from middleware import X`
+  // resolving to a TypeScript middleware.ts via suffix matching). Issue #417.
+  const dirParts = importerDir.split('/');
+  for (let i = dirParts.length - 1; i >= 0; i--) {
+    const ancestorDir = dirParts.slice(0, i).join('/');
+    const prefix = ancestorDir ? `${ancestorDir}/` : '';
+    if (allFiles.has(`${prefix}${pathLike}/__init__.py`)) return `${prefix}${pathLike}/__init__.py`;
+    if (allFiles.has(`${prefix}${pathLike}.py`)) return `${prefix}${pathLike}.py`;
+  }
+
   return null;
 }
 
@@ -71,7 +84,12 @@ export function resolvePythonImport(
   ctx: ResolveCtx,
 ): ImportResult {
   const resolved = resolvePythonImportInternal(filePath, rawImportPath, ctx.allFilePaths);
-  if (resolved) return { kind: 'files', files: [resolved] };
+  if (resolved) {
+    // Store in resolveCache so other files importing the same module skip the
+    // ancestor walk. The cache key matches resolveStandard's convention.
+    ctx.resolveCache.set(`${filePath}::${rawImportPath}`, resolved);
+    return { kind: 'files', files: [resolved] };
+  }
   if (rawImportPath.startsWith('.')) return null; // relative but unresolved -- don't suffix-match
   return resolveStandard(rawImportPath, filePath, ctx, SupportedLanguages.Python);
 }
