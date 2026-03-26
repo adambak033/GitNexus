@@ -29,7 +29,7 @@ export const REL_TABLE_NAME = 'CodeRelation';
 
 // Valid relation types
 // Note: WRAPS is reserved for future middleware graph traversal (not yet emitted)
-export const REL_TYPES = ['CONTAINS', 'DEFINES', 'IMPORTS', 'CALLS', 'EXTENDS', 'IMPLEMENTS', 'HAS_METHOD', 'HAS_PROPERTY', 'ACCESSES', 'OVERRIDES', 'MEMBER_OF', 'STEP_IN_PROCESS', 'HANDLES_ROUTE', 'FETCHES', 'HANDLES_TOOL', 'ENTRY_POINT_OF', 'WRAPS'] as const;
+export const REL_TYPES = ['CONTAINS', 'DEFINES', 'IMPORTS', 'CALLS', 'EXTENDS', 'IMPLEMENTS', 'HAS_METHOD', 'HAS_PROPERTY', 'ACCESSES', 'OVERRIDES', 'MEMBER_OF', 'STEP_IN_PROCESS', 'HANDLES_ROUTE', 'FETCHES', 'HANDLES_TOOL', 'ENTRY_POINT_OF', 'WRAPS', 'QUERIES'] as const;
 export type RelType = typeof REL_TYPES[number];
 
 // ============================================================================
@@ -284,6 +284,7 @@ CREATE REL TABLE ${REL_TABLE_NAME} (
   FROM Function TO \`Typedef\`,
   FROM Function TO \`Union\`,
   FROM Function TO \`Property\`,
+  FROM Function TO CodeElement,
   FROM Class TO Method,
   FROM Class TO Function,
   FROM Class TO Class,
@@ -317,6 +318,7 @@ CREATE REL TABLE ${REL_TABLE_NAME} (
   FROM Method TO Interface,
   FROM Method TO \`Constructor\`,
   FROM Method TO \`Property\`,
+  FROM Method TO CodeElement,
   FROM \`Template\` TO \`Template\`,
   FROM \`Template\` TO Function,
   FROM \`Template\` TO Method,

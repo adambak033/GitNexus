@@ -11,7 +11,7 @@ import { getDefinitionNodeFromCaptures, findEnclosingClassId, extractMethodSigna
 import { extractPropertyDeclaredType } from './type-extractors/shared.js';
 import { detectFrameworkFromAST } from './framework-detection.js';
 import { WorkerPool } from './workers/worker-pool.js';
-import type { ParseWorkerResult, ParseWorkerInput, ExtractedImport, ExtractedCall, ExtractedAssignment, ExtractedHeritage, ExtractedRoute, ExtractedFetchCall, ExtractedDecoratorRoute, ExtractedToolDef, FileConstructorBindings, FileTypeEnvBindings } from './workers/parse-worker.js';
+import type { ParseWorkerResult, ParseWorkerInput, ExtractedImport, ExtractedCall, ExtractedAssignment, ExtractedHeritage, ExtractedRoute, ExtractedFetchCall, ExtractedDecoratorRoute, ExtractedToolDef, FileConstructorBindings, FileTypeEnvBindings, ExtractedORMQuery } from './workers/parse-worker.js';
 import { getTreeSitterBufferSize, TREE_SITTER_MAX_BUFFER } from './constants.js';
 
 export type FileProgressCallback = (current: number, total: number, filePath: string) => void;
@@ -25,6 +25,7 @@ export interface WorkerExtractedData {
   fetchCalls: ExtractedFetchCall[];
   decoratorRoutes: ExtractedDecoratorRoute[];
   toolDefs: ExtractedToolDef[];
+  ormQueries: ExtractedORMQuery[];
   constructorBindings: FileConstructorBindings[];
   typeEnvBindings: FileTypeEnvBindings[];
 }
@@ -48,7 +49,7 @@ const processParsingWithWorkers = async (
     if (lang) parseableFiles.push({ path: file.path, content: file.content });
   }
 
-  if (parseableFiles.length === 0) return { imports: [], calls: [], assignments: [], heritage: [], routes: [], fetchCalls: [], decoratorRoutes: [], toolDefs: [], constructorBindings: [], typeEnvBindings: [] };
+  if (parseableFiles.length === 0) return { imports: [], calls: [], assignments: [], heritage: [], routes: [], fetchCalls: [], decoratorRoutes: [], toolDefs: [], ormQueries: [], constructorBindings: [], typeEnvBindings: [] };
 
   const total = files.length;
 
@@ -69,6 +70,7 @@ const processParsingWithWorkers = async (
   const allFetchCalls: ExtractedFetchCall[] = [];
   const allDecoratorRoutes: ExtractedDecoratorRoute[] = [];
   const allToolDefs: ExtractedToolDef[] = [];
+  const allORMQueries: ExtractedORMQuery[] = [];
   const allConstructorBindings: FileConstructorBindings[] = [];
   const allTypeEnvBindings: FileTypeEnvBindings[] = [];
   for (const result of chunkResults) {
@@ -103,6 +105,7 @@ const processParsingWithWorkers = async (
     allFetchCalls.push(...result.fetchCalls);
     allDecoratorRoutes.push(...result.decoratorRoutes);
     allToolDefs.push(...result.toolDefs);
+    if (result.ormQueries) allORMQueries.push(...result.ormQueries);
     allConstructorBindings.push(...result.constructorBindings);
     allTypeEnvBindings.push(...result.typeEnvBindings);
   }
@@ -123,7 +126,7 @@ const processParsingWithWorkers = async (
 
   // Final progress
   onFileProgress?.(total, total, 'done');
-  return { imports: allImports, calls: allCalls, assignments: allAssignments, heritage: allHeritage, routes: allRoutes, fetchCalls: allFetchCalls, decoratorRoutes: allDecoratorRoutes, toolDefs: allToolDefs, constructorBindings: allConstructorBindings, typeEnvBindings: allTypeEnvBindings };
+  return { imports: allImports, calls: allCalls, assignments: allAssignments, heritage: allHeritage, routes: allRoutes, fetchCalls: allFetchCalls, decoratorRoutes: allDecoratorRoutes, toolDefs: allToolDefs, ormQueries: allORMQueries, constructorBindings: allConstructorBindings, typeEnvBindings: allTypeEnvBindings };
 };
 
 // ============================================================================

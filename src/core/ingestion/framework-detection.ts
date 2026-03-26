@@ -81,6 +81,17 @@ export function detectFrameworkFromPath(filePath: string): FrameworkHint | null 
     return { framework: 'expo-router', entryPointMultiplier: 2.5, reason: 'expo-screen' };
   }
 
+  // Prisma schema (ORM data model definition)
+  if (p.includes('/prisma/') && p.endsWith('schema.prisma')) {
+    return { framework: 'prisma', entryPointMultiplier: 1.5, reason: 'prisma-schema' };
+  }
+
+  // Supabase client files
+  if ((p.includes('/lib/supabase') || p.includes('/utils/supabase') || p.includes('/supabase/')) &&
+      (p.endsWith('.ts') || p.endsWith('.js'))) {
+    return { framework: 'supabase', entryPointMultiplier: 1.5, reason: 'supabase-client' };
+  }
+
   // Express / Node.js routes
   if (p.includes('/routes/') && (p.endsWith('.ts') || p.endsWith('.js'))) {
     return { framework: 'express', entryPointMultiplier: 2.5, reason: 'routes-folder' };
@@ -487,6 +498,10 @@ export const FRAMEWORK_AST_PATTERNS = {
   'echo': ['echo.Context', 'echo.New'],
   'fiber': ['fiber.Ctx', 'fiber.New', 'fiber.App'],
   'go-grpc': ['grpc.Server', 'RegisterServer', 'pb.Unimplemented'],
+
+  // ORM patterns
+  'prisma': ['prisma.', 'PrismaClient', '@prisma/client'],
+  'supabase': ['supabase.from', 'createClient', '@supabase/supabase-js'],
 
   // PHP/Laravel
   'laravel': ['Route::get', 'Route::post', 'Route::put', 'Route::delete',
