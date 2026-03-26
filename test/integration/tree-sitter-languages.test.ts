@@ -422,6 +422,211 @@ describe('Tree-sitter multi-language parsing', () => {
     });
   });
 
+  describe('Dart', () => {
+    const dartQueries = () => getProvider(SupportedLanguages.Dart).treeSitterQueries;
+
+    function loadDartOrSkip() {
+      return loadLanguage(SupportedLanguages.Dart).catch(() => null);
+    }
+
+    // ── Definition extraction ──────────────────────────────────────────
+
+    it('parses classes, functions, mixins, enums, and type aliases', async () => {
+      if (!(await loadDartOrSkip())) return;
+      const { matches } = parseAndQuery(parser, readFixture('simple.dart'), dartQueries());
+      const defs = extractDefinitions(matches);
+      const defTypes = defs.map(d => d.type);
+      const defNames = defs.map(d => d.name);
+
+      expect(defTypes).toContain('definition.class');
+      expect(defTypes).toContain('definition.function');
+      expect(defTypes).toContain('definition.method');
+      expect(defTypes).toContain('definition.enum');
+      expect(defTypes).toContain('definition.trait');    // mixin
+      expect(defTypes).toContain('definition.type');     // typedef
+      expect(defTypes).toContain('definition.constructor');
+      expect(defTypes).toContain('definition.property'); // getter/setter
+
+      expect(defNames).toContain('Animal');
+      expect(defNames).toContain('Dog');
+      expect(defNames).toContain('greet');
+      expect(defNames).toContain('Swimming');
+      expect(defNames).toContain('Status');
+      expect(defNames).toContain('main');
+      expect(defNames).toContain('StringExtension');
+    });
+
+    it('captures factory constructor variant name (not class name)', async () => {
+      if (!(await loadDartOrSkip())) return;
+      const { matches } = parseAndQuery(parser, readFixture('simple.dart'), dartQueries());
+      const defs = extractDefinitions(matches);
+      const constructors = defs.filter(d => d.type === 'definition.constructor');
+      expect(constructors.length).toBeGreaterThan(0);
+      // factory Dog.unknown() should capture 'unknown', not 'Dog'
+      const constructorNames = constructors.map(c => c.name);
+      expect(constructorNames).toContain('unknown');
+      expect(constructorNames).not.toContain('Dog');
+    });
+
+    it('captures getter and setter as definition.property', async () => {
+      if (!(await loadDartOrSkip())) return;
+      const { matches } = parseAndQuery(parser, readFixture('simple.dart'), dartQueries());
+      const defs = extractDefinitions(matches);
+      const props = defs.filter(d => d.type === 'definition.property');
+      expect(props.map(p => p.name)).toContain('info');     // getter
+      expect(props.map(p => p.name)).toContain('nickname');  // setter
+    });
+
+    it('captures typedef names without duplicates', async () => {
+      if (!(await loadDartOrSkip())) return;
+      const { matches } = parseAndQuery(parser, readFixture('simple.dart'), dartQueries());
+      const defs = extractDefinitions(matches);
+      const typedefs = defs.filter(d => d.type === 'definition.type');
+      const typedefNames = typedefs.map(d => d.name);
+      expect(typedefNames).toContain('JsonMap');
+      expect(typedefNames).toContain('Callback');
+      // Should not capture RHS types as names
+      expect(typedefNames).not.toContain('Map');
+      expect(typedefNames).not.toContain('Function');
+    });
+
+    // ── Export detection (private underscore convention) ────────────────
+
+    it('filters private symbols via underscore convention', async () => {
+      if (!(await loadDartOrSkip())) return;
+      const { matches } = parseAndQuery(parser, readFixture('simple.dart'), dartQueries());
+      const defs = extractDefinitions(matches);
+      const { dartExportChecker } = await import('../../src/core/ingestion/export-detection.js');
+      const publicNames = defs.filter(d => dartExportChecker(null as any, d.name)).map(d => d.name);
+      const privateNames = defs.filter(d => !dartExportChecker(null as any, d.name)).map(d => d.name);
+
+      expect(publicNames).toContain('Animal');
+      expect(publicNames).toContain('greet');
+      expect(privateNames).toContain('_privateHelper');
+    });
+
+    // ── Import extraction ──────────────────────────────────────────────
+
+    it('extracts imports', async () => {
+      if (!(await loadDartOrSkip())) return;
+      const { matches } = parseAndQuery(parser, readFixture('simple.dart'), dartQueries());
+
+      const imports: string[] = [];
+      for (const match of matches) {
+        for (const capture of match.captures) {
+          if (capture.name === 'import.source') imports.push(capture.node.text);
+        }
+      }
+      expect(imports.length).toBe(3);
+    });
+
+    it('extracts re-exports', async () => {
+      if (!(await loadDartOrSkip())) return;
+      const { matches } = parseAndQuery(parser, readFixture('dart-advanced.dart'), dartQueries());
+
+      const imports: string[] = [];
+      for (const match of matches) {
+        for (const capture of match.captures) {
+          if (capture.name === 'import.source') imports.push(capture.node.text);
+        }
+      }
+      // 2 imports + 1 re-export = 3 import.source captures
+      expect(imports.length).toBe(3);
+    });
+
+    // ── Heritage extraction ────────────────────────────────────────────
+
+    it('extracts heritage (extends, implements, with)', async () => {
+      if (!(await loadDartOrSkip())) return;
+      const { matches } = parseAndQuery(parser, readFixture('simple.dart'), dartQueries());
+
+      const heritage: { class: string; parent: string }[] = [];
+      for (const match of matches) {
+        const captures: Record<string, string> = {};
+        for (const c of match.captures) captures[c.name] = c.node.text;
+        if (captures['heritage.extends']) {
+          heritage.push({ class: captures['heritage.class'], parent: captures['heritage.extends'] });
+        }
+        if (captures['heritage.implements']) {
+          heritage.push({ class: captures['heritage.class'], parent: captures['heritage.implements'] });
+        }
+        if (captures['heritage.trait']) {
+          heritage.push({ class: captures['heritage.class'], parent: captures['heritage.trait'] });
+        }
+      }
+
+      const pairs = heritage.map(h => `${h.class}->${h.parent}`);
+      expect(pairs).toContain('Dog->Animal');
+      expect(pairs).toContain('Dog->Describable');
+      expect(pairs).toContain('Duck->Animal');
+      expect(pairs).toContain('Duck->Swimming');
+      expect(pairs).toContain('Duck->Flying');
+    });
+
+    // ── Call extraction ────────────────────────────────────────────────
+
+    it('extracts calls in expression statements', async () => {
+      if (!(await loadDartOrSkip())) return;
+      const { matches } = parseAndQuery(parser, readFixture('dart-advanced.dart'), dartQueries());
+
+      const callNames: string[] = [];
+      for (const match of matches) {
+        for (const capture of match.captures) {
+          if (capture.name === 'call.name') callNames.push(capture.node.text);
+        }
+      }
+      expect(callNames).toContain('fetchUsers');
+      expect(callNames).toContain('processData');
+    });
+
+    it('extracts calls in return statements', async () => {
+      if (!(await loadDartOrSkip())) return;
+      const { matches } = parseAndQuery(parser, readFixture('dart-advanced.dart'), dartQueries());
+
+      const callNames: string[] = [];
+      for (const match of matches) {
+        for (const capture of match.captures) {
+          if (capture.name === 'call.name') callNames.push(capture.node.text);
+        }
+      }
+      expect(callNames).toContain('formatOutput');
+    });
+
+    it('extracts calls in variable assignments', async () => {
+      if (!(await loadDartOrSkip())) return;
+      const { matches } = parseAndQuery(parser, readFixture('dart-advanced.dart'), dartQueries());
+
+      const callNames: string[] = [];
+      for (const match of matches) {
+        for (const capture of match.captures) {
+          if (capture.name === 'call.name') callNames.push(capture.node.text);
+        }
+      }
+      expect(callNames).toContain('computeScore');
+      expect(callNames).toContain('loadUser');
+    });
+
+    // ── Framework detection (path-based) ───────────────────────────────
+
+    it('detects Flutter framework from file paths', async () => {
+      const { detectFrameworkFromPath } = await import('../../src/core/ingestion/framework-detection.js');
+
+      expect(detectFrameworkFromPath('lib/main.dart')?.framework).toBe('flutter');
+      expect(detectFrameworkFromPath('lib/app.dart')?.framework).toBe('flutter');
+      expect(detectFrameworkFromPath('lib/screens/home.dart')?.framework).toBe('flutter');
+      expect(detectFrameworkFromPath('lib/pages/login.dart')?.framework).toBe('flutter');
+      expect(detectFrameworkFromPath('lib/widgets/button.dart')?.framework).toBe('flutter');
+      expect(detectFrameworkFromPath('lib/bloc/user_bloc.dart')?.framework).toBe('flutter');
+      expect(detectFrameworkFromPath('lib/services/api.dart')?.framework).toBe('flutter');
+      expect(detectFrameworkFromPath('lib/routes/app_router.dart')?.framework).toBe('flutter');
+
+      // main.dart gets highest boost
+      expect(detectFrameworkFromPath('lib/main.dart')?.entryPointMultiplier).toBe(3.0);
+      // widgets get lowest
+      expect(detectFrameworkFromPath('lib/widgets/button.dart')?.entryPointMultiplier).toBe(1.5);
+    });
+  });
+
   describe('cross-language assertions', () => {
     it('all supported languages produce at least one definition from fixtures', async () => {
       const langFixtures: [SupportedLanguages, string, string?][] = [
@@ -435,6 +640,7 @@ describe('Tree-sitter multi-language parsing', () => {
         [SupportedLanguages.CSharp, 'simple.cs'],
         [SupportedLanguages.Rust, 'simple.rs'],
         [SupportedLanguages.PHP, 'simple.php'],
+        // Dart and Swift are excluded — they are optionalDependencies that may not be installed
       ];
 
       for (const [lang, fixture, filePath] of langFixtures) {

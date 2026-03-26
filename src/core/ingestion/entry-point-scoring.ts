@@ -212,6 +212,20 @@ export const ENTRY_POINT_PATTERNS = {
     /^perform$/,              // Background jobs (Sidekiq, ActiveJob)
     /^execute$/,              // Command pattern
   ],
+
+  // Dart / Flutter
+  [SupportedLanguages.Dart]: [
+    /^main$/,             // App entry
+    /^build$/,            // Widget.build — fundamental Flutter render entry point
+    /^createState$/,      // StatefulWidget.createState
+    /^initState$/,        // State lifecycle initialization
+    /^dispose$/,          // State lifecycle teardown
+    /^didChangeDependencies$/,  // State lifecycle — InheritedWidget changes
+    /^didUpdateWidget$/,  // State lifecycle — widget rebuild with new config
+    /^runApp$/,           // App entry point
+    /^onEvent$/,          // BLoC event handler
+    /^mapEventToState$/,  // Legacy BLoC pattern
+  ],
 } satisfies Record<SupportedLanguages, RegExp[]>;
 
 /** Pre-computed merged patterns (universal + language-specific) to avoid per-call array allocation. */
