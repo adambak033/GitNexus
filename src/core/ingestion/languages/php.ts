@@ -15,6 +15,8 @@ import { extractPhpNamedBindings } from '../named-bindings/php.js';
 import { PHP_QUERIES } from '../tree-sitter-queries.js';
 import { findDescendant, extractStringContent } from '../utils/ast-helpers.js';
 import type { NodeLabel } from '../../graph/types.js';
+import { createFieldExtractor } from '../field-extractors/generic.js';
+import { phpConfig as phpFieldConfig } from '../field-extractors/configs/php.js';
 
 const BUILT_INS: ReadonlySet<string> = new Set([
   'echo', 'isset', 'empty', 'unset', 'list', 'array', 'compact', 'extract',
@@ -147,6 +149,7 @@ export const phpProvider = defineLanguage({
   exportChecker: phpExportChecker,
   importResolver: resolvePhpImport,
   namedBindingExtractor: extractPhpNamedBindings,
+  fieldExtractor: createFieldExtractor(phpFieldConfig),
   descriptionExtractor: phpDescriptionExtractor,
   isRouteFile: isPhpRouteFile,
   builtInNames: BUILT_INS,

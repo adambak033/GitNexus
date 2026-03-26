@@ -19,6 +19,8 @@ import { typeConfig as dartConfig } from '../type-extractors/dart.js';
 import { dartExportChecker } from '../export-detection.js';
 import { resolveDartImport } from '../import-resolvers/dart.js';
 import { DART_QUERIES } from '../tree-sitter-queries.js';
+import { createFieldExtractor } from '../field-extractors/generic.js';
+import { dartConfig as dartFieldConfig } from '../field-extractors/configs/dart.js';
 
 /**
  * Resolve the enclosing function from a `function_body` node by looking at its
@@ -54,6 +56,7 @@ export const dartProvider = defineLanguage({
   exportChecker: dartExportChecker,
   importResolver: resolveDartImport,
   importSemantics: 'wildcard',
+  fieldExtractor: createFieldExtractor(dartFieldConfig),
   enclosingFunctionFinder: dartEnclosingFunctionFinder,
   builtInNames: BUILT_INS,
 });

@@ -16,6 +16,8 @@ import { extractKotlinNamedBindings } from '../named-bindings/kotlin.js';
 import { appendKotlinWildcard } from '../import-resolvers/jvm.js';
 import { KOTLIN_QUERIES } from '../tree-sitter-queries.js';
 import { isKotlinClassMethod } from '../utils/ast-helpers.js';
+import { createFieldExtractor } from '../field-extractors/generic.js';
+import { kotlinConfig } from '../field-extractors/configs/jvm.js';
 
 const BUILT_INS: ReadonlySet<string> = new Set([
   'println', 'print', 'readLine', 'require', 'requireNotNull', 'check', 'assert', 'lazy', 'error',
@@ -42,6 +44,7 @@ export const kotlinProvider = defineLanguage({
   namedBindingExtractor: extractKotlinNamedBindings,
   importPathPreprocessor: appendKotlinWildcard,
   mroStrategy: 'implements-split',
+  fieldExtractor: createFieldExtractor(kotlinConfig),
   builtInNames: BUILT_INS,
   labelOverride: (functionNode, defaultLabel) => {
     if (defaultLabel !== 'Function') return defaultLabel;

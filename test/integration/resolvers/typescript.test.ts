@@ -1763,6 +1763,33 @@ describe('Field type resolution (TypeScript)', () => {
       expect(edge.rel.reason).toBe('read');
     }
   });
+
+  it('populates field metadata (visibility, isStatic, isReadonly, declaredType) on Property nodes', () => {
+    const properties = getNodesByLabelFull(result, 'Property');
+
+    const city = properties.find(p => p.name === 'city');
+    expect(city).toBeDefined();
+    expect(city!.properties.visibility).toBe('public');
+    expect(city!.properties.isStatic).toBe(false);
+    expect(city!.properties.isReadonly).toBe(false);
+    expect(city!.properties.declaredType).toBe('string');
+
+    const addr = properties.find(p => p.name === 'address');
+    expect(addr).toBeDefined();
+    expect(addr!.properties.visibility).toBe('public');
+    expect(addr!.properties.isStatic).toBe(false);
+    expect(addr!.properties.isReadonly).toBe(false);
+    expect(addr!.properties.declaredType).toBe('Address');
+  });
+
+  it('marks Config.DEFAULT as static', () => {
+    const properties = getNodesByLabelFull(result, 'Property');
+    const def = properties.find(p => p.name === 'DEFAULT');
+    expect(def).toBeDefined();
+    expect(def!.properties.isStatic).toBe(true);
+    expect(def!.properties.declaredType).toBe('Config');
+    expect(def!.properties.visibility).toBe('public');
+  });
 });
 
 // ---------------------------------------------------------------------------

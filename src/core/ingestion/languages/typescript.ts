@@ -14,6 +14,9 @@ import { tsExportChecker } from '../export-detection.js';
 import { resolveTypescriptImport, resolveJavascriptImport } from '../import-resolvers/standard.js';
 import { extractTsNamedBindings } from '../named-bindings/typescript.js';
 import { TYPESCRIPT_QUERIES, JAVASCRIPT_QUERIES } from '../tree-sitter-queries.js';
+import { typescriptFieldExtractor } from '../field-extractors/typescript.js';
+import { createFieldExtractor } from '../field-extractors/generic.js';
+import { javascriptConfig } from '../field-extractors/configs/typescript-javascript.js';
 
 const BUILT_INS: ReadonlySet<string> = new Set([
   'console', 'log', 'warn', 'error', 'info', 'debug',
@@ -44,6 +47,7 @@ export const typescriptProvider = defineLanguage({
   exportChecker: tsExportChecker,
   importResolver: resolveTypescriptImport,
   namedBindingExtractor: extractTsNamedBindings,
+  fieldExtractor: typescriptFieldExtractor,
   builtInNames: BUILT_INS,
 });
 
@@ -55,5 +59,6 @@ export const javascriptProvider = defineLanguage({
   exportChecker: tsExportChecker,
   importResolver: resolveJavascriptImport,
   namedBindingExtractor: extractTsNamedBindings,
+  fieldExtractor: createFieldExtractor(javascriptConfig),
   builtInNames: BUILT_INS,
 });

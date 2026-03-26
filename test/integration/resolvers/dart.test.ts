@@ -3,8 +3,8 @@
  * Verifies that class fields are captured as Property nodes with HAS_PROPERTY
  * edges, and that calls (including chained and call-result-bound) are resolved.
  *
- * Remaining known Dart gaps (field-chain ACCESSES) are documented as
- * it.todo() tests to be filled when the pipeline is extended.
+ * All Dart pipeline features are covered: Property nodes, HAS_PROPERTY edges,
+ * CALLS chain resolution, IMPORTS, call attribution, and ACCESSES field reads.
  */
 import { describe, it, expect, beforeAll } from 'vitest';
 import path from 'path';
@@ -78,15 +78,7 @@ describe.skipIf(!dartAvailable)('Dart field-type resolution', () => {
     expect(appImports.length).toBe(1);
   });
 
-  // Dart field-chain ACCESSES edges require the call-processor's chain-resolution
-  // tier (Step 1c) to fire. This needs the type-env's scoped parameter binding
-  // (processUser's `user: User`) to propagate to processCallsFromExtracted so
-  // walkMixedChain can resolve User → address → Address and emit ACCESSES.
-  // The chain extraction (extractMixedChain) and member detection
-  // (MEMBER_ACCESS_NODE_TYPES) are wired, but the base receiver type lookup
-  // from the type-env currently returns undefined for Dart function parameters
-  // in the call-processor context. Tracked for follow-up.
-  it.skip('emits ACCESSES edges for field reads in chains', () => {
+  it('emits ACCESSES edges for field reads in chains', () => {
     const accesses = getRelationships(result, 'ACCESSES');
     const addressReads = accesses.filter(
       (e) => e.target === 'address' && e.rel.reason === 'read',

@@ -13,6 +13,7 @@ import type { SupportedLanguages } from '../../config/supported-languages.js';
 import type { LanguageTypeConfig } from './type-extractors/types.js';
 import type { CallRouter } from './call-routing.js';
 import type { ExportChecker } from './export-detection.js';
+import type { FieldExtractor } from './field-extractor.js';
 import type { ImportResolverFn } from './import-resolvers/types.js';
 import type { NamedBindingExtractorFn } from './named-bindings/types.js';
 import type { SyntaxNode } from './utils/ast-helpers.js';
@@ -114,6 +115,10 @@ interface LanguageProviderConfig {
   readonly mroStrategy?: MroStrategy;
 
   // ── Language-specific extraction hooks ────────────────────────────
+  /** Field extractor for extracting field/property definitions from class/struct
+   *  declarations. Produces FieldInfo[] with name, type, visibility, static,
+   *  readonly metadata. Default: undefined (no field extraction). */
+  readonly fieldExtractor?: FieldExtractor;
   /** Extract a semantic description for a definition node (e.g., PHP Eloquent
    *  property arrays, relation method descriptions).
    *  Default: undefined (no description extraction). */

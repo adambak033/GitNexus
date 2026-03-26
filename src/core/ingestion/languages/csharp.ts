@@ -13,6 +13,8 @@ import { csharpExportChecker } from '../export-detection.js';
 import { resolveCSharpImport } from '../import-resolvers/csharp.js';
 import { extractCSharpNamedBindings } from '../named-bindings/csharp.js';
 import { CSHARP_QUERIES } from '../tree-sitter-queries.js';
+import { createFieldExtractor } from '../field-extractors/generic.js';
+import { csharpConfig as csharpFieldConfig } from '../field-extractors/configs/csharp.js';
 
 const BUILT_INS: ReadonlySet<string> = new Set([
   'Console', 'WriteLine', 'ReadLine', 'Write',
@@ -45,5 +47,6 @@ export const csharpProvider = defineLanguage({
   namedBindingExtractor: extractCSharpNamedBindings,
   interfaceNamePattern: /^I[A-Z]/,
   mroStrategy: 'implements-split',
+  fieldExtractor: createFieldExtractor(csharpFieldConfig),
   builtInNames: BUILT_INS,
 });

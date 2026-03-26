@@ -103,6 +103,8 @@ GitNexus builds a complete knowledge graph of your codebase through a multi-phas
 1. **Structure** — Walks the file tree and maps folder/file relationships
 2. **Parsing** — Extracts functions, classes, methods, and interfaces using Tree-sitter ASTs
 3. **Resolution** — Resolves imports and function calls across files with language-aware logic
+   - **Field & Property Type Resolution** — Tracks field types across classes and interfaces for deep chain resolution (e.g., `user.address.city.getName()`)
+   - **Return-Type-Aware Variable Binding** — Infers variable types from function return types, enabling accurate call-result binding
 4. **Clustering** — Groups related symbols into functional communities
 5. **Processes** — Traces execution flows from entry points through call chains
 6. **Search** — Builds hybrid search indexes for fast retrieval

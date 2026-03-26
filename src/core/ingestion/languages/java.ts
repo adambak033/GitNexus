@@ -14,6 +14,8 @@ import { javaExportChecker } from '../export-detection.js';
 import { resolveJavaImport } from '../import-resolvers/jvm.js';
 import { extractJavaNamedBindings } from '../named-bindings/java.js';
 import { JAVA_QUERIES } from '../tree-sitter-queries.js';
+import { createFieldExtractor } from '../field-extractors/generic.js';
+import { javaConfig } from '../field-extractors/configs/jvm.js';
 
 export const javaProvider = defineLanguage({
   id: SupportedLanguages.Java,
@@ -25,4 +27,5 @@ export const javaProvider = defineLanguage({
   namedBindingExtractor: extractJavaNamedBindings,
   interfaceNamePattern: /^I[A-Z]/,
   mroStrategy: 'implements-split',
+  fieldExtractor: createFieldExtractor(javaConfig),
 });

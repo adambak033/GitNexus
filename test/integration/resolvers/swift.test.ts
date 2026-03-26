@@ -9,7 +9,7 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import path from 'path';
 import {
-  FIXTURES, getRelationships, getNodesByLabel,
+  FIXTURES, getRelationships, getNodesByLabel, getNodesByLabelFull, edgeSet,
   runPipelineFromRepo, type PipelineResult,
 } from './helpers.js';
 import { isLanguageAvailable } from '../../../src/core/tree-sitter/parser-loader.js';
@@ -498,5 +498,108 @@ describe.skipIf(!swiftAvailable)('Swift for-in loop element type inference', () 
   it('creates implicit import edges between files', () => {
     const imports = getRelationships(result, 'IMPORTS');
     expect(imports.length).toBeGreaterThan(0);
+  });
+});
+
+// ── Phase 8: Field-type resolution ──────────────────────────────────────
+
+describe.skipIf(!swiftAvailable)('Swift field-type resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'swift-field-types'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects classes and their properties', () => {
+    expect(getNodesByLabel(result, 'Class')).toEqual(
+      expect.arrayContaining(['Address', 'User']),
+    );
+    const properties = getNodesByLabel(result, 'Property');
+    expect(properties).toContain('address');
+    expect(properties).toContain('city');
+    expect(properties).toContain('name');
+  });
+
+  it('emits HAS_PROPERTY edges from class to field', () => {
+    const propEdges = getRelationships(result, 'HAS_PROPERTY');
+    expect(edgeSet(propEdges)).toEqual(
+      expect.arrayContaining([
+        'User → address',
+        'Address → city',
+      ]),
+    );
+  });
+
+  it('resolves field-chain call user.address.save() → Address#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCalls = calls.filter(
+      (c) => c.target === 'save' && c.source === 'processUser',
+    );
+    expect(saveCalls.length).toBe(1);
+    expect(saveCalls[0]!.targetFilePath).toContain('Models.swift');
+  });
+
+  it('emits ACCESSES edges for field reads in chains', () => {
+    const accesses = getRelationships(result, 'ACCESSES');
+    const addressReads = accesses.filter(
+      (e) => e.target === 'address' && e.rel.reason === 'read',
+    );
+    expect(addressReads.length).toBeGreaterThanOrEqual(1);
+    expect(addressReads[0]!.source).toBe('processUser');
+    expect(addressReads[0]!.targetLabel).toBe('Property');
+  });
+
+  it('populates field metadata (visibility, declaredType) on Property nodes', () => {
+    const properties = getNodesByLabelFull(result, 'Property');
+
+    const city = properties.find(p => p.name === 'city');
+    expect(city).toBeDefined();
+    // Swift default visibility is 'internal', not 'public'
+    expect(city!.properties.visibility).toBe('internal');
+    expect(city!.properties.isStatic).toBe(false);
+    expect(city!.properties.declaredType).toBe('String');
+
+    const addr = properties.find(p => p.name === 'address');
+    expect(addr).toBeDefined();
+    expect(addr!.properties.visibility).toBe('internal');
+    expect(addr!.properties.declaredType).toBe('Address');
+  });
+});
+
+// ── Phase 9: Call-result binding ────────────────────────────────────────
+
+describe.skipIf(!swiftAvailable)('Swift call-result binding', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'swift-call-result-binding'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves call-result-bound method call user.save() → User#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCalls = calls.filter(
+      (c) => c.target === 'save' && c.source === 'processUser',
+    );
+    expect(saveCalls.length).toBe(1);
+    expect(saveCalls[0]!.targetFilePath).toContain('Models.swift');
+  });
+
+  it('getUser() is present as a defined function', () => {
+    expect(getNodesByLabel(result, 'Function')).toContain('getUser');
+  });
+
+  it('emits processUser -> getUser CALLS edge for let-assigned free function call', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const getUserCall = calls.find(c =>
+      c.target === 'getUser' && c.source === 'processUser',
+    );
+    expect(getUserCall).toBeDefined();
+    expect(getUserCall!.targetFilePath).toContain('Models.swift');
   });
 });

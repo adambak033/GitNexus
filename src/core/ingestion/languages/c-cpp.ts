@@ -17,6 +17,8 @@ import { C_QUERIES, CPP_QUERIES } from '../tree-sitter-queries.js';
 
 import { isCppInsideClassOrStruct } from '../utils/ast-helpers.js';
 import type { LanguageProvider } from '../language-provider.js';
+import { createFieldExtractor } from '../field-extractors/generic.js';
+import { cConfig as cFieldConfig, cppConfig as cppFieldConfig } from '../field-extractors/configs/c-cpp.js';
 
 const C_BUILT_INS: ReadonlySet<string> = new Set([
   'printf', 'fprintf', 'sprintf', 'snprintf', 'vprintf', 'vfprintf', 'vsprintf', 'vsnprintf',
@@ -55,6 +57,7 @@ export const cProvider = defineLanguage({
   exportChecker: cCppExportChecker,
   importResolver: resolveCImport,
   importSemantics: 'wildcard',
+  fieldExtractor: createFieldExtractor(cFieldConfig),
   labelOverride: cppLabelOverride,
   builtInNames: C_BUILT_INS,
 });
@@ -68,6 +71,7 @@ export const cppProvider = defineLanguage({
   importResolver: resolveCppImport,
   importSemantics: 'wildcard',
   mroStrategy: 'leftmost-base',
+  fieldExtractor: createFieldExtractor(cppFieldConfig),
   labelOverride: cppLabelOverride,
   builtInNames: C_BUILT_INS,
 });

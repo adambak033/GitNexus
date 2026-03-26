@@ -38,6 +38,7 @@ import {
   extractMethodSignature,
   findDescendant,
   extractStringContent,
+  type SyntaxNode,
 } from '../utils/ast-helpers.js';
 import {
   countCallArguments,
@@ -53,8 +54,9 @@ import { detectFrameworkFromAST } from '../framework-detection.js';
 import { generateId } from '../../../lib/utils.js';
 import { preprocessImportPath } from '../import-processor.js';
 import type { NamedBinding } from '../named-bindings/types.js';
-import { extractPropertyDeclaredType } from '../type-extractors/shared.js';
 import type { NodeLabel } from '../../graph/types.js';
+import type { FieldInfo, FieldExtractorContext } from '../field-types.js';
+import { CLASS_CONTAINER_TYPES } from '../utils/ast-helpers.js';
 
 // ============================================================================
 // Types for serializable results
@@ -76,6 +78,11 @@ interface ParsedNode {
     parameterCount?: number;
     requiredParameterCount?: number;
     returnType?: string;
+    // Field/property metadata (populated by FieldExtractor)
+    declaredType?: string;
+    visibility?: string;
+    isStatic?: boolean;
+    isReadonly?: boolean;
   };
 }
 
@@ -99,6 +106,9 @@ interface ParsedSymbol {
   returnType?: string;
   declaredType?: string;
   ownerId?: string;
+  visibility?: string;
+  isStatic?: boolean;
+  isReadonly?: boolean;
 }
 
 export interface ExtractedImport {
@@ -287,7 +297,67 @@ const classIdCache = new Map<any, string | null>();
 const functionIdCache = new Map<any, string | null>();
 const exportCache = new Map<any, boolean>();
 
-const clearCaches = (): void => { classIdCache.clear(); functionIdCache.clear(); exportCache.clear(); };
+const clearCaches = (): void => { classIdCache.clear(); functionIdCache.clear(); exportCache.clear(); fieldInfoCache.clear(); };
+
+// ============================================================================
+// FieldExtractor cache — extract field metadata once per class, reuse for each property.
+// Keyed by class node startIndex (unique per AST node within a file).
+// ============================================================================
+
+const fieldInfoCache = new Map<number, Map<string, FieldInfo>>();
+
+/**
+ * Walk up from a definition node to find the nearest enclosing class/struct/interface
+ * AST node. Returns the SyntaxNode itself (not an ID) for passing to FieldExtractor.
+ */
+function findEnclosingClassNode(node: SyntaxNode): SyntaxNode | null {
+  let current = node.parent;
+  while (current) {
+    if (CLASS_CONTAINER_TYPES.has(current.type)) {
+      return current;
+    }
+    current = current.parent;
+  }
+  return null;
+}
+
+/**
+ * Minimal no-op SymbolTable stub for FieldExtractorContext in the worker.
+ * Field extraction only uses symbolTable.lookupExactAll for optional type resolution —
+ * returning [] causes the extractor to use the raw type string, which is fine for us.
+ */
+const NOOP_SYMBOL_TABLE: any = {
+  lookupExactAll: () => [],
+  lookupExact: () => undefined,
+  lookupExactFull: () => undefined,
+};
+
+/**
+ * Get (or extract and cache) field info for a class node.
+ * Returns a name→FieldInfo map, or undefined if the provider has no field extractor
+ * or the class yielded no fields.
+ */
+function getFieldInfo(
+  classNode: SyntaxNode,
+  provider: LanguageProvider,
+  context: FieldExtractorContext,
+): Map<string, FieldInfo> | undefined {
+  if (!provider.fieldExtractor) return undefined;
+
+  const cacheKey = classNode.startIndex;
+  let cached = fieldInfoCache.get(cacheKey);
+  if (cached) return cached;
+
+  const result = provider.fieldExtractor.extract(classNode, context);
+  if (!result?.fields?.length) return undefined;
+
+  cached = new Map<string, FieldInfo>();
+  for (const field of result.fields) {
+    cached.set(field.name, field);
+  }
+  fieldInfoCache.set(cacheKey, cached);
+  return cached;
+}
 
 // ============================================================================
 // Enclosing function detection (for call extraction) — cached
@@ -975,8 +1045,8 @@ const processFileGroup = (
     // Build per-file type environment + constructor bindings in a single AST walk.
     // Constructor bindings are verified against the SymbolTable in processCallsFromExtracted.
     const parentMap: ReadonlyMap<string, readonly string[]> = fileParentMap;
-    const typeEnv = buildTypeEnv(tree, language, { parentMap });
     const provider = getProvider(language);
+    const typeEnv = buildTypeEnv(tree, language, { parentMap, enclosingFunctionFinder: provider?.enclosingFunctionFinder });
     const callRouter = provider.callRouter;
 
     if (typeEnv.constructorBindings.length > 0) {
@@ -1147,7 +1217,18 @@ const processFileGroup = (
 
             if (routed.kind === 'properties') {
               const propEnclosingClassId = cachedFindEnclosingClassId(captureMap['call'], file.path);
+              // Enrich routed properties with FieldExtractor metadata
+              let routedFieldMap: Map<string, FieldInfo> | undefined;
+              if (provider.fieldExtractor && typeEnv) {
+                const classNode = findEnclosingClassNode(captureMap['call']);
+                if (classNode) {
+                  routedFieldMap = getFieldInfo(classNode, provider, {
+                    typeEnv, symbolTable: NOOP_SYMBOL_TABLE, filePath: file.path, language,
+                  });
+                }
+              }
               for (const item of routed.items) {
+                const routedFieldInfo = routedFieldMap?.get(item.propName);
                 const nodeId = generateId('Property', `${file.path}:${item.propName}`);
                 result.nodes.push({
                   id: nodeId,
@@ -1160,6 +1241,10 @@ const processFileGroup = (
                     language,
                     isExported: true,
                     description: item.accessorType,
+                    ...(item.declaredType ? { declaredType: item.declaredType } : routedFieldInfo?.type ? { declaredType: routedFieldInfo.type } : {}),
+                    ...(routedFieldInfo?.visibility !== undefined ? { visibility: routedFieldInfo.visibility } : {}),
+                    ...(routedFieldInfo?.isStatic !== undefined ? { isStatic: routedFieldInfo.isStatic } : {}),
+                    ...(routedFieldInfo?.isReadonly !== undefined ? { isReadonly: routedFieldInfo.isReadonly } : {}),
                   },
                 });
                 result.symbols.push({
@@ -1168,7 +1253,10 @@ const processFileGroup = (
                   nodeId,
                   type: 'Property',
                   ...(propEnclosingClassId ? { ownerId: propEnclosingClassId } : {}),
-                  ...(item.declaredType ? { declaredType: item.declaredType } : {}),
+                  ...(item.declaredType ? { declaredType: item.declaredType } : routedFieldInfo?.type ? { declaredType: routedFieldInfo.type } : {}),
+                  ...(routedFieldInfo?.visibility !== undefined ? { visibility: routedFieldInfo.visibility } : {}),
+                  ...(routedFieldInfo?.isStatic !== undefined ? { isStatic: routedFieldInfo.isStatic } : {}),
+                  ...(routedFieldInfo?.isReadonly !== undefined ? { isReadonly: routedFieldInfo.isReadonly } : {}),
                 });
                 const fileId = generateId('File', file.path);
                 const relId = generateId('DEFINES', `${fileId}->${nodeId}`);
@@ -1332,6 +1420,9 @@ const processFileGroup = (
       let parameterTypes: string[] | undefined;
       let returnType: string | undefined;
       let declaredType: string | undefined;
+      let visibility: string | undefined;
+      let isStatic: boolean | undefined;
+      let isReadonly: boolean | undefined;
       if (nodeLabel === 'Function' || nodeLabel === 'Method' || nodeLabel === 'Constructor') {
         const sig = extractMethodSignature(definitionNode);
         parameterCount = sig.parameterCount;
@@ -1349,9 +1440,22 @@ const processFileGroup = (
           }
         }
       } else if (nodeLabel === 'Property' && definitionNode) {
-        // Extract the declared type for property/field nodes.
-        // Walk the definition node for type annotation children.
-        declaredType = extractPropertyDeclaredType(definitionNode);
+        // FieldExtractor is the single source of truth when available
+        if (provider.fieldExtractor && typeEnv) {
+          const classNode = findEnclosingClassNode(definitionNode);
+          if (classNode) {
+            const fieldMap = getFieldInfo(classNode, provider, {
+              typeEnv, symbolTable: NOOP_SYMBOL_TABLE, filePath: file.path, language,
+            });
+            const info = fieldMap?.get(nodeName);
+            if (info) {
+              declaredType = info.type ?? undefined;
+              visibility = info.visibility;
+              isStatic = info.isStatic;
+              isReadonly = info.isReadonly;
+            }
+          }
+        }
       }
 
       result.nodes.push({
@@ -1373,6 +1477,10 @@ const processFileGroup = (
           ...(requiredParameterCount !== undefined ? { requiredParameterCount } : {}),
           ...(parameterTypes !== undefined ? { parameterTypes } : {}),
           ...(returnType !== undefined ? { returnType } : {}),
+          ...(declaredType !== undefined ? { declaredType } : {}),
+          ...(visibility !== undefined ? { visibility } : {}),
+          ...(isStatic !== undefined ? { isStatic } : {}),
+          ...(isReadonly !== undefined ? { isReadonly } : {}),
         },
       });
 
@@ -1392,6 +1500,9 @@ const processFileGroup = (
         ...(returnType !== undefined ? { returnType } : {}),
         ...(declaredType !== undefined ? { declaredType } : {}),
         ...(enclosingClassId ? { ownerId: enclosingClassId } : {}),
+        ...(visibility !== undefined ? { visibility } : {}),
+        ...(isStatic !== undefined ? { isStatic } : {}),
+        ...(isReadonly !== undefined ? { isReadonly } : {}),
       });
 
       const fileId = generateId('File', file.path);

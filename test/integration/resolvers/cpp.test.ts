@@ -857,6 +857,20 @@ describe('Field type resolution (C++)', () => {
     );
     expect(addressSave).toBeDefined();
   });
+
+  it('populates field metadata (visibility, declaredType) on Property nodes', () => {
+    const properties = getNodesByLabelFull(result, 'Property');
+
+    const city = properties.find(p => p.name === 'city');
+    expect(city).toBeDefined();
+    expect(city!.properties.visibility).toBe('public');
+    expect(city!.properties.isStatic).toBe(false);
+    expect(city!.properties.isReadonly).toBe(false);
+
+    const addr = properties.find(p => p.name === 'address');
+    expect(addr).toBeDefined();
+    expect(addr!.properties.visibility).toBe('public');
+  });
 });
 
 // ---------------------------------------------------------------------------

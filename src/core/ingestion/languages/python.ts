@@ -17,6 +17,8 @@ import { pythonExportChecker } from '../export-detection.js';
 import { resolvePythonImport } from '../import-resolvers/python.js';
 import { extractPythonNamedBindings } from '../named-bindings/python.js';
 import { PYTHON_QUERIES } from '../tree-sitter-queries.js';
+import { createFieldExtractor } from '../field-extractors/generic.js';
+import { pythonConfig as pythonFieldConfig } from '../field-extractors/configs/python.js';
 
 const BUILT_INS: ReadonlySet<string> = new Set([
   'print', 'len', 'range', 'str', 'int', 'float', 'list', 'dict', 'set', 'tuple',
@@ -35,5 +37,6 @@ export const pythonProvider = defineLanguage({
   namedBindingExtractor: extractPythonNamedBindings,
   importSemantics: 'namespace',
   mroStrategy: 'c3',
+  fieldExtractor: createFieldExtractor(pythonFieldConfig),
   builtInNames: BUILT_INS,
 });

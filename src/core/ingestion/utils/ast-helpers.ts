@@ -633,6 +633,18 @@ export const extractMethodSignature = (node: SyntaxNode | null | undefined): Met
     }
   }
 
+  // Swift fallback: tree-sitter-swift places `parameter` nodes as direct children of
+  // function_declaration without a wrapping parameters/function_parameters list node.
+  // When no parameter list was found, count direct `parameter` children on the node.
+  if (!parameterList && parameterCount === 0) {
+    for (const child of node.namedChildren) {
+      if (child.type === 'parameter') {
+        if (!hasDefaultValue(child)) requiredCount++;
+        parameterCount++;
+      }
+    }
+  }
+
   // Return type extraction — language-specific field names
   // Go: 'result' field is either a type_identifier or parameter_list (multi-return)
   const goResult = node.childForFieldName?.('result');

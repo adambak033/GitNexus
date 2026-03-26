@@ -76,7 +76,7 @@ export type ForLoopExtractor = (node: SyntaxNode, ctx: ForLoopExtractorContext) 
  *  - `methodCallResult` — `const b = a.method()` (bind b to method's returnType on a's type) */
 export type PendingAssignment =
   | { kind: 'copy'; lhs: string; rhs: string }
-  | { kind: 'callResult'; lhs: string; callee: string }
+  | { kind: 'callResult'; lhs: string; callee: string; calleeFqn?: string; line?: number }
   | { kind: 'fieldAccess'; lhs: string; receiver: string; field: string }
   | { kind: 'methodCallResult'; lhs: string; receiver: string; method: string };
 

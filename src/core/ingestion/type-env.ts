@@ -6,6 +6,7 @@ import { getProvider } from './languages/index.js';
 import type { ClassNameLookup, ReturnTypeLookup, ForLoopExtractorContext, PendingAssignment } from './type-extractors/types.js';
 import { extractSimpleTypeName, extractVarName, stripNullable, extractReturnTypeName } from './type-extractors/shared.js';
 import type { SymbolTable } from './symbol-table.js';
+import type { NodeLabel } from '../graph/types.js';
 
 /**
  * Per-file scoped type environment: maps (scope, variableName) → typeName.
@@ -115,6 +116,7 @@ const lookupInEnv = (
   varName: string,
   callNode: SyntaxNode,
   patternOverrides?: PatternOverrides,
+  enclosingFunctionFinder?: (n: SyntaxNode) => { funcName: string; label: NodeLabel } | null,
 ): string | undefined => {
   // Self/this receiver: resolve to enclosing class name via AST walk
   if (varName === 'self' || varName === 'this' || varName === '$this') {
@@ -128,7 +130,7 @@ const lookupInEnv = (
   }
 
   // Determine the enclosing function scope for the call
-  const scopeKey = findEnclosingScopeKey(callNode);
+  const scopeKey = findEnclosingScopeKey(callNode, enclosingFunctionFinder);
 
   // Check position-indexed pattern overrides first (e.g., Kotlin when/is smart casts).
   // These take priority over flat scopeEnv because they represent per-branch narrowing.
@@ -338,13 +340,29 @@ const extractParentClassFromNode = (classNode: SyntaxNode): string | undefined =
   return undefined;
 };
 
-/** Find the enclosing function name for scope lookup. */
-const findEnclosingScopeKey = (node: SyntaxNode): string | undefined => {
+/** Find the enclosing function name for scope lookup.
+ *  When an `enclosingFunctionFinder` hook is provided (from the language provider),
+ *  it is consulted for each ancestor before the default FUNCTION_NODE_TYPES check.
+ *  This handles languages like Dart where the function body is a sibling of the
+ *  signature instead of a child. */
+const findEnclosingScopeKey = (
+  node: SyntaxNode,
+  enclosingFunctionFinder?: (n: SyntaxNode) => { funcName: string; label: NodeLabel } | null,
+): string | undefined => {
   let current = node.parent;
   while (current) {
     if (FUNCTION_NODE_TYPES.has(current.type)) {
       const { funcName } = extractFunctionName(current);
       if (funcName) return `${funcName}@${current.startIndex}`;
+    }
+    // Language-specific hook (e.g., Dart function_body → sibling function_signature)
+    if (enclosingFunctionFinder) {
+      const result = enclosingFunctionFinder(current);
+      if (result) {
+        const sigNode = current.previousSibling;
+        const startIdx = sigNode?.startIndex ?? current.startIndex;
+        return `${result.funcName}@${startIdx}`;
+      }
     }
     current = current.parent;
   }
@@ -627,7 +645,10 @@ const resolveFixpointBindings = (
       let typeName: string | undefined;
       switch (item.kind) {
         case 'callResult':
-          typeName = returnTypeLookup.lookupReturnType(item.callee);
+          // Phase 9: Prefer FQN lookup when available for higher precision
+          typeName = item.calleeFqn
+            ? returnTypeLookup.lookupReturnType(item.calleeFqn)
+            : returnTypeLookup.lookupReturnType(item.callee);
           break;
         case 'copy':
           typeName = scopeEnv.get(item.rhs) ?? env.get(FILE_SCOPE)?.get(item.rhs);
@@ -680,6 +701,10 @@ export interface BuildTypeEnvOptions {
    *  Stores raw declared return type strings (e.g., 'User[]', 'List<User>').
    *  Used by lookupRawReturnType for for-loop element extraction. */
   importedRawReturnTypes?: ReadonlyMap<string, string>;
+  /** Language-specific enclosing function resolver for scope key lookup.
+   *  Same hook as LanguageProvider.enclosingFunctionFinder — handles languages
+   *  where function_body is a sibling of the signature (e.g., Dart). */
+  enclosingFunctionFinder?: (ancestorNode: SyntaxNode) => { funcName: string; label: NodeLabel } | null;
 }
 
 /** Seed cross-file type bindings into the file scope.
@@ -1107,7 +1132,7 @@ export const buildTypeEnv = (
   }
 
   return {
-    lookup: (varName, callNode) => lookupInEnv(env, varName, callNode, patternOverrides),
+    lookup: (varName, callNode) => lookupInEnv(env, varName, callNode, patternOverrides, options?.enclosingFunctionFinder),
     constructorBindings: bindings,
     fileScope: () => env.get(FILE_SCOPE) ?? EMPTY_FILE_SCOPE,
     allScopes: () => env as ReadonlyMap<string, ReadonlyMap<string, string>>,

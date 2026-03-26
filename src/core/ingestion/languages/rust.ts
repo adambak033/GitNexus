@@ -17,6 +17,8 @@ import { rustExportChecker } from '../export-detection.js';
 import { resolveRustImport } from '../import-resolvers/rust.js';
 import { extractRustNamedBindings } from '../named-bindings/rust.js';
 import { RUST_QUERIES } from '../tree-sitter-queries.js';
+import { createFieldExtractor } from '../field-extractors/generic.js';
+import { rustConfig as rustFieldConfig } from '../field-extractors/configs/rust.js';
 
 const BUILT_INS: ReadonlySet<string> = new Set([
   'unwrap', 'expect', 'unwrap_or', 'unwrap_or_else', 'unwrap_or_default',
@@ -40,5 +42,6 @@ export const rustProvider = defineLanguage({
   importResolver: resolveRustImport,
   namedBindingExtractor: extractRustNamedBindings,
   mroStrategy: 'qualified-syntax',
+  fieldExtractor: createFieldExtractor(rustFieldConfig),
   builtInNames: BUILT_INS,
 });

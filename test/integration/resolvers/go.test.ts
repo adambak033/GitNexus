@@ -4,7 +4,7 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import path from 'path';
 import {
-  FIXTURES, CROSS_FILE_FIXTURES, getRelationships, getNodesByLabel, edgeSet,
+  FIXTURES, CROSS_FILE_FIXTURES, getRelationships, getNodesByLabel, getNodesByLabelFull, edgeSet,
   runPipelineFromRepo, type PipelineResult,
 } from './helpers.js';
 
@@ -981,6 +981,19 @@ describe('Field type resolution (Go)', () => {
       e => e.source === 'processUser' && e.targetFilePath.includes('models'),
     );
     expect(addressSave).toBeDefined();
+  });
+
+  it('Property nodes contain expected field names', () => {
+    const properties = getNodesByLabelFull(result, 'Property');
+
+    const city = properties.find(p => p.name === 'City');
+    expect(city).toBeDefined();
+
+    const name = properties.find(p => p.name === 'Name');
+    expect(name).toBeDefined();
+
+    const addr = properties.find(p => p.name === 'Address');
+    expect(addr).toBeDefined();
   });
 });
 

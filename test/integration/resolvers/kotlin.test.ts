@@ -1258,6 +1258,19 @@ describe('Field type resolution (Kotlin)', () => {
     );
     expect(addressSave).toBeDefined();
   });
+
+  it('Property nodes contain expected field names', () => {
+    const properties = getNodesByLabelFull(result, 'Property');
+
+    const city = properties.find(p => p.name === 'city');
+    expect(city).toBeDefined();
+
+    const name = properties.find(p => p.name === 'name');
+    expect(name).toBeDefined();
+
+    const addr = properties.find(p => p.name === 'address');
+    expect(addr).toBeDefined();
+  });
 });
 
 // ---------------------------------------------------------------------------

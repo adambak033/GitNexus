@@ -7,9 +7,11 @@ import { SymbolTable } from './symbol-table.js';
 import { ASTCache } from './ast-cache.js';
 import { getLanguageFromFilename } from './utils/language-detection.js';
 import { yieldToEventLoop } from './utils/event-loop.js';
-import { getDefinitionNodeFromCaptures, findEnclosingClassId, extractMethodSignature, getLabelFromCaptures } from './utils/ast-helpers.js';
-import { extractPropertyDeclaredType } from './type-extractors/shared.js';
+import { getDefinitionNodeFromCaptures, findEnclosingClassId, extractMethodSignature, getLabelFromCaptures, CLASS_CONTAINER_TYPES, type SyntaxNode } from './utils/ast-helpers.js';
 import { detectFrameworkFromAST } from './framework-detection.js';
+import { buildTypeEnv } from './type-env.js';
+import type { FieldInfo, FieldExtractorContext } from './field-types.js';
+import type { LanguageProvider } from './language-provider.js';
 import { WorkerPool } from './workers/worker-pool.js';
 import type { ParseWorkerResult, ParseWorkerInput, ExtractedImport, ExtractedCall, ExtractedAssignment, ExtractedHeritage, ExtractedRoute, ExtractedFetchCall, ExtractedDecoratorRoute, ExtractedToolDef, FileConstructorBindings, FileTypeEnvBindings, ExtractedORMQuery } from './workers/parse-worker.js';
 import { getTreeSitterBufferSize, TREE_SITTER_MAX_BUFFER } from './constants.js';
@@ -154,6 +156,43 @@ const cachedExportCheck = (checker: (node: any, name: string) => boolean, node: 
   return result;
 };
 
+// FieldExtractor cache for sequential path — same pattern as parse-worker.ts
+const seqFieldInfoCache = new Map<number, Map<string, FieldInfo>>();
+
+function seqFindEnclosingClassNode(node: any): any | null {
+  let current = node.parent;
+  while (current) {
+    if (CLASS_CONTAINER_TYPES.has(current.type)) return current;
+    current = current.parent;
+  }
+  return null;
+}
+
+/** Minimal no-op SymbolTable stub for FieldExtractorContext (sequential path has a real
+ *  SymbolTable, but it's incomplete at this stage — use the stub for safety). */
+const NOOP_SYMBOL_TABLE_SEQ: any = {
+  lookupExactAll: () => [],
+  lookupExact: () => undefined,
+  lookupExactFull: () => undefined,
+};
+
+function seqGetFieldInfo(
+  classNode: SyntaxNode,
+  provider: LanguageProvider,
+  context: FieldExtractorContext,
+): Map<string, FieldInfo> | undefined {
+  if (!provider.fieldExtractor) return undefined;
+  const cacheKey = classNode.startIndex;
+  let cached = seqFieldInfoCache.get(cacheKey);
+  if (cached) return cached;
+  const extracted = provider.fieldExtractor.extract(classNode, context);
+  if (!extracted?.fields?.length) return undefined;
+  cached = new Map<string, FieldInfo>();
+  for (const field of extracted.fields) cached.set(field.name, field);
+  seqFieldInfoCache.set(cacheKey, cached);
+  return cached;
+}
+
 const processParsingSequential = async (
   graph: KnowledgeGraph,
   files: { path: string; content: string }[],
@@ -171,6 +210,7 @@ const processParsingSequential = async (
     // Reset memoization before each new file (node refs are per-tree)
     classIdCache.clear();
     exportCache.clear();
+    seqFieldInfoCache.clear();
 
     onFileProgress?.(i + 1, total, file.path);
 
@@ -221,6 +261,9 @@ const processParsingSequential = async (
       console.warn(`Query error for ${file.path}:`, queryError);
       continue;
     }
+
+    // Build per-file type environment for FieldExtractor context (lightweight — skipped if no fieldExtractor)
+    const typeEnv = provider.fieldExtractor ? buildTypeEnv(tree, language, { enclosingFunctionFinder: provider.enclosingFunctionFinder }) : null;
 
     matches.forEach(match => {
       const captureMap: Record<string, any> = {};
@@ -291,10 +334,36 @@ const processParsingSequential = async (
       const needsOwner = nodeLabel === 'Method' || nodeLabel === 'Constructor' || nodeLabel === 'Property' || nodeLabel === 'Function';
       const enclosingClassId = needsOwner ? cachedFindEnclosingClassId(nameNode || definitionNodeForRange, file.path) : null;
 
-      // Extract declared type for Property nodes (field/property type annotations)
-      const declaredType = (nodeLabel === 'Property' && definitionNode)
-        ? extractPropertyDeclaredType(definitionNode)
-        : undefined;
+      // Extract declared type and field metadata for Property nodes
+      let declaredType: string | undefined;
+      let seqVisibility: string | undefined;
+      let seqIsStatic: boolean | undefined;
+      let seqIsReadonly: boolean | undefined;
+      if (nodeLabel === 'Property' && definitionNode) {
+        // FieldExtractor is the single source of truth when available
+        if (provider.fieldExtractor && typeEnv) {
+          const classNode = seqFindEnclosingClassNode(definitionNode);
+          if (classNode) {
+            const fieldMap = seqGetFieldInfo(classNode, provider, {
+              typeEnv, symbolTable: NOOP_SYMBOL_TABLE_SEQ, filePath: file.path, language,
+            });
+            const info = fieldMap?.get(nodeName);
+            if (info) {
+              declaredType = info.type ?? undefined;
+              seqVisibility = info.visibility;
+              seqIsStatic = info.isStatic;
+              seqIsReadonly = info.isReadonly;
+            }
+          }
+        }
+        // All 14 languages register a FieldExtractor — no fallback needed.
+      }
+
+      // Apply field metadata to the graph node retroactively
+      if (seqVisibility !== undefined) node.properties.visibility = seqVisibility;
+      if (seqIsStatic !== undefined) node.properties.isStatic = seqIsStatic;
+      if (seqIsReadonly !== undefined) node.properties.isReadonly = seqIsReadonly;
+      if (declaredType !== undefined) node.properties.declaredType = declaredType;
 
       symbolTable.add(file.path, nodeName, nodeId, nodeLabel, {
         parameterCount: methodSig?.parameterCount,

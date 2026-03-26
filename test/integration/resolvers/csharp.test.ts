@@ -1235,6 +1235,21 @@ describe('Field type resolution (C#)', () => {
     );
     expect(addressSave).toBeDefined();
   });
+
+  it('populates field metadata (visibility, declaredType) on Property nodes', () => {
+    const properties = getNodesByLabelFull(result, 'Property');
+
+    const city = properties.find(p => p.name === 'City');
+    expect(city).toBeDefined();
+    expect(city!.properties.visibility).toBe('public');
+    expect(city!.properties.isStatic).toBe(false);
+    expect(city!.properties.declaredType).toBe('string');
+
+    const addr = properties.find(p => p.name === 'Address');
+    expect(addr).toBeDefined();
+    expect(addr!.properties.visibility).toBe('public');
+    expect(addr!.properties.declaredType).toBe('Address');
+  });
 });
 
 // ---------------------------------------------------------------------------
