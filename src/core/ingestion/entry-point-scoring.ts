@@ -226,6 +226,7 @@ export const ENTRY_POINT_PATTERNS = {
     /^onEvent$/,          // BLoC event handler
     /^mapEventToState$/,  // Legacy BLoC pattern
   ],
+  [SupportedLanguages.Cobol]: [], // Standalone regex processor — no tree-sitter entry points
 } satisfies Record<SupportedLanguages, RegExp[]>;
 
 /** Pre-computed merged patterns (universal + language-specific) to avoid per-call array allocation. */
@@ -325,7 +326,7 @@ export function calculateEntryPointScore(
     // Check positive patterns
     const allPatterns = MERGED_ENTRY_POINT_PATTERNS[language];
     
-    if (allPatterns.some(p => p.test(name))) {
+    if (allPatterns?.some(p => p.test(name))) {
       nameMultiplier = 1.5;  // Bonus for matching entry point pattern
       reasons.push('entry-pattern');
     }

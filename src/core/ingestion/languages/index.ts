@@ -23,6 +23,7 @@ import { phpProvider } from './php.js';
 import { rubyProvider } from './ruby.js';
 import { swiftProvider } from './swift.js';
 import { dartProvider } from './dart.js';
+import { cobolProvider } from './cobol.js';
 
 export const providers = {
   [SupportedLanguages.JavaScript]: javascriptProvider,
@@ -39,6 +40,7 @@ export const providers = {
   [SupportedLanguages.Ruby]: rubyProvider,
   [SupportedLanguages.Swift]: swiftProvider,
   [SupportedLanguages.Dart]: dartProvider,
+  [SupportedLanguages.Cobol]: cobolProvider,
 } satisfies Record<SupportedLanguages, LanguageProvider>;
 
 /** Get provider by language enum (always succeeds for SupportedLanguages). */

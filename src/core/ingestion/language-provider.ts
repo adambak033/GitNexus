@@ -40,7 +40,12 @@ interface LanguageProviderConfig {
   readonly extensions: readonly string[];
 
   // ── Parser ────────────────────────────────────────────────────────
-  /** Tree-sitter query strings for definitions, imports, calls, heritage */
+  /** Parse strategy: 'tree-sitter' (default) uses AST parsing via tree-sitter.
+   *  'standalone' means the language has its own regex-based processor and
+   *  should be skipped by the tree-sitter pipeline (e.g., COBOL, Markdown). */
+  readonly parseStrategy?: 'tree-sitter' | 'standalone';
+  /** Tree-sitter query strings for definitions, imports, calls, heritage.
+   *  Required for tree-sitter languages; empty string for standalone processors. */
   readonly treeSitterQueries: string;
 
   // ── Core (required) ───────────────────────────────────────────────

@@ -34,7 +34,15 @@ export const createKnowledgeGraph = (): KnowledgeGraph => {
   };
 
   /**
-   * Remove all nodes (and their relationships) belonging to a file
+   * Remove a single relationship by id.
+   * Returns true if the relationship existed and was removed, false otherwise.
+   */
+  const removeRelationship = (relationshipId: string): boolean => {
+    return relationshipMap.delete(relationshipId);
+  };
+
+  /**
+   * Remove all nodes (and their relationships) belonging to a file.
    */
   const removeNodesByFile = (filePath: string): number => {
     let removed = 0;
@@ -75,6 +83,7 @@ export const createKnowledgeGraph = (): KnowledgeGraph => {
     addRelationship,
     removeNode,
     removeNodesByFile,
+    removeRelationship,
 
   };
 };

@@ -601,6 +601,7 @@ export const AST_FRAMEWORK_PATTERNS_BY_LANGUAGE = {
     { framework: 'flutter', entryPointMultiplier: 2.5, reason: 'flutter-widget', patterns: FRAMEWORK_AST_PATTERNS.flutter },
     { framework: 'riverpod', entryPointMultiplier: 2.8, reason: 'riverpod-pattern', patterns: FRAMEWORK_AST_PATTERNS.riverpod },
   ],
+  [SupportedLanguages.Cobol]: [], // Standalone regex processor — no AST framework patterns
 } satisfies Record<SupportedLanguages, AstFrameworkPatternConfig[]>;
 
 /** Pre-lowercased patterns for O(1) pattern matching at runtime */
