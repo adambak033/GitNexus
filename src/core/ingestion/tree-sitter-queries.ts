@@ -1054,6 +1054,20 @@ export const DART_QUERIES = `
   (factory_constructor_signature
     (identifier) @name . (formal_parameter_list))) @definition.constructor
 
+; ── Field declarations (String name = '', Address address = Address()) ──────
+(declaration
+  (type_identifier)
+  (initialized_identifier_list
+    (initialized_identifier
+      (identifier) @name))) @definition.property
+
+; ── Nullable field declarations (String? name) ──────────────────────────────
+(declaration
+  (nullable_type)
+  (initialized_identifier_list
+    (initialized_identifier
+      (identifier) @name))) @definition.property
+
 ; ── Getters ──────────────────────────────────────────────────────────────────
 (method_signature
   (getter_signature
@@ -1096,6 +1110,22 @@ export const DART_QUERIES = `
 (import_or_export
   (library_export
     (configurable_uri) @import.source)) @import
+
+; ── Write access: obj.field = value ──────────────────────────────────────────
+(assignment_expression
+  left: (assignable_expression
+    (identifier) @assignment.receiver
+    (unconditional_assignable_selector
+      (identifier) @assignment.property))
+  right: (_)) @assignment
+
+; ── Write access: this.field = value ─────────────────────────────────────────
+(assignment_expression
+  left: (assignable_expression
+    (this) @assignment.receiver
+    (unconditional_assignable_selector
+      (identifier) @assignment.property))
+  right: (_)) @assignment
 
 ; ── Heritage: extends ────────────────────────────────────────────────────────
 (class_definition
