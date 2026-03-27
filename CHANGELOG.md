@@ -2,6 +2,16 @@
 
 All notable changes to GitNexus will be documented in this file.
 
+## [1.4.10] - 2026-03-27
+
+### Fixed
+- **MCP server install via npx** — resolve tree-sitter peer dependency conflicts that broke `npx -y gitnexus@latest mcp` (#537, #538)
+  - Downgrade tree-sitter from ^0.25.0 to ^0.21.1 (only npm version where all 14 parsers agree)
+  - Align all parser versions to their highest ^0.21.x-compatible releases
+  - Remove tree-sitter override (only applies to root packages, ignored by npx)
+  - Pin tree-sitter-dart to correct ABI-14-compatible commit
+  - Exact pins for tree-sitter-c (0.23.2), tree-sitter-python (0.23.4), tree-sitter-rust (0.23.1) where next patch requires ^0.22.x
+
 ## [1.4.9] - 2026-03-26
 
 ### Added
