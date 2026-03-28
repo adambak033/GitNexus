@@ -24,6 +24,10 @@ interface RepoStats {
   processes?: number;
 }
 
+export interface AIContextOptions {
+  skipAgentsMd?: boolean;
+}
+
 const GITNEXUS_START_MARKER = '<!-- gitnexus:start -->';
 const GITNEXUS_END_MARKER = '<!-- gitnexus:end -->';
 
@@ -299,19 +303,25 @@ export async function generateAIContextFiles(
   projectName: string,
   stats: RepoStats,
   generatedSkills?: GeneratedSkillInfo[],
+  options?: AIContextOptions,
 ): Promise<{ files: string[] }> {
   const content = generateGitNexusContent(projectName, stats, generatedSkills);
   const createdFiles: string[] = [];
 
-  // Create AGENTS.md (standard for Cursor, Windsurf, OpenCode, Cline, etc.)
-  const agentsPath = path.join(repoPath, 'AGENTS.md');
-  const agentsResult = await upsertGitNexusSection(agentsPath, content);
-  createdFiles.push(`AGENTS.md (${agentsResult})`);
+  if (!options?.skipAgentsMd) {
+    // Create AGENTS.md (standard for Cursor, Windsurf, OpenCode, Cline, etc.)
+    const agentsPath = path.join(repoPath, 'AGENTS.md');
+    const agentsResult = await upsertGitNexusSection(agentsPath, content);
+    createdFiles.push(`AGENTS.md (${agentsResult})`);
 
-  // Create CLAUDE.md (for Claude Code)
-  const claudePath = path.join(repoPath, 'CLAUDE.md');
-  const claudeResult = await upsertGitNexusSection(claudePath, content);
-  createdFiles.push(`CLAUDE.md (${claudeResult})`);
+    // Create CLAUDE.md (for Claude Code)
+    const claudePath = path.join(repoPath, 'CLAUDE.md');
+    const claudeResult = await upsertGitNexusSection(claudePath, content);
+    createdFiles.push(`CLAUDE.md (${claudeResult})`);
+  } else {
+    createdFiles.push('AGENTS.md (skipped via --skip-agents-md)');
+    createdFiles.push('CLAUDE.md (skipped via --skip-agents-md)');
+  }
 
   // Install skills to .claude/skills/gitnexus/
   const installedSkills = await installSkills(repoPath);

@@ -46,6 +46,8 @@ export interface AnalyzeOptions {
   force?: boolean;
   embeddings?: boolean;
   skipGit?: boolean;
+  /** Skip AGENTS.md and CLAUDE.md gitnexus block updates. */
+  skipAgentsMd?: boolean;
 }
 
 export interface AnalyzeResult {
@@ -312,14 +314,21 @@ export async function runFullAnalysis(
     }
 
     try {
-      await generateAIContextFiles(repoPath, storagePath, projectName, {
-        files: pipelineResult.totalFileCount,
-        nodes: stats.nodes,
-        edges: stats.edges,
-        communities: pipelineResult.communityResult?.stats.totalCommunities,
-        clusters: aggregatedClusterCount,
-        processes: pipelineResult.processResult?.stats.totalProcesses,
-      });
+      await generateAIContextFiles(
+        repoPath,
+        storagePath,
+        projectName,
+        {
+          files: pipelineResult.totalFileCount,
+          nodes: stats.nodes,
+          edges: stats.edges,
+          communities: pipelineResult.communityResult?.stats.totalCommunities,
+          clusters: aggregatedClusterCount,
+          processes: pipelineResult.processResult?.stats.totalProcesses,
+        },
+        undefined,
+        { skipAgentsMd: options.skipAgentsMd },
+      );
     } catch {
       // Best-effort — don't fail the entire analysis for context file issues
     }

@@ -79,4 +79,32 @@ describe('generateAIContextFiles', () => {
       // Skills dir may not be created if skills source doesn't exist in test context
     }
   });
+
+  it('preserves manual AGENTS.md and CLAUDE.md edits when skipAgentsMd is enabled', async () => {
+    const stats = { nodes: 42, edges: 84, processes: 3 };
+    const agentsPath = path.join(tmpDir, 'AGENTS.md');
+    const claudePath = path.join(tmpDir, 'CLAUDE.md');
+    const agentsContent = '# AGENTS\n\nCustom manual instructions only\n';
+    const claudeContent = '# CLAUDE\n\nCustom manual instructions only\n';
+
+    await fs.writeFile(agentsPath, agentsContent, 'utf-8');
+    await fs.writeFile(claudePath, claudeContent, 'utf-8');
+
+    const result = await generateAIContextFiles(
+      tmpDir,
+      storagePath,
+      'TestProject',
+      stats,
+      undefined,
+      { skipAgentsMd: true },
+    );
+
+    expect(result.files).toContain('AGENTS.md (skipped via --skip-agents-md)');
+    expect(result.files).toContain('CLAUDE.md (skipped via --skip-agents-md)');
+
+    const agentsAfter = await fs.readFile(agentsPath, 'utf-8');
+    const claudeAfter = await fs.readFile(claudePath, 'utf-8');
+    expect(agentsAfter).toBe(agentsContent);
+    expect(claudeAfter).toBe(claudeContent);
+  });
 });
