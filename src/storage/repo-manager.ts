@@ -320,14 +320,16 @@ export const listRegisteredRepos = async (opts?: {
 
 // ─── Global CLI Config (~/.gitnexus/config.json) ─────────────────────────
 
-export type LLMProvider = 'openai' | 'cursor';
-
 export interface CLIConfig {
   apiKey?: string;
   model?: string;
   baseUrl?: string;
-  provider?: LLMProvider;
+  provider?: 'openai' | 'openrouter' | 'azure' | 'custom' | 'cursor';
   cursorModel?: string;
+  /** Azure api-version query param (e.g. '2024-10-21'). Only used when provider is 'azure'. */
+  apiVersion?: string;
+  /** Set true when the deployment is a reasoning model (o1, o3, o4-mini). Auto-detected for OpenAI; must be set for Azure deployments. */
+  isReasoningModel?: boolean;
 }
 
 /**

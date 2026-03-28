@@ -75,9 +75,21 @@ program
   .description('Generate repository wiki from knowledge graph')
   .option('-f, --force', 'Force full regeneration even if up to date')
   .option('--provider <provider>', 'LLM provider: openai or cursor (default: openai)')
-  .option('--model <model>', 'LLM model name (default depends on provider)')
-  .option('--base-url <url>', 'LLM API base URL (for openai provider)')
-  .option('--api-key <key>', 'LLM API key (saved to ~/.gitnexus/config.json)')
+  .option('--model <model>', 'LLM model or Azure deployment name (default: minimax/minimax-m2.5)')
+  .option(
+    '--base-url <url>',
+    'LLM API base URL. Azure v1: https://{resource}.openai.azure.com/openai/v1',
+  )
+  .option('--api-key <key>', 'LLM API key or Azure api-key (saved to ~/.gitnexus/config.json)')
+  .option(
+    '--api-version <version>',
+    'Azure api-version query param, e.g. 2024-10-21 (legacy Azure API only)',
+  )
+  .option(
+    '--reasoning-model',
+    'Mark deployment as reasoning model (o1/o3/o4-mini) — strips temperature, uses max_completion_tokens',
+  )
+  .option('--no-reasoning-model', 'Disable reasoning model mode (overrides saved config)')
   .option('--concurrency <n>', 'Parallel LLM calls (default: 3)', '3')
   .option('--gist', 'Publish wiki as a public GitHub Gist after generation')
   .option('-v, --verbose', 'Enable verbose output (show LLM commands and responses)')
