@@ -18,6 +18,8 @@ import { KOTLIN_QUERIES } from '../tree-sitter-queries.js';
 import { isKotlinClassMethod } from '../utils/ast-helpers.js';
 import { createFieldExtractor } from '../field-extractors/generic.js';
 import { kotlinConfig } from '../field-extractors/configs/jvm.js';
+import { createMethodExtractor } from '../method-extractors/generic.js';
+import { kotlinMethodConfig } from '../method-extractors/configs/jvm.js';
 
 const BUILT_INS: ReadonlySet<string> = new Set([
   'println',
@@ -89,6 +91,7 @@ export const kotlinProvider = defineLanguage({
   importPathPreprocessor: appendKotlinWildcard,
   mroStrategy: 'implements-split',
   fieldExtractor: createFieldExtractor(kotlinConfig),
+  methodExtractor: createMethodExtractor(kotlinMethodConfig),
   builtInNames: BUILT_INS,
   labelOverride: (functionNode, defaultLabel) => {
     if (defaultLabel !== 'Function') return defaultLabel;

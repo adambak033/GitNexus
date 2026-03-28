@@ -14,6 +14,7 @@ import type { LanguageTypeConfig } from './type-extractors/types.js';
 import type { CallRouter } from './call-routing.js';
 import type { ExportChecker } from './export-detection.js';
 import type { FieldExtractor } from './field-extractor.js';
+import type { MethodExtractor } from './method-types.js';
 import type { ImportResolverFn } from './import-resolvers/types.js';
 import type { NamedBindingExtractorFn } from './named-bindings/types.js';
 import type { SyntaxNode } from './utils/ast-helpers.js';
@@ -126,6 +127,10 @@ interface LanguageProviderConfig {
    *  declarations. Produces FieldInfo[] with name, type, visibility, static,
    *  readonly metadata. Default: undefined (no field extraction). */
   readonly fieldExtractor?: FieldExtractor;
+  /** Method extractor for extracting method/function definitions from class/struct/interface
+   *  declarations. Produces MethodInfo[] with name, parameters, visibility, isAbstract,
+   *  isFinal, annotations metadata. Default: undefined (no method extraction). */
+  readonly methodExtractor?: MethodExtractor;
   /** Extract a semantic description for a definition node (e.g., PHP Eloquent
    *  property arrays, relation method descriptions).
    *  Default: undefined (no description extraction). */

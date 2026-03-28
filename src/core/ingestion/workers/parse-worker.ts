@@ -68,6 +68,7 @@ import { preprocessImportPath } from '../import-processor.js';
 import type { NamedBinding } from '../named-bindings/types.js';
 import type { NodeLabel } from 'gitnexus-shared';
 import type { FieldInfo, FieldExtractorContext } from '../field-types.js';
+import type { MethodInfo, MethodExtractorContext } from '../method-types.js';
 import { CLASS_CONTAINER_TYPES } from '../utils/ast-helpers.js';
 
 // ============================================================================
@@ -121,6 +122,9 @@ interface ParsedSymbol {
   visibility?: string;
   isStatic?: boolean;
   isReadonly?: boolean;
+  isAbstract?: boolean;
+  isFinal?: boolean;
+  annotations?: string[];
 }
 
 export interface ExtractedImport {
@@ -323,6 +327,7 @@ const clearCaches = (): void => {
   functionIdCache.clear();
   exportCache.clear();
   fieldInfoCache.clear();
+  methodInfoCache.clear();
 };
 
 // ============================================================================
@@ -382,6 +387,41 @@ function getFieldInfo(
     cached.set(field.name, field);
   }
   fieldInfoCache.set(cacheKey, cached);
+  return cached;
+}
+
+// ============================================================================
+// MethodExtractor cache — extract method metadata once per class, reuse for each method.
+// Keyed by class node startIndex (unique per AST node within a file).
+// ============================================================================
+
+const methodInfoCache = new Map<number, Map<string, MethodInfo>>();
+
+/**
+ * Get (or extract and cache) method info for a class node.
+ * Returns a "name:line" → MethodInfo map, or undefined if the provider has no method extractor
+ * or the class yielded no methods.
+ * Keyed by name:line (not name alone) to support overloaded methods in Java/Kotlin.
+ */
+function getMethodInfo(
+  classNode: SyntaxNode,
+  provider: LanguageProvider,
+  context: MethodExtractorContext,
+): Map<string, MethodInfo> | undefined {
+  if (!provider.methodExtractor) return undefined;
+
+  const cacheKey = classNode.startIndex;
+  let cached = methodInfoCache.get(cacheKey);
+  if (cached) return cached;
+
+  const result = provider.methodExtractor.extract(classNode, context);
+  if (!result?.methods?.length) return undefined;
+
+  cached = new Map<string, MethodInfo>();
+  for (const method of result.methods) {
+    cached.set(`${method.name}:${method.line}`, method);
+  }
+  methodInfoCache.set(cacheKey, cached);
   return cached;
 }
 
@@ -1660,12 +1700,52 @@ const processFileGroup = (
       let visibility: string | undefined;
       let isStatic: boolean | undefined;
       let isReadonly: boolean | undefined;
+      let isAbstract: boolean | undefined;
+      let isFinal: boolean | undefined;
+      let annotations: string[] | undefined;
       if (nodeLabel === 'Function' || nodeLabel === 'Method' || nodeLabel === 'Constructor') {
-        const sig = extractMethodSignature(definitionNode);
-        parameterCount = sig.parameterCount;
-        requiredParameterCount = sig.requiredParameterCount;
-        parameterTypes = sig.parameterTypes;
-        returnType = sig.returnType;
+        // Try MethodExtractor first — it provides everything extractMethodSignature does, plus
+        // isAbstract/isFinal/annotations. Only fall back to extractMethodSignature when no
+        // MethodExtractor is available or the method isn't inside a class body.
+        let enrichedByMethodExtractor = false;
+        if (provider.methodExtractor && definitionNode) {
+          const classNode = findEnclosingClassNode(definitionNode);
+          if (classNode) {
+            const methodMap = getMethodInfo(classNode, provider, {
+              filePath: file.path,
+              language,
+            });
+            const defLine = definitionNode.startPosition.row + 1;
+            const info = methodMap?.get(`${nodeName}:${defLine}`);
+            if (info) {
+              enrichedByMethodExtractor = true;
+              parameterCount = info.parameters.length;
+              const types: string[] = [];
+              let optionalCount = 0;
+              for (const p of info.parameters) {
+                if (p.type !== null) types.push(p.type);
+                if (p.isOptional) optionalCount++;
+              }
+              parameterTypes = types.length > 0 ? types : undefined;
+              requiredParameterCount =
+                optionalCount > 0 ? parameterCount - optionalCount : undefined;
+              returnType = info.returnType ?? undefined;
+              visibility = info.visibility;
+              isStatic = info.isStatic;
+              isAbstract = info.isAbstract;
+              isFinal = info.isFinal;
+              if (info.annotations.length > 0) annotations = info.annotations;
+            }
+          }
+        }
+
+        if (!enrichedByMethodExtractor) {
+          const sig = extractMethodSignature(definitionNode);
+          parameterCount = sig.parameterCount;
+          requiredParameterCount = sig.requiredParameterCount;
+          parameterTypes = sig.parameterTypes;
+          returnType = sig.returnType;
+        }
 
         // Language-specific return type fallback (e.g. Ruby YARD @return [Type])
         // Also upgrades uninformative AST types like PHP `array` with PHPDoc `@return User[]`
@@ -1730,6 +1810,9 @@ const processFileGroup = (
           ...(visibility !== undefined ? { visibility } : {}),
           ...(isStatic !== undefined ? { isStatic } : {}),
           ...(isReadonly !== undefined ? { isReadonly } : {}),
+          ...(isAbstract !== undefined ? { isAbstract } : {}),
+          ...(isFinal !== undefined ? { isFinal } : {}),
+          ...(annotations !== undefined ? { annotations } : {}),
         },
       });
 
@@ -1758,6 +1841,9 @@ const processFileGroup = (
         ...(visibility !== undefined ? { visibility } : {}),
         ...(isStatic !== undefined ? { isStatic } : {}),
         ...(isReadonly !== undefined ? { isReadonly } : {}),
+        ...(isAbstract !== undefined ? { isAbstract } : {}),
+        ...(isFinal !== undefined ? { isFinal } : {}),
+        ...(annotations !== undefined ? { annotations } : {}),
       });
 
       const fileId = generateId('File', file.path);

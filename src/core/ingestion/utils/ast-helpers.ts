@@ -65,6 +65,8 @@ export const FUNCTION_NODE_TYPES = new Set([
   // Java
   'method_declaration',
   'constructor_declaration',
+  'compact_constructor_declaration',
+  'annotation_type_element_declaration',
   // C/C++
   // 'function_definition' already included above
   // Go
