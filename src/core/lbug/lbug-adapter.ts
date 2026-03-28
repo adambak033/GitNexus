@@ -551,6 +551,27 @@ export const executeQuery = async (cypher: string): Promise<any[]> => {
   return rows;
 };
 
+/**
+ * Execute a single parameterized query (prepare/execute pattern).
+ * Prevents Cypher injection by binding values as parameters.
+ */
+export const executePrepared = async (
+  cypher: string,
+  params: Record<string, any>,
+): Promise<any[]> => {
+  if (!conn) {
+    throw new Error('LadybugDB not initialized. Call initLbug first.');
+  }
+  const stmt = await conn.prepare(cypher);
+  if (!stmt.isSuccess()) {
+    const errMsg = await stmt.getErrorMessage();
+    throw new Error(`Prepare failed: ${errMsg}`);
+  }
+  const queryResult = await conn.execute(stmt, params);
+  const result = Array.isArray(queryResult) ? queryResult[0] : queryResult;
+  return await result.getAll();
+};
+
 export const executeWithReusedStatement = async (
   cypher: string,
   paramsList: Array<Record<string, any>>

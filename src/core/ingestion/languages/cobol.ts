@@ -9,7 +9,7 @@
  * This provider exists to satisfy the SupportedLanguages exhaustiveness
  * checks and to declare parseStrategy: 'standalone'.
  */
-import { SupportedLanguages } from '../../../config/supported-languages.js';
+import { SupportedLanguages } from 'gitnexus-shared';
 import { defineLanguage } from '../language-provider.js';
 
 export const cobolProvider = defineLanguage({

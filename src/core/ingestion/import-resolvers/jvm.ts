@@ -5,7 +5,7 @@
 
 import type { SuffixIndex } from './utils.js';
 import type { SyntaxNode } from '../utils/ast-helpers.js';
-import { SupportedLanguages } from '../../../config/supported-languages.js';
+import { SupportedLanguages } from 'gitnexus-shared';
 import type { ImportResult, ResolveCtx } from './types.js';
 import { resolveStandard } from './standard.js';
 

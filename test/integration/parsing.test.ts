@@ -11,8 +11,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import { createKnowledgeGraph } from '../../src/core/graph/graph.js';
 import { loadParser, loadLanguage } from '../../src/core/tree-sitter/parser-loader.js';
-import { getLanguageFromFilename } from '../../src/core/ingestion/utils/language-detection.js';
-import { SupportedLanguages } from '../../src/config/supported-languages.js';
+import { getLanguageFromFilename, SupportedLanguages } from 'gitnexus-shared';
 import { getProvider } from '../../src/core/ingestion/languages/index.js';
 
 const FIXTURES_DIR = path.join(process.cwd(), 'test', 'fixtures', 'sample-code');

@@ -1,4 +1,5 @@
-import { GraphNode, GraphRelationship, KnowledgeGraph } from './types.js'
+import type { GraphNode, GraphRelationship } from 'gitnexus-shared';
+import { KnowledgeGraph } from './types.js';
 
 export const createKnowledgeGraph = (): KnowledgeGraph => {
   const nodeMap = new Map<string, GraphNode>();

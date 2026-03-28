@@ -39,6 +39,7 @@
   ],
   "scripts": {
     "build": "tsc",
+    "serve": "tsx src/cli/index.ts serve",
     "dev": "tsx watch src/cli/index.ts",
     "test": "vitest run",
     "test:unit": "vitest run test/unit",
@@ -49,6 +50,7 @@
     "prepack": "npm run build && chmod +x dist/cli/index.js"
   },
   "dependencies": {
+    "gitnexus-shared": "file:../gitnexus-shared",
     "@huggingface/transformers": "^3.0.0",
     "@ladybugdb/core": "^0.15.2",
     "@modelcontextprotocol/sdk": "^1.0.0",

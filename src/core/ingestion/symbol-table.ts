@@ -1,4 +1,4 @@
-import type { NodeLabel } from '../graph/types.js';
+import type { NodeLabel } from 'gitnexus-shared';
 
 export interface SymbolDefinition {
   nodeId: string;

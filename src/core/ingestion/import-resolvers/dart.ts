@@ -6,7 +6,7 @@
 
 import type { ImportResult, ResolveCtx } from './types.js';
 import { resolveStandard } from './standard.js';
-import { SupportedLanguages } from '../../../config/supported-languages.js';
+import { SupportedLanguages } from 'gitnexus-shared';
 
 export function resolveDartImport(
   rawImportPath: string,

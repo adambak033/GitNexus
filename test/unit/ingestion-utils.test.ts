@@ -1,7 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { getLanguageFromFilename } from '../../src/core/ingestion/utils/language-detection.js';
+import { getLanguageFromFilename, SupportedLanguages } from 'gitnexus-shared';
 import { getProvider } from '../../src/core/ingestion/languages/index.js';
-import { SupportedLanguages } from '../../src/config/supported-languages.js';
 import { extractFunctionName } from '../../src/core/ingestion/utils/ast-helpers.js';
 import { getTreeSitterBufferSize, TREE_SITTER_BUFFER_SIZE, TREE_SITTER_MAX_BUFFER } from '../../src/core/ingestion/constants.js';
 import Parser from 'tree-sitter';

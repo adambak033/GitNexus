@@ -1,6 +1,6 @@
 // gitnexus/src/core/ingestion/field-extractors/configs/python.ts
 
-import { SupportedLanguages } from '../../../../config/supported-languages.js';
+import { SupportedLanguages } from 'gitnexus-shared';
 import type { FieldExtractionConfig } from '../generic.js';
 import { extractSimpleTypeName } from '../../type-extractors/shared.js';
 

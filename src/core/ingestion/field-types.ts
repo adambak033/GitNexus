@@ -2,7 +2,7 @@
 
 import type { TypeEnvironment } from './type-env.js';
 import type { SymbolTable } from './symbol-table.js';
-import { SupportedLanguages } from '../../config/supported-languages.js';
+import { SupportedLanguages } from 'gitnexus-shared';
 
 /**
  * Visibility levels used across all supported languages.

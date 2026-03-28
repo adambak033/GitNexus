@@ -10,7 +10,7 @@
  * (no bonus, no penalty) - same behavior as before this feature.
  */
 
-import { SupportedLanguages } from '../../config/supported-languages.js';
+import { SupportedLanguages } from 'gitnexus-shared';
 
 // ============================================================================
 // TYPES

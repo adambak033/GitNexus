@@ -1,6 +1,6 @@
 // gitnexus/src/core/ingestion/field-extractors/configs/ruby.ts
 
-import { SupportedLanguages } from '../../../../config/supported-languages.js';
+import { SupportedLanguages } from 'gitnexus-shared';
 import type { FieldExtractionConfig } from '../generic.js';
 import type { SyntaxNode } from '../../utils/ast-helpers.js';
 

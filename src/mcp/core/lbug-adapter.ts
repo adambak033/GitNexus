@@ -550,8 +550,11 @@ export const closeLbug = async (repoId?: string): Promise<void> => {
  */
 export const isLbugReady = (repoId: string): boolean => pool.has(repoId);
 
-/** Regex to detect write operations in user-supplied Cypher queries */
-export const CYPHER_WRITE_RE = /(?<!:)\b(CREATE|DELETE|SET|MERGE|REMOVE|DROP|ALTER|COPY|DETACH|FOREACH)\b/i;
+/** Regex to detect write operations in user-supplied Cypher queries.
+ * Note: CALL is NOT blocked — it's used for read-only FTS (CALL QUERY_FTS_INDEX)
+ * and vector search (CALL QUERY_VECTOR_INDEX). The database is opened in
+ * read-only mode as defense-in-depth against write procedures. */
+export const CYPHER_WRITE_RE = /(?<!:)\b(CREATE|DELETE|SET|MERGE|REMOVE|DROP|ALTER|COPY|DETACH|FOREACH|INSTALL|LOAD)\b/i;
 
 /** Check if a Cypher query contains write operations */
 export function isWriteQuery(query: string): boolean {

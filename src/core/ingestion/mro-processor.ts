@@ -19,9 +19,10 @@
  * Cypher: MATCH (c:Class)-[r:CodeRelation {type: 'OVERRIDES'}]->(m:Method)
  */
 
-import { KnowledgeGraph, GraphRelationship } from '../graph/types.js';
+import type { GraphRelationship } from 'gitnexus-shared';
+import { KnowledgeGraph } from '../graph/types.js';
 import { generateId } from '../../lib/utils.js';
-import { SupportedLanguages } from '../../config/supported-languages.js';
+import { SupportedLanguages } from 'gitnexus-shared';
 import { getProvider } from './languages/index.js';
 
 // ---------------------------------------------------------------------------
@@ -295,7 +296,7 @@ export function computeMRO(graph: KnowledgeGraph): MROResult {
     const classNode = graph.getNode(classId);
     if (!classNode) continue;
 
-    const language = classNode.properties.language;
+    const language = classNode.properties.language as SupportedLanguages | undefined;
     if (!language) continue;
     const className = classNode.properties.name;
 

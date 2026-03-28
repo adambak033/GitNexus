@@ -1,5 +1,5 @@
 import type Parser from 'tree-sitter';
-import type { NodeLabel } from '../../graph/types.js';
+import type { NodeLabel } from 'gitnexus-shared';
 import type { LanguageProvider } from '../language-provider.js';
 import { generateId } from '../../../lib/utils.js';
 import { extractSimpleTypeName } from '../type-extractors/shared.js';

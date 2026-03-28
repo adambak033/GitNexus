@@ -15,7 +15,8 @@ import Graph from 'graphology';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
-import { KnowledgeGraph, NodeLabel } from '../graph/types.js';
+import type { NodeLabel } from 'gitnexus-shared';
+import { KnowledgeGraph } from '../graph/types.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);

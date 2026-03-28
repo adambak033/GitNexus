@@ -8,7 +8,7 @@
  * 4. Run `tsc --noEmit` to verify
  */
 
-import { SupportedLanguages } from '../../../config/supported-languages.js';
+import { SupportedLanguages } from 'gitnexus-shared';
 import type { LanguageProvider } from '../language-provider.js';
 
 import { typescriptProvider, javascriptProvider } from './typescript.js';

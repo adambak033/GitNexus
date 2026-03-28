@@ -6,7 +6,7 @@
  * extensions from legacy versions through modern PHP 8.
  */
 
-import { SupportedLanguages } from '../../../config/supported-languages.js';
+import { SupportedLanguages } from 'gitnexus-shared';
 import { defineLanguage } from '../language-provider.js';
 import { typeConfig as phpConfig } from '../type-extractors/php.js';
 import { phpExportChecker } from '../export-detection.js';
@@ -14,7 +14,7 @@ import { resolvePhpImport } from '../import-resolvers/php.js';
 import { extractPhpNamedBindings } from '../named-bindings/php.js';
 import { PHP_QUERIES } from '../tree-sitter-queries.js';
 import { findDescendant, extractStringContent } from '../utils/ast-helpers.js';
-import type { NodeLabel } from '../../graph/types.js';
+import type { NodeLabel } from 'gitnexus-shared';
 import { createFieldExtractor } from '../field-extractors/generic.js';
 import { phpConfig as phpFieldConfig } from '../field-extractors/configs/php.js';
 

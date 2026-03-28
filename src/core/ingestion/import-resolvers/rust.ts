@@ -3,7 +3,7 @@
  * Handles crate::, super::, self:: prefix paths and :: separators.
  */
 
-import { SupportedLanguages } from '../../../config/supported-languages.js';
+import { SupportedLanguages } from 'gitnexus-shared';
 import type { ImportResult, ResolveCtx } from './types.js';
 import { resolveStandard } from './standard.js';
 

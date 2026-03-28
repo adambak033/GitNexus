@@ -11,7 +11,7 @@
  */
 
 import { detectFrameworkFromPath } from './framework-detection.js';
-import { SupportedLanguages } from '../../config/supported-languages.js';
+import { SupportedLanguages } from 'gitnexus-shared';
 
 // ============================================================================
 // NAME PATTERNS - All 13 supported languages

@@ -1,12 +1,12 @@
 import { type SyntaxNode, FUNCTION_NODE_TYPES, extractFunctionName, CLASS_CONTAINER_TYPES } from './utils/ast-helpers.js';
 import { CALL_EXPRESSION_TYPES } from './utils/call-analysis.js';
-import { SupportedLanguages } from '../../config/supported-languages.js';
+import { SupportedLanguages } from 'gitnexus-shared';
 import { TYPED_PARAMETER_TYPES } from './type-extractors/shared.js';
 import { getProvider } from './languages/index.js';
 import type { ClassNameLookup, ReturnTypeLookup, ForLoopExtractorContext, PendingAssignment } from './type-extractors/types.js';
 import { extractSimpleTypeName, extractVarName, stripNullable, extractReturnTypeName } from './type-extractors/shared.js';
 import type { SymbolTable } from './symbol-table.js';
-import type { NodeLabel } from '../graph/types.js';
+import type { NodeLabel } from 'gitnexus-shared';
 
 /**
  * Per-file scoped type environment: maps (scope, variableName) → typeName.

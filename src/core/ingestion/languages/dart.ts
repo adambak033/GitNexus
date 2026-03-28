@@ -11,9 +11,9 @@
  */
 
 import type { SyntaxNode } from '../utils/ast-helpers.js';
-import type { NodeLabel } from '../../graph/types.js';
+import type { NodeLabel } from 'gitnexus-shared';
 import { FUNCTION_NODE_TYPES, extractFunctionName } from '../utils/ast-helpers.js';
-import { SupportedLanguages } from '../../../config/supported-languages.js';
+import { SupportedLanguages } from 'gitnexus-shared';
 import { defineLanguage } from '../language-provider.js';
 import { typeConfig as dartConfig } from '../type-extractors/dart.js';
 import { dartExportChecker } from '../export-detection.js';

@@ -12,7 +12,8 @@ import path from 'path';
 import { PipelineResult } from '../types/pipeline.js';
 import { CommunityNode, CommunityMembership } from '../core/ingestion/community-processor.js';
 import { ProcessNode } from '../core/ingestion/process-processor.js';
-import { GraphNode, KnowledgeGraph } from '../core/graph/types.js';
+import type { GraphNode } from 'gitnexus-shared';
+import { KnowledgeGraph } from '../core/graph/types.js';
 
 // ============================================================================
 // TYPES

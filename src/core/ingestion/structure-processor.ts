@@ -1,5 +1,6 @@
 import { generateId } from "../../lib/utils.js";
-import { KnowledgeGraph, GraphNode, GraphRelationship } from "../graph/types.js";
+import type { GraphNode, GraphRelationship } from 'gitnexus-shared';
+import { KnowledgeGraph } from '../graph/types.js';
 
 export const processStructure = ( graph: KnowledgeGraph, paths: string[])=>{
     paths.forEach( path => {

@@ -2,9 +2,8 @@ import { describe, it, expect, beforeAll } from 'vitest';
 import fs from 'fs';
 import path from 'path';
 import { loadParser, loadLanguage } from '../../src/core/tree-sitter/parser-loader.js';
-import { SupportedLanguages } from '../../src/config/supported-languages.js';
+import { SupportedLanguages, getLanguageFromFilename } from 'gitnexus-shared';
 import { getProvider } from '../../src/core/ingestion/languages/index.js';
-import { getLanguageFromFilename } from '../../src/core/ingestion/utils/language-detection.js';
 import Parser from 'tree-sitter';
 
 const fixturesDir = path.resolve(__dirname, '..', 'fixtures', 'sample-code');
