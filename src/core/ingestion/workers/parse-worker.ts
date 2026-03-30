@@ -1702,6 +1702,10 @@ const processFileGroup = (
       let isReadonly: boolean | undefined;
       let isAbstract: boolean | undefined;
       let isFinal: boolean | undefined;
+      let isVirtual: boolean | undefined;
+      let isOverride: boolean | undefined;
+      let isAsync: boolean | undefined;
+      let isPartial: boolean | undefined;
       let annotations: string[] | undefined;
       if (nodeLabel === 'Function' || nodeLabel === 'Method' || nodeLabel === 'Constructor') {
         // Try MethodExtractor first — it provides everything extractMethodSignature does, plus
@@ -1734,6 +1738,10 @@ const processFileGroup = (
               isStatic = info.isStatic;
               isAbstract = info.isAbstract;
               isFinal = info.isFinal;
+              if (info.isVirtual) isVirtual = info.isVirtual;
+              if (info.isOverride) isOverride = info.isOverride;
+              if (info.isAsync) isAsync = info.isAsync;
+              if (info.isPartial) isPartial = info.isPartial;
               if (info.annotations.length > 0) annotations = info.annotations;
             }
           }
@@ -1812,6 +1820,10 @@ const processFileGroup = (
           ...(isReadonly !== undefined ? { isReadonly } : {}),
           ...(isAbstract !== undefined ? { isAbstract } : {}),
           ...(isFinal !== undefined ? { isFinal } : {}),
+          ...(isVirtual !== undefined ? { isVirtual } : {}),
+          ...(isOverride !== undefined ? { isOverride } : {}),
+          ...(isAsync !== undefined ? { isAsync } : {}),
+          ...(isPartial !== undefined ? { isPartial } : {}),
           ...(annotations !== undefined ? { annotations } : {}),
         },
       });
@@ -1843,6 +1855,10 @@ const processFileGroup = (
         ...(isReadonly !== undefined ? { isReadonly } : {}),
         ...(isAbstract !== undefined ? { isAbstract } : {}),
         ...(isFinal !== undefined ? { isFinal } : {}),
+        ...(isVirtual !== undefined ? { isVirtual } : {}),
+        ...(isOverride !== undefined ? { isOverride } : {}),
+        ...(isAsync !== undefined ? { isAsync } : {}),
+        ...(isPartial !== undefined ? { isPartial } : {}),
         ...(annotations !== undefined ? { annotations } : {}),
       });
 

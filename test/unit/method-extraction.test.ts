@@ -4,9 +4,11 @@ import {
   javaMethodConfig,
   kotlinMethodConfig,
 } from '../../src/core/ingestion/method-extractors/configs/jvm.js';
+import { csharpMethodConfig } from '../../src/core/ingestion/method-extractors/configs/csharp.js';
 import type { MethodExtractorContext } from '../../src/core/ingestion/method-types.js';
 import Parser from 'tree-sitter';
 import Java from 'tree-sitter-java';
+import CSharp from 'tree-sitter-c-sharp';
 import { SupportedLanguages } from '../../src/config/supported-languages.js';
 
 let Kotlin: unknown;
@@ -37,6 +39,16 @@ const javaCtx: MethodExtractorContext = {
 const kotlinCtx: MethodExtractorContext = {
   filePath: 'Test.kt',
   language: SupportedLanguages.Kotlin,
+};
+
+const parseCSharp = (code: string) => {
+  parser.setLanguage(CSharp);
+  return parser.parse(code);
+};
+
+const csharpCtx: MethodExtractorContext = {
+  filePath: 'Test.cs',
+  language: SupportedLanguages.CSharp,
 };
 
 // ---------------------------------------------------------------------------
@@ -623,6 +635,665 @@ describeKotlin('Kotlin MethodExtractor', () => {
       expect(result!.ownerName).toBe('Factory');
       expect(result!.methods[0].name).toBe('build');
       expect(result!.methods[0].isStatic).toBe(true);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// C#
+// ---------------------------------------------------------------------------
+
+describe('C# MethodExtractor', () => {
+  const extractor = createMethodExtractor(csharpMethodConfig);
+
+  describe('isTypeDeclaration', () => {
+    it('recognizes class_declaration', () => {
+      const tree = parseCSharp('public class Foo { }');
+      expect(extractor.isTypeDeclaration(tree.rootNode.child(0)!)).toBe(true);
+    });
+
+    it('recognizes interface_declaration', () => {
+      const tree = parseCSharp('public interface IBar { }');
+      expect(extractor.isTypeDeclaration(tree.rootNode.child(0)!)).toBe(true);
+    });
+
+    it('recognizes struct_declaration', () => {
+      const tree = parseCSharp('public struct Point { }');
+      expect(extractor.isTypeDeclaration(tree.rootNode.child(0)!)).toBe(true);
+    });
+
+    it('recognizes record_declaration', () => {
+      const tree = parseCSharp('public record Person { }');
+      expect(extractor.isTypeDeclaration(tree.rootNode.child(0)!)).toBe(true);
+    });
+
+    it('rejects using_directive', () => {
+      const tree = parseCSharp('using System;');
+      expect(extractor.isTypeDeclaration(tree.rootNode.child(0)!)).toBe(false);
+    });
+  });
+
+  describe('extract from class', () => {
+    it('extracts public method with parameters', () => {
+      const tree = parseCSharp(`
+        public class UserService {
+          public User FindById(int id, bool active) { return null; }
+        }
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, csharpCtx);
+
+      expect(result).not.toBeNull();
+      expect(result!.ownerName).toBe('UserService');
+      expect(result!.methods).toHaveLength(1);
+
+      const m = result!.methods[0];
+      expect(m.name).toBe('FindById');
+      expect(m.returnType).toBe('User');
+      expect(m.visibility).toBe('public');
+      expect(m.isStatic).toBe(false);
+      expect(m.isAbstract).toBe(false);
+      expect(m.isFinal).toBe(false);
+      expect(m.parameters).toHaveLength(2);
+      expect(m.parameters[0]).toEqual({
+        name: 'id',
+        type: 'int',
+        isOptional: false,
+        isVariadic: false,
+      });
+      expect(m.parameters[1]).toEqual({
+        name: 'active',
+        type: 'bool',
+        isOptional: false,
+        isVariadic: false,
+      });
+    });
+
+    it('extracts static method', () => {
+      const tree = parseCSharp(`
+        public class MathUtils {
+          public static int Add(int a, int b) { return a + b; }
+        }
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, csharpCtx);
+
+      expect(result!.methods[0].isStatic).toBe(true);
+    });
+
+    it('extracts private method (default visibility)', () => {
+      const tree = parseCSharp(`
+        public class Foo {
+          void InternalMethod() { }
+        }
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, csharpCtx);
+
+      expect(result!.methods[0].visibility).toBe('private');
+    });
+
+    it('extracts sealed method', () => {
+      const tree = parseCSharp(`
+        public class Derived {
+          public sealed override string ToString() { return ""; }
+        }
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, csharpCtx);
+
+      expect(result!.methods[0].isFinal).toBe(true);
+      expect(result!.methods[0].isOverride).toBe(true);
+    });
+  });
+
+  describe('extract from abstract class', () => {
+    it('detects abstract methods', () => {
+      const tree = parseCSharp(`
+        public abstract class Shape {
+          public abstract double Area();
+          public double Perimeter() { return 0; }
+        }
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, csharpCtx);
+
+      expect(result!.methods).toHaveLength(2);
+
+      const areaMethod = result!.methods.find((m) => m.name === 'Area');
+      const perimeterMethod = result!.methods.find((m) => m.name === 'Perimeter');
+
+      expect(areaMethod!.isAbstract).toBe(true);
+      expect(perimeterMethod!.isAbstract).toBe(false);
+    });
+  });
+
+  describe('extract from interface', () => {
+    it('marks bodyless methods as abstract', () => {
+      const tree = parseCSharp(`
+        public interface IRepository {
+          void Save(int id);
+          string FindAll();
+        }
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, csharpCtx);
+
+      expect(result!.methods).toHaveLength(2);
+      expect(result!.methods[0].isAbstract).toBe(true);
+      expect(result!.methods[1].isAbstract).toBe(true);
+    });
+  });
+
+  describe('extract params (variadic)', () => {
+    it('detects params as isVariadic', () => {
+      const tree = parseCSharp(`
+        public class Formatter {
+          public string Format(string template, params object[] args) { return ""; }
+        }
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, csharpCtx);
+      const params = result!.methods[0].parameters;
+
+      expect(params).toHaveLength(2);
+      expect(params[0].isVariadic).toBe(false);
+      expect(params[1].isVariadic).toBe(true);
+      expect(params[1].name).toBe('args');
+    });
+  });
+
+  describe('extract out/ref parameters', () => {
+    it('handles out parameter (type prefixed with modifier)', () => {
+      const tree = parseCSharp(`
+        public class Parser {
+          public bool TryParse(string input, out int result) { return false; }
+        }
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, csharpCtx);
+      const params = result!.methods[0].parameters;
+
+      expect(params).toHaveLength(2);
+      expect(params[0].name).toBe('input');
+      expect(params[1].name).toBe('result');
+      expect(params[1].type).toBe('out int');
+    });
+
+    it('handles ref parameter', () => {
+      const tree = parseCSharp(`
+        public class Swapper {
+          public void Swap(ref int a, ref int b) { }
+        }
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, csharpCtx);
+      const params = result!.methods[0].parameters;
+
+      expect(params).toHaveLength(2);
+      expect(params[0].type).toBe('ref int');
+      expect(params[1].type).toBe('ref int');
+    });
+  });
+
+  describe('extract optional parameters', () => {
+    it('detects optional with defaults', () => {
+      const tree = parseCSharp(`
+        public class Logger {
+          public void Log(string message, int level = 0) { }
+        }
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, csharpCtx);
+      const params = result!.methods[0].parameters;
+
+      expect(params).toHaveLength(2);
+      expect(params[0].isOptional).toBe(false);
+      expect(params[1].isOptional).toBe(true);
+    });
+  });
+
+  describe('extract attributes', () => {
+    it('extracts attribute names', () => {
+      const tree = parseCSharp(`
+        public class Controller {
+          [HttpGet]
+          [Authorize]
+          public string GetAll() { return ""; }
+        }
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, csharpCtx);
+
+      expect(result!.methods[0].annotations).toContain('@HttpGet');
+      expect(result!.methods[0].annotations).toContain('@Authorize');
+    });
+
+    it('skips targeted attributes like [return: NotNull]', () => {
+      const tree = parseCSharp(`
+        public class Service {
+          [return: MarshalAs(UnmanagedType.Bool)]
+          [Obsolete]
+          public bool Check() { return true; }
+        }
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, csharpCtx);
+
+      // [Obsolete] is a method attribute, [return: MarshalAs(...)] targets the return value
+      expect(result!.methods[0].annotations).toContain('@Obsolete');
+      expect(result!.methods[0].annotations).not.toContain('@MarshalAs');
+    });
+  });
+
+  describe('extract constructor', () => {
+    it('extracts constructor', () => {
+      const tree = parseCSharp(`
+        public class Service {
+          public Service(string name) { }
+        }
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, csharpCtx);
+
+      expect(result).not.toBeNull();
+      const ctor = result!.methods.find((m) => m.name === 'Service');
+      expect(ctor).toBeDefined();
+      expect(ctor!.returnType).toBeNull();
+      expect(ctor!.parameters).toHaveLength(1);
+      expect(ctor!.parameters[0].name).toBe('name');
+    });
+
+    it('extracts static constructor as isStatic: true with same name as class', () => {
+      const tree = parseCSharp(`
+        public class Config {
+          static Config() { }
+        }
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, csharpCtx);
+
+      const ctor = result!.methods.find((m) => m.name === 'Config');
+      expect(ctor).toBeDefined();
+      expect(ctor!.isStatic).toBe(true);
+      expect(ctor!.parameters).toHaveLength(0);
+    });
+  });
+
+  describe('extract from struct', () => {
+    it('extracts struct methods', () => {
+      const tree = parseCSharp(`
+        public struct Point {
+          public double Distance() { return 0; }
+        }
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, csharpCtx);
+
+      expect(result).not.toBeNull();
+      expect(result!.ownerName).toBe('Point');
+      expect(result!.methods).toHaveLength(1);
+    });
+  });
+
+  describe('extract from record', () => {
+    it('extracts record methods', () => {
+      const tree = parseCSharp(`
+        public record Person {
+          public string FullName() { return ""; }
+        }
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, csharpCtx);
+
+      expect(result).not.toBeNull();
+      expect(result!.ownerName).toBe('Person');
+      expect(result!.methods).toHaveLength(1);
+    });
+  });
+
+  describe('internal visibility', () => {
+    it('detects internal visibility', () => {
+      const tree = parseCSharp(`
+        public class Foo {
+          internal void InternalMethod() { }
+        }
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, csharpCtx);
+
+      expect(result!.methods[0].visibility).toBe('internal');
+    });
+  });
+
+  describe('extract destructor', () => {
+    it('extracts destructor declaration', () => {
+      const tree = parseCSharp(`
+        public class Resource {
+          ~Resource() { }
+        }
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, csharpCtx);
+
+      expect(result).not.toBeNull();
+      const dtor = result!.methods.find((m) => m.name === '~Resource');
+      expect(dtor).toBeDefined();
+      expect(dtor!.returnType).toBeNull();
+    });
+  });
+
+  describe('extract operator overload', () => {
+    it('extracts operator+ declaration', () => {
+      const tree = parseCSharp(`
+        public class Vector {
+          public static Vector operator +(Vector a, Vector b) { return a; }
+        }
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, csharpCtx);
+
+      expect(result).not.toBeNull();
+      const op = result!.methods.find((m) => m.name === 'operator +');
+      expect(op).toBeDefined();
+      expect(op!.isStatic).toBe(true);
+      expect(op!.returnType).toBe('Vector');
+      expect(op!.parameters).toHaveLength(2);
+    });
+  });
+
+  describe('extract conversion operator', () => {
+    it('extracts implicit conversion operator', () => {
+      const tree = parseCSharp(`
+        public class Celsius {
+          public static implicit operator double(Celsius c) { return 0; }
+        }
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, csharpCtx);
+
+      expect(result).not.toBeNull();
+      const conv = result!.methods.find((m) => m.name === 'implicit operator double');
+      expect(conv).toBeDefined();
+      expect(conv!.isStatic).toBe(true);
+      expect(conv!.returnType).toBe('double');
+      expect(conv!.parameters).toHaveLength(1);
+    });
+  });
+
+  describe('extract in parameter modifier', () => {
+    it('handles in parameter (read-only ref)', () => {
+      const tree = parseCSharp(`
+        public class Calculator {
+          public double Calculate(in double value) { return value; }
+        }
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, csharpCtx);
+      const params = result!.methods[0].parameters;
+
+      expect(params).toHaveLength(1);
+      expect(params[0].name).toBe('value');
+      expect(params[0].type).toBe('in double');
+    });
+  });
+
+  describe('extract this parameter (extension methods)', () => {
+    it('prefixes type with this for extension method parameter', () => {
+      const tree = parseCSharp(`
+        public static class StringExtensions {
+          public static bool IsNullOrEmpty(this string s) { return false; }
+        }
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, csharpCtx);
+      const params = result!.methods[0].parameters;
+
+      expect(params).toHaveLength(1);
+      expect(params[0].name).toBe('s');
+      expect(params[0].type).toBe('this string');
+    });
+  });
+
+  describe('compound visibility', () => {
+    it('detects protected internal', () => {
+      const tree = parseCSharp(`
+        public class Foo {
+          protected internal void SharedMethod() { }
+        }
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, csharpCtx);
+
+      expect(result!.methods[0].visibility).toBe('protected internal');
+    });
+
+    it('detects private protected', () => {
+      const tree = parseCSharp(`
+        public class Foo {
+          private protected void RestrictedMethod() { }
+        }
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, csharpCtx);
+
+      expect(result!.methods[0].visibility).toBe('private protected');
+    });
+  });
+
+  describe('expression-bodied members', () => {
+    it('extracts expression-bodied method', () => {
+      const tree = parseCSharp(`
+        public class MathUtils {
+          public int Double(int x) => x * 2;
+        }
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, csharpCtx);
+
+      expect(result).not.toBeNull();
+      expect(result!.methods).toHaveLength(1);
+      expect(result!.methods[0].name).toBe('Double');
+      expect(result!.methods[0].returnType).toBe('int');
+      expect(result!.methods[0].parameters).toHaveLength(1);
+    });
+  });
+
+  describe('primary constructor (C# 12)', () => {
+    it('extracts primary constructor from class declaration', () => {
+      const tree = parseCSharp(`
+        public class Point(int x, int y) {
+          public double Distance() => 0;
+        }
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, csharpCtx);
+
+      expect(result).not.toBeNull();
+      expect(result!.methods).toHaveLength(2);
+
+      const ctor = result!.methods.find((m) => m.name === 'Point');
+      expect(ctor).toBeDefined();
+      expect(ctor!.returnType).toBeNull();
+      expect(ctor!.parameters).toHaveLength(2);
+      expect(ctor!.parameters[0]).toEqual({
+        name: 'x',
+        type: 'int',
+        isOptional: false,
+        isVariadic: false,
+      });
+
+      const method = result!.methods.find((m) => m.name === 'Distance');
+      expect(method).toBeDefined();
+    });
+
+    it('extracts primary constructor from record declaration', () => {
+      const tree = parseCSharp(`
+        public record Person(string Name, int Age);
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, csharpCtx);
+
+      expect(result).not.toBeNull();
+      const ctor = result!.methods.find((m) => m.name === 'Person');
+      expect(ctor).toBeDefined();
+      expect(ctor!.parameters).toHaveLength(2);
+      expect(ctor!.parameters[0].name).toBe('Name');
+      expect(ctor!.parameters[1].name).toBe('Age');
+    });
+  });
+
+  describe('virtual / override / async modifiers', () => {
+    it('detects virtual method', () => {
+      const tree = parseCSharp(`
+        public class Base {
+          public virtual void Process() { }
+        }
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, csharpCtx);
+
+      expect(result!.methods[0].isVirtual).toBe(true);
+      expect(result!.methods[0].isOverride).toBeUndefined();
+    });
+
+    it('detects override method', () => {
+      const tree = parseCSharp(`
+        public class Derived {
+          public override void Process() { }
+        }
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, csharpCtx);
+
+      expect(result!.methods[0].isOverride).toBe(true);
+      expect(result!.methods[0].isVirtual).toBeUndefined();
+    });
+
+    it('detects async method', () => {
+      const tree = parseCSharp(`
+        public class Service {
+          public async Task<string> FetchData() { return ""; }
+        }
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, csharpCtx);
+
+      expect(result!.methods[0].isAsync).toBe(true);
+    });
+
+    it('regular method has no virtual/override/async', () => {
+      const tree = parseCSharp(`
+        public class Foo {
+          public void Bar() { }
+        }
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, csharpCtx);
+
+      expect(result!.methods[0].isVirtual).toBeUndefined();
+      expect(result!.methods[0].isOverride).toBeUndefined();
+      expect(result!.methods[0].isAsync).toBeUndefined();
+    });
+  });
+
+  describe('record struct', () => {
+    // tree-sitter-c-sharp ^0.23.1 emits record_declaration for 'record struct' —
+    // there is no separate record_struct_declaration node type.
+    it('recognizes record struct via record_declaration', () => {
+      const tree = parseCSharp('public record struct Point { }');
+      expect(extractor.isTypeDeclaration(tree.rootNode.child(0)!)).toBe(true);
+    });
+
+    it('extracts methods from record struct', () => {
+      const tree = parseCSharp(`
+        public record struct Measurement(double Value) {
+          public string Format() { return ""; }
+        }
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, csharpCtx);
+
+      expect(result).not.toBeNull();
+      expect(result!.ownerName).toBe('Measurement');
+      expect(result!.methods.find((m) => m.name === 'Format')).toBeDefined();
+    });
+
+    it('extracts primary constructor from record struct', () => {
+      const tree = parseCSharp('public record struct Point(int X, int Y);');
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, csharpCtx);
+
+      const ctor = result!.methods.find((m) => m.name === 'Point');
+      expect(ctor).toBeDefined();
+      expect(ctor!.parameters).toHaveLength(2);
+    });
+  });
+
+  describe('partial methods', () => {
+    it('detects partial method declaration (no body)', () => {
+      const tree = parseCSharp(`
+        public partial class Foo {
+          partial void OnChanged();
+        }
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, csharpCtx);
+
+      const m = result!.methods.find((m) => m.name === 'OnChanged');
+      expect(m).toBeDefined();
+      expect(m!.isPartial).toBe(true);
+      // partial declaration-only is not abstract — it's a compile-time slot
+      expect(m!.isAbstract).toBe(false);
+    });
+
+    it('detects partial method implementation (with body)', () => {
+      const tree = parseCSharp(`
+        public partial class Foo {
+          partial void OnChanged() { }
+        }
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, csharpCtx);
+
+      const m = result!.methods.find((m) => m.name === 'OnChanged');
+      expect(m).toBeDefined();
+      expect(m!.isPartial).toBe(true);
+    });
+
+    // When both declaration and implementation coexist in the same
+    // declaration_list, two MethodInfo entries are produced (one per node).
+    // Deduplication across partial class files is the caller's responsibility.
+    it('produces two entries when declaration and implementation coexist', () => {
+      const tree = parseCSharp(`
+        public partial class Foo {
+          partial void OnChanged();
+          partial void OnChanged() { }
+        }
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, csharpCtx);
+
+      const partials = result!.methods.filter((m) => m.name === 'OnChanged');
+      expect(partials).toHaveLength(2);
+      for (const m of partials) {
+        expect(m.isPartial).toBe(true);
+      }
+    });
+
+    // Generic method type parameters are stripped from the name.
+    // public T GetValue<T>() → name: 'GetValue' (no <T>).
+    // This is intentional — the call graph uses names, not signatures.
+    it('generic method type parameters are stripped from name', () => {
+      const tree = parseCSharp(`
+        public class Repo {
+          public T GetValue<T>() { return default; }
+        }
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, csharpCtx);
+
+      expect(result!.methods[0].name).toBe('GetValue');
     });
   });
 });
