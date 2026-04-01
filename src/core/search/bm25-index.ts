@@ -73,7 +73,7 @@ export const searchFTSFromLbug = async (
     // Use MCP connection pool via dynamic import
     // IMPORTANT: FTS queries run sequentially to avoid connection contention.
     // The MCP pool supports multiple connections, but FTS is best run serially.
-    const { executeQuery } = await import('../../mcp/core/lbug-adapter.js');
+    const { executeQuery } = await import('../lbug/pool-adapter.js');
     const executor = (cypher: string) => executeQuery(repoId, cypher);
     fileResults = await queryFTSViaExecutor(executor, 'File', 'file_fts', query, limit);
     functionResults = await queryFTSViaExecutor(executor, 'Function', 'function_fts', query, limit);

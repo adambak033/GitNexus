@@ -128,13 +128,13 @@ export function withTestLbugDB(
     if (options?.poolAdapter) {
       const coreDb = adapter.getDatabase();
       if (!coreDb) throw new Error('withTestLbugDB: core adapter has no open Database');
-      const { initLbugWithDb } = await import('../../src/mcp/core/lbug-adapter.js');
+      const { initLbugWithDb } = await import('../../src/core/lbug/pool-adapter.js');
       await initLbugWithDb(repoId, coreDb, dbPath);
     }
 
     const cleanup = async () => {
       if (options?.poolAdapter) {
-        const poolAdapter = await import('../../src/mcp/core/lbug-adapter.js');
+        const poolAdapter = await import('../../src/core/lbug/pool-adapter.js');
         await poolAdapter.closeLbug(repoId);
       }
       await adapter.closeLbug();
