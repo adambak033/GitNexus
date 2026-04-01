@@ -66,4 +66,8 @@ function walk(dir, extensions, cb) {
 
 walk(DIST, ['.js', '.d.ts'], rewriteFile);
 
+// ── 5. Make CLI entry executable ────────────────────────────────────
+const cliEntry = path.join(DIST, 'cli', 'index.js');
+if (fs.existsSync(cliEntry)) fs.chmodSync(cliEntry, 0o755);
+
 console.log(`[build] done — rewrote ${rewritten} files.`);

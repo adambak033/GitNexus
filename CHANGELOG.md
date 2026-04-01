@@ -2,10 +2,16 @@
 
 All notable changes to GitNexus will be documented in this file.
 
-## [1.5.1] - 2026-04-01
+## [1.5.2] - 2026-04-01
 
 ### Fixed
 - **`gitnexus-shared` module not found** — `gitnexus-shared` was a `file:` workspace dependency never published to npm, causing `ERR_MODULE_NOT_FOUND` when installing `gitnexus` globally. The build now bundles shared code into `dist/_shared/` and rewrites imports to relative paths (#613)
+- **v1.5.1 publish regression** — npm's `prepare` lifecycle ran `tsc` after `prepack`, overwriting the rewritten imports before packing; both scripts now run the full build so the final tarball is always correct
+
+## [1.5.1] - 2026-04-01 [YANKED]
+
+### Fixed
+- Incomplete fix for `gitnexus-shared` bundling — `prepare` script overwrote rewritten imports during publish
 
 ## [1.5.0] - 2026-04-01
 

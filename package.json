@@ -1,6 +1,6 @@
 {
   "name": "gitnexus",
-  "version": "1.5.1",
+  "version": "1.5.2",
   "description": "Graph-powered code intelligence for AI agents. Index any codebase, query via MCP or CLI.",
   "author": "Abhigyan Patwari",
   "license": "PolyForm-Noncommercial-1.0.0",
@@ -46,8 +46,8 @@
     "test:integration": "vitest run test/integration",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
-    "prepare": "tsc",
-    "prepack": "npm run build && chmod +x dist/cli/index.js"
+    "prepare": "node scripts/build.js",
+    "prepack": "node scripts/build.js"
   },
   "dependencies": {
     "@huggingface/transformers": "^3.0.0",
