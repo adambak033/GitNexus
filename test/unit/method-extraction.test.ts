@@ -9,10 +9,12 @@ import {
   typescriptMethodConfig,
   javascriptMethodConfig,
 } from '../../src/core/ingestion/method-extractors/configs/typescript-javascript.js';
+import { cppMethodConfig } from '../../src/core/ingestion/method-extractors/configs/c-cpp.js';
 import type { MethodExtractorContext } from '../../src/core/ingestion/method-types.js';
 import Parser from 'tree-sitter';
 import Java from 'tree-sitter-java';
 import CSharp from 'tree-sitter-c-sharp';
+import CPP from 'tree-sitter-cpp';
 import TypeScript from 'tree-sitter-typescript';
 import JavaScript from 'tree-sitter-javascript';
 import { SupportedLanguages } from '../../src/config/supported-languages.js';
@@ -1905,6 +1907,492 @@ describe('JavaScript MethodExtractor', () => {
 
       expect(result!.methods[0].isAsync).toBe(true);
       expect(result!.methods[0].name).toBe('fetch');
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// C++
+// ---------------------------------------------------------------------------
+
+const parseCPP = (code: string) => {
+  parser.setLanguage(CPP);
+  return parser.parse(code);
+};
+
+const cppCtx: MethodExtractorContext = {
+  filePath: 'Test.cpp',
+  language: SupportedLanguages.CPlusPlus,
+};
+
+describe('C++ MethodExtractor', () => {
+  const extractor = createMethodExtractor(cppMethodConfig);
+
+  describe('isTypeDeclaration', () => {
+    it('recognizes class_specifier', () => {
+      const tree = parseCPP('class Foo {};');
+      expect(extractor.isTypeDeclaration(tree.rootNode.child(0)!)).toBe(true);
+    });
+
+    it('recognizes struct_specifier', () => {
+      const tree = parseCPP('struct Bar {};');
+      expect(extractor.isTypeDeclaration(tree.rootNode.child(0)!)).toBe(true);
+    });
+
+    it('recognizes union_specifier', () => {
+      const tree = parseCPP('union Variant {};');
+      expect(extractor.isTypeDeclaration(tree.rootNode.child(0)!)).toBe(true);
+    });
+
+    it('rejects function_definition', () => {
+      const tree = parseCPP('void foo() {}');
+      expect(extractor.isTypeDeclaration(tree.rootNode.child(0)!)).toBe(false);
+    });
+  });
+
+  describe('extract', () => {
+    it('extracts pure virtual method as isAbstract and isVirtual', () => {
+      const tree = parseCPP(`
+        class Shape {
+        public:
+          virtual double area() const = 0;
+        };
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, cppCtx);
+
+      expect(result).not.toBeNull();
+      expect(result!.ownerName).toBe('Shape');
+      expect(result!.methods).toHaveLength(1);
+
+      const m = result!.methods[0];
+      expect(m.name).toBe('area');
+      expect(m.returnType).toBe('double');
+      expect(m.isAbstract).toBe(true);
+      expect(m.isVirtual).toBe(true);
+      expect(m.visibility).toBe('public');
+    });
+
+    it('extracts virtual non-pure method as isAbstract false', () => {
+      const tree = parseCPP(`
+        class Base {
+        public:
+          virtual void draw() {}
+        };
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, cppCtx);
+
+      const m = result!.methods[0];
+      expect(m.name).toBe('draw');
+      expect(m.isAbstract).toBe(false);
+      expect(m.isVirtual).toBe(true);
+    });
+
+    it('extracts final method', () => {
+      const tree = parseCPP(`
+        class Derived {
+        public:
+          void process() final;
+        };
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, cppCtx);
+
+      expect(result!.methods[0].name).toBe('process');
+      expect(result!.methods[0].isFinal).toBe(true);
+      // final is only legal on virtual functions — isVirtual must be true
+      expect(result!.methods[0].isVirtual).toBe(true);
+    });
+
+    it('extracts override method', () => {
+      const tree = parseCPP(`
+        class Child {
+        public:
+          void draw() override {}
+        };
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, cppCtx);
+
+      expect(result!.methods[0].name).toBe('draw');
+      expect(result!.methods[0].isOverride).toBe(true);
+      // override is only legal on virtual functions — isVirtual must be true
+      expect(result!.methods[0].isVirtual).toBe(true);
+    });
+
+    it('non-virtual method has isVirtual false', () => {
+      const tree = parseCPP(`
+        class Plain {
+        public:
+          void bar();
+        };
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, cppCtx);
+
+      expect(result!.methods[0].isVirtual).toBe(undefined);
+    });
+
+    it('extracts static method', () => {
+      const tree = parseCPP(`
+        class Factory {
+        public:
+          static Factory* create();
+        };
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, cppCtx);
+
+      expect(result!.methods[0].name).toBe('create');
+      expect(result!.methods[0].isStatic).toBe(true);
+      expect(result!.methods[0].returnType).toBe('Factory');
+    });
+
+    it('extracts parameters with types including pointer and reference', () => {
+      const tree = parseCPP(`
+        class Handler {
+        public:
+          void process(int x, const char* name, double& ref);
+        };
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, cppCtx);
+
+      const params = result!.methods[0].parameters;
+      expect(params).toHaveLength(3);
+      expect(params[0].name).toBe('x');
+      expect(params[0].type).toBe('int');
+      expect(params[1].name).toBe('name');
+      expect(params[1].type).toBe('char');
+      expect(params[2].name).toBe('ref');
+      expect(params[2].type).toBe('double');
+    });
+
+    it('extracts optional parameter with default value', () => {
+      const tree = parseCPP(`
+        class Config {
+        public:
+          void set(int value, int priority = 0);
+        };
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, cppCtx);
+
+      const params = result!.methods[0].parameters;
+      expect(params).toHaveLength(2);
+      expect(params[0].isOptional).toBe(false);
+      expect(params[1].name).toBe('priority');
+      expect(params[1].isOptional).toBe(true);
+    });
+
+    it('extracts access specifier visibility correctly', () => {
+      const tree = parseCPP(`
+        class Account {
+        public:
+          void deposit(int amount);
+        private:
+          void validate();
+        protected:
+          void notify();
+        };
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, cppCtx);
+
+      expect(result!.methods).toHaveLength(3);
+      const deposit = result!.methods.find((m) => m.name === 'deposit');
+      const validate = result!.methods.find((m) => m.name === 'validate');
+      const notify = result!.methods.find((m) => m.name === 'notify');
+      expect(deposit!.visibility).toBe('public');
+      expect(validate!.visibility).toBe('private');
+      expect(notify!.visibility).toBe('protected');
+    });
+
+    it('defaults to private for class without access specifier', () => {
+      const tree = parseCPP(`
+        class Foo {
+          void bar();
+        };
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, cppCtx);
+
+      expect(result!.methods[0].visibility).toBe('private');
+    });
+
+    it('defaults to public for struct without access specifier', () => {
+      const tree = parseCPP(`
+        struct Foo {
+          void bar();
+        };
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, cppCtx);
+
+      expect(result!.methods[0].visibility).toBe('public');
+    });
+
+    it('extracts destructor', () => {
+      const tree = parseCPP(`
+        class Resource {
+        public:
+          ~Resource();
+        };
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, cppCtx);
+
+      expect(result!.methods[0].name).toBe('~Resource');
+    });
+
+    it('extracts constructor', () => {
+      const tree = parseCPP(`
+        class Point {
+        public:
+          Point(int x, int y);
+        };
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, cppCtx);
+
+      expect(result!.methods).toHaveLength(1);
+      expect(result!.methods[0].name).toBe('Point');
+      expect(result!.methods[0].parameters).toHaveLength(2);
+    });
+
+    it('returns empty methods for class with only data members', () => {
+      const tree = parseCPP(`
+        class Data {
+          int x;
+          int y;
+        };
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, cppCtx);
+
+      // field_declaration without function_declarator → extractName returns undefined → skipped
+      expect(result).not.toBeNull();
+      expect(result!.methods).toHaveLength(0);
+    });
+
+    it('extracts double-pointer parameter name correctly', () => {
+      const tree = parseCPP(`
+        class Allocator {
+        public:
+          void alloc(int** ptr, char** argv);
+        };
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, cppCtx);
+
+      const params = result!.methods[0].parameters;
+      expect(params).toHaveLength(2);
+      expect(params[0].name).toBe('ptr');
+      expect(params[0].type).toBe('int');
+      expect(params[1].name).toBe('argv');
+    });
+
+    it('extracts template methods from class body with correct visibility', () => {
+      const tree = parseCPP(`
+        class Buffer {
+        public:
+          template<typename T>
+          void push(T value);
+          template<typename T>
+          T get(int index) { return T(); }
+        private:
+          template<typename T>
+          void internal(T x);
+        };
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, cppCtx);
+
+      expect(result!.methods).toHaveLength(3);
+      const push = result!.methods.find((m) => m.name === 'push');
+      const get = result!.methods.find((m) => m.name === 'get');
+      const internal = result!.methods.find((m) => m.name === 'internal');
+      expect(push).toBeDefined();
+      expect(push!.parameters).toHaveLength(1);
+      expect(push!.parameters[0].name).toBe('value');
+      expect(push!.visibility).toBe('public');
+      expect(get).toBeDefined();
+      expect(get!.parameters).toHaveLength(1);
+      expect(get!.parameters[0].name).toBe('index');
+      expect(get!.visibility).toBe('public');
+      expect(internal).toBeDefined();
+      expect(internal!.visibility).toBe('private');
+    });
+
+    it('extracts methods from union_specifier', () => {
+      const tree = parseCPP(`
+        union Variant {
+          void clear();
+          int asInt() const;
+        };
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, cppCtx);
+
+      expect(result).not.toBeNull();
+      expect(result!.ownerName).toBe('Variant');
+      expect(result!.methods).toHaveLength(2);
+      // Union default visibility is public (like struct)
+      expect(result!.methods[0].visibility).toBe('public');
+      expect(result!.methods[1].visibility).toBe('public');
+    });
+
+    it('suppresses = delete special members from extraction', () => {
+      const tree = parseCPP(`
+        class NonCopyable {
+        public:
+          void doWork();
+          NonCopyable(const NonCopyable&) = delete;
+          NonCopyable& operator=(const NonCopyable&) = delete;
+        };
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, cppCtx);
+
+      expect(result!.methods).toHaveLength(1);
+      expect(result!.methods[0].name).toBe('doWork');
+    });
+
+    it('suppresses = default special members from extraction', () => {
+      const tree = parseCPP(`
+        class Widget {
+        public:
+          Widget() = default;
+          ~Widget() = default;
+          void paint();
+        };
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, cppCtx);
+
+      expect(result!.methods).toHaveLength(1);
+      expect(result!.methods[0].name).toBe('paint');
+    });
+
+    it('does not suppress = 0 (pure virtual) as deleted/defaulted', () => {
+      const tree = parseCPP(`
+        class Shape {
+        public:
+          virtual double area() = 0;
+        };
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, cppCtx);
+
+      expect(result!.methods).toHaveLength(1);
+      expect(result!.methods[0].name).toBe('area');
+      expect(result!.methods[0].isAbstract).toBe(true);
+    });
+
+    it('extracts operator overloads', () => {
+      const tree = parseCPP(`
+        class Vec {
+        public:
+          Vec operator+(const Vec& rhs) const;
+          bool operator==(const Vec& rhs) const;
+          Vec& operator<<(int val);
+        };
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, cppCtx);
+
+      expect(result!.methods).toHaveLength(3);
+      const names = result!.methods.map((m) => m.name);
+      expect(names).toContain('operator+');
+      expect(names).toContain('operator==');
+      expect(names).toContain('operator<<');
+
+      const plus = result!.methods.find((m) => m.name === 'operator+')!;
+      expect(plus.returnType).toBe('Vec');
+      expect(plus.parameters).toHaveLength(1);
+      expect(plus.parameters[0].name).toBe('rhs');
+    });
+
+    it('extracts method with deep pointer return type', () => {
+      const tree = parseCPP(`
+        class Matrix {
+        public:
+          int** getBuffer();
+          const char* getName();
+        };
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, cppCtx);
+
+      expect(result!.methods).toHaveLength(2);
+      expect(result!.methods[0].name).toBe('getBuffer');
+      expect(result!.methods[0].returnType).toBe('int');
+      expect(result!.methods[1].name).toBe('getName');
+    });
+
+    it('defaults to private visibility for class, public for struct', () => {
+      const classTree = parseCPP(`
+        class Foo {
+          void secret();
+        };
+      `);
+      const classResult = extractor.extract(classTree.rootNode.child(0)!, cppCtx);
+      expect(classResult!.methods[0].name).toBe('secret');
+      expect(classResult!.methods[0].visibility).toBe('private');
+
+      const structTree = parseCPP(`
+        struct Bar {
+          void open();
+        };
+      `);
+      const structResult = extractor.extract(structTree.rootNode.child(0)!, cppCtx);
+      expect(structResult!.methods[0].name).toBe('open');
+      expect(structResult!.methods[0].visibility).toBe('public');
+    });
+
+    it('tracks visibility across multiple access specifier sections', () => {
+      const tree = parseCPP(`
+        class Mixed {
+        public:
+          void pub1();
+        private:
+          void priv1();
+          void priv2();
+        protected:
+          void prot1();
+        public:
+          void pub2();
+        };
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, cppCtx);
+
+      expect(result!.methods).toHaveLength(5);
+      const byName = Object.fromEntries(result!.methods.map((m) => [m.name, m.visibility]));
+      expect(byName['pub1']).toBe('public');
+      expect(byName['priv1']).toBe('private');
+      expect(byName['priv2']).toBe('private');
+      expect(byName['prot1']).toBe('protected');
+      expect(byName['pub2']).toBe('public');
+    });
+
+    it('extracts trailing return type instead of auto', () => {
+      const tree = parseCPP(`
+        class Container {
+        public:
+          auto begin() -> iterator;
+          auto size() -> size_t;
+        };
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, cppCtx);
+
+      expect(result!.methods).toHaveLength(2);
+      expect(result!.methods[0].name).toBe('begin');
+      expect(result!.methods[0].returnType).toBe('iterator');
+      expect(result!.methods[1].name).toBe('size');
+      expect(result!.methods[1].returnType).toBe('size_t');
     });
   });
 });
