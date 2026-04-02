@@ -89,6 +89,122 @@ service HealthCheck {
       expect(contracts).toHaveLength(1);
       expect(contracts[0].contractId).toBe('grpc::HealthCheck/Check');
     });
+
+    it('test_extract_proto_with_google_api_http_nested_braces', async () => {
+      writeFile(
+        'api/gateway.proto',
+        `syntax = "proto3";
+package gateway.v1;
+
+import "google/api/annotations.proto";
+
+service GatewayService {
+  rpc GetUser (GetUserRequest) returns (UserResponse) {
+    option (google.api.http) = {
+      get: "/v1/users/{user_id}"
+    };
+  }
+  rpc CreateUser (CreateUserRequest) returns (UserResponse) {
+    option (google.api.http) = {
+      post: "/v1/users"
+      body: "*"
+    };
+  }
+}`,
+      );
+
+      const contracts = await extractor.extract(null, tmpDir, makeRepo(tmpDir));
+      const providers = contracts.filter(
+        (c) => c.role === 'provider' && c.symbolRef.filePath === 'api/gateway.proto',
+      );
+
+      expect(providers).toHaveLength(2);
+      const ids = providers.map((c) => c.contractId).sort();
+      expect(ids).toEqual([
+        'grpc::gateway.v1.GatewayService/CreateUser',
+        'grpc::gateway.v1.GatewayService/GetUser',
+      ]);
+    });
+
+    it('test_extract_proto_with_multiple_services', async () => {
+      writeFile(
+        'api/multi.proto',
+        `syntax = "proto3";
+package multi;
+
+service ServiceA {
+  rpc MethodA (Req) returns (Res);
+}
+
+service ServiceB {
+  rpc MethodB1 (Req) returns (Res);
+  rpc MethodB2 (Req) returns (Res);
+}`,
+      );
+
+      const contracts = await extractor.extract(null, tmpDir, makeRepo(tmpDir));
+      const providers = contracts.filter(
+        (c) => c.role === 'provider' && c.symbolRef.filePath === 'api/multi.proto',
+      );
+
+      expect(providers).toHaveLength(3);
+      const ids = providers.map((c) => c.contractId).sort();
+      expect(ids).toEqual([
+        'grpc::multi.ServiceA/MethodA',
+        'grpc::multi.ServiceB/MethodB1',
+        'grpc::multi.ServiceB/MethodB2',
+      ]);
+    });
+
+    it('test_extract_proto_with_nested_option_blocks_in_rpc', async () => {
+      writeFile(
+        'api/nested.proto',
+        `syntax = "proto3";
+package nested;
+
+service DeepService {
+  rpc DeepMethod (Req) returns (Res) {
+    option (google.api.http) = {
+      post: "/v1/deep"
+      body: "*"
+      additional_bindings {
+        get: "/v1/deep/{id}"
+      }
+    };
+  }
+}`,
+      );
+
+      const contracts = await extractor.extract(null, tmpDir, makeRepo(tmpDir));
+      const providers = contracts.filter(
+        (c) => c.role === 'provider' && c.symbolRef.filePath === 'api/nested.proto',
+      );
+
+      expect(providers).toHaveLength(1);
+      expect(providers[0].contractId).toBe('grpc::nested.DeepService/DeepMethod');
+    });
+
+    it('test_extract_proto_malformed_unclosed_brace_skips_service', async () => {
+      writeFile(
+        'api/broken.proto',
+        `syntax = "proto3";
+package broken;
+
+service IncompleteService {
+  rpc SomeMethod (Req) returns (Res);
+  // Missing closing brace — EOF before depth returns to 0
+`,
+      );
+
+      // Should not throw; incomplete service is silently skipped
+      const contracts = await extractor.extract(null, tmpDir, makeRepo(tmpDir));
+      const providers = contracts.filter(
+        (c) => c.role === 'provider' && c.symbolRef.filePath === 'api/broken.proto',
+      );
+
+      // The old regex would find partial match; the new parser should skip it
+      expect(providers).toHaveLength(0);
+    });
   });
 
   describe('Go server detection', () => {

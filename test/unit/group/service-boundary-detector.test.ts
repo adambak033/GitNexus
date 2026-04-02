@@ -149,6 +149,71 @@ describe('ServiceBoundaryDetector', () => {
       expect(boundaries).toHaveLength(1);
       expect(boundaries[0].markers).toContain('pyproject.toml');
     });
+
+    it('test_detect_skips_vendor_directory', async () => {
+      writeFile('services/auth/package.json', '{}');
+      writeFile('services/auth/src/index.ts', '');
+      // vendor should be skipped — its contents should not create a boundary
+      writeFile('vendor/some-dep/package.json', '{}');
+      writeFile('vendor/some-dep/src/lib.go', '');
+
+      const boundaries = await detectServiceBoundaries(tmpDir);
+
+      const paths = boundaries.map((b) => b.servicePath);
+      expect(paths).toContain('services/auth');
+      expect(paths).not.toContain('vendor/some-dep');
+    });
+
+    it('test_detect_skips_target_directory', async () => {
+      writeFile('services/api/go.mod', 'module api');
+      writeFile('services/api/main.go', '');
+      writeFile('target/classes/Main.java', '');
+      writeFile('target/pom.xml', '<project/>');
+
+      const boundaries = await detectServiceBoundaries(tmpDir);
+
+      const paths = boundaries.map((b) => b.servicePath);
+      expect(paths).toContain('services/api');
+      expect(paths).not.toContain('target');
+    });
+
+    it('test_detect_skips_pycache_directory', async () => {
+      writeFile('services/ml/pyproject.toml', '[project]');
+      writeFile('services/ml/model.py', '');
+      // __pycache__ with a marker + source files — would be detected as
+      // a boundary if not excluded, since it has package.json + .py file
+      writeFile('__pycache__/package.json', '{}');
+      writeFile('__pycache__/cached.py', '');
+
+      const boundaries = await detectServiceBoundaries(tmpDir);
+
+      const paths = boundaries.map((b) => b.servicePath);
+      expect(paths).toContain('services/ml');
+      expect(paths.every((p) => !p.includes('__pycache__'))).toBe(true);
+    });
+
+    it('test_detect_skips_dotfile_directories_regression', async () => {
+      writeFile('services/api/package.json', '{}');
+      writeFile('services/api/src/index.ts', '');
+      writeFile('.hidden/package.json', '{}');
+      writeFile('.hidden/src/index.ts', '');
+
+      const boundaries = await detectServiceBoundaries(tmpDir);
+
+      const paths = boundaries.map((b) => b.servicePath);
+      expect(paths).toContain('services/api');
+      expect(paths).not.toContain('.hidden');
+    });
+
+    it('test_detect_does_not_skip_regular_source_directories', async () => {
+      writeFile('services/api/package.json', '{}');
+      writeFile('services/api/src/index.ts', '');
+
+      const boundaries = await detectServiceBoundaries(tmpDir);
+
+      expect(boundaries).toHaveLength(1);
+      expect(boundaries[0].serviceName).toBe('api');
+    });
   });
 
   describe('assignService', () => {

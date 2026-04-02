@@ -25,6 +25,36 @@ function serviceOnlyContractId(serviceName: string): string {
   return `grpc::${serviceName}/*`;
 }
 
+function extractServiceBlocks(content: string): Array<{ name: string; body: string }> {
+  const results: Array<{ name: string; body: string }> = [];
+  // v1: brace-depth only — braces inside comments or string literals are not filtered (see spec Fix 2)
+  const headerRe = /service\s+(\w+)\s*\{/g;
+  let headerMatch: RegExpExecArray | null;
+
+  while ((headerMatch = headerRe.exec(content)) !== null) {
+    const serviceName = headerMatch[1];
+    const bodyStart = headerMatch.index + headerMatch[0].length;
+    let depth = 1;
+    let pos = bodyStart;
+
+    while (pos < content.length && depth > 0) {
+      const ch = content[pos];
+      if (ch === '{') depth++;
+      else if (ch === '}') depth--;
+      pos++;
+    }
+
+    // If EOF before depth returns to 0, skip incomplete service
+    if (depth !== 0) continue;
+
+    // body is between opening { (consumed by regex) and closing } (pos is one past it)
+    const body = content.slice(bodyStart, pos - 1);
+    results.push({ name: serviceName, body });
+  }
+
+  return results;
+}
+
 function makeContract(
   cid: string,
   role: 'provider' | 'consumer',
@@ -104,12 +134,7 @@ export class GrpcExtractor implements ContractExtractor {
     const pkgMatch = content.match(/^package\s+([\w.]+)\s*;/m);
     const pkg = pkgMatch ? pkgMatch[1] : '';
 
-    const serviceRe = /service\s+(\w+)\s*\{([^}]*)}/gs;
-    let svcMatch: RegExpExecArray | null;
-    while ((svcMatch = serviceRe.exec(content)) !== null) {
-      const serviceName = svcMatch[1];
-      const body = svcMatch[2];
-
+    for (const { name: serviceName, body } of extractServiceBlocks(content)) {
       const rpcRe = /rpc\s+(\w+)\s*\(/g;
       let rpcMatch: RegExpExecArray | null;
       while ((rpcMatch = rpcRe.exec(body)) !== null) {

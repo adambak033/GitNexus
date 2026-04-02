@@ -50,6 +50,23 @@ const SOURCE_EXTENSIONS = new Set([
   '.proto',
 ]);
 
+const EXCLUDED_DIRS = new Set([
+  'node_modules',
+  'vendor',
+  'target',
+  'build',
+  'dist',
+  '__pycache__',
+  '.venv',
+  'venv',
+  '.tox',
+  '.mypy_cache',
+  '.gradle',
+  '.mvn',
+  'out',
+  'bin',
+]);
+
 export async function detectServiceBoundaries(repoPath: string): Promise<ServiceBoundary[]> {
   const boundaries: ServiceBoundary[] = [];
   await walkForBoundaries(repoPath, repoPath, boundaries);
@@ -75,7 +92,7 @@ async function walkForBoundaries(
   const subdirs: string[] = [];
 
   for (const entry of entries) {
-    if (entry.name.startsWith('.') || entry.name === 'node_modules') continue;
+    if (entry.name.startsWith('.') || EXCLUDED_DIRS.has(entry.name)) continue;
 
     if (entry.isDirectory()) {
       subdirs.push(path.join(dir, entry.name));
@@ -127,7 +144,7 @@ async function hasSourceFilesInSubdirs(subdirs: string[]): Promise<boolean> {
         const ext = path.extname(entry.name).toLowerCase();
         if (SOURCE_EXTENSIONS.has(ext)) return true;
       }
-      if (entry.isDirectory() && !entry.name.startsWith('.') && entry.name !== 'node_modules') {
+      if (entry.isDirectory() && !entry.name.startsWith('.') && !EXCLUDED_DIRS.has(entry.name)) {
         const deeper = await hasSourceFilesInSubdirs([path.join(subdir, entry.name)]);
         if (deeper) return true;
       }

@@ -8,6 +8,8 @@ import {
   writeContractRegistry,
   readContractRegistry,
   listGroups,
+  createGroupDir,
+  validateGroupName,
 } from '../../../src/core/group/storage.js';
 import type { ContractRegistry } from '../../../src/core/group/types.js';
 
@@ -77,5 +79,60 @@ describe('Group storage', () => {
 
     const groups = await listGroups(tmpDir);
     expect(groups.sort()).toEqual(['company', 'personal']);
+  });
+
+  describe('validateGroupName', () => {
+    it('test_validateGroupName_traversal_path_throws', () => {
+      expect(() => validateGroupName('../../evil')).toThrow(/Invalid group name/);
+    });
+
+    it('test_validateGroupName_slash_in_name_throws', () => {
+      expect(() => validateGroupName('foo/bar')).toThrow(/Invalid group name/);
+    });
+
+    it('test_validateGroupName_empty_string_throws', () => {
+      expect(() => validateGroupName('')).toThrow(/Invalid group name/);
+    });
+
+    it('test_validateGroupName_starts_with_dash_throws', () => {
+      expect(() => validateGroupName('-leading-dash')).toThrow(/Invalid group name/);
+    });
+
+    it('test_validateGroupName_starts_with_underscore_throws', () => {
+      expect(() => validateGroupName('_leading')).toThrow(/Invalid group name/);
+    });
+
+    it('test_validateGroupName_dots_throws', () => {
+      expect(() => validateGroupName('com.example')).toThrow(/Invalid group name/);
+    });
+
+    it('test_validateGroupName_valid_alphanumeric_passes', () => {
+      expect(() => validateGroupName('my-group_01')).not.toThrow();
+    });
+
+    it('test_validateGroupName_single_char_passes', () => {
+      expect(() => validateGroupName('A')).not.toThrow();
+    });
+
+    it('test_validateGroupName_all_digits_passes', () => {
+      expect(() => validateGroupName('123')).not.toThrow();
+    });
+  });
+
+  describe('getGroupDir rejects invalid names', () => {
+    it('test_getGroupDir_traversal_throws', () => {
+      expect(() => getGroupDir(tmpDir, '../../etc')).toThrow(/Invalid group name/);
+    });
+
+    it('test_getGroupDir_valid_name_returns_path', () => {
+      const dir = getGroupDir(tmpDir, 'company');
+      expect(dir).toBe(path.join(tmpDir, 'groups', 'company'));
+    });
+  });
+
+  describe('createGroupDir rejects invalid names', () => {
+    it('test_createGroupDir_traversal_throws', async () => {
+      await expect(createGroupDir(tmpDir, '../evil')).rejects.toThrow(/Invalid group name/);
+    });
   });
 });

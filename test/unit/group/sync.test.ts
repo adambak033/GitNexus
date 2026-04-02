@@ -157,6 +157,51 @@ describe('syncGroup', () => {
     expect(result).toBeDefined();
   });
 
+  it('test_syncGroup_closes_only_opened_pools', async () => {
+    const config = makeConfig({
+      'app/backend': 'backend-repo',
+      'app/frontend': 'frontend-repo',
+    });
+
+    const closedIds: string[] = [];
+
+    const { vi } = await import('vitest');
+    const poolAdapter = await import('../../../src/core/lbug/pool-adapter.js');
+    const initSpy = vi.spyOn(poolAdapter, 'initLbug').mockResolvedValue(undefined);
+    const closeSpy = vi.spyOn(poolAdapter, 'closeLbug').mockImplementation(async (id?: string) => {
+      if (id) closedIds.push(id);
+    });
+
+    try {
+      await syncGroup(config, {
+        resolveRepoHandle: async (_name, groupPath) => ({
+          id: groupPath.replace(/\//g, '-'),
+          path: groupPath,
+          repoPath: '/tmp/' + groupPath,
+          storagePath: '/tmp/' + groupPath + '/.gitnexus',
+        }),
+        skipWrite: true,
+      }).catch(() => {});
+
+      // closeLbug must have been called at least once with specific pool ids
+      expect(closeSpy.mock.calls.length).toBeGreaterThan(0);
+      expect(closedIds).toContain('app-backend');
+      expect(closedIds).toContain('app-frontend');
+
+      // Every call must have a truthy string id
+      for (const id of closedIds) {
+        expect(id).toBeTruthy();
+        expect(typeof id).toBe('string');
+      }
+      // No blanket close (no-arg or empty-string or undefined)
+      const blanketCalls = closeSpy.mock.calls.filter((args) => args.length === 0 || !args[0]);
+      expect(blanketCalls).toHaveLength(0);
+    } finally {
+      initSpy.mockRestore();
+      closeSpy.mockRestore();
+    }
+  });
+
   it('writes registry to groupDir when skipWrite is false', async () => {
     const tmpDir = path.join(os.tmpdir(), `gitnexus-sync-write-${Date.now()}`);
     fs.mkdirSync(tmpDir, { recursive: true });

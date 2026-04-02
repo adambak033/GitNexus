@@ -14,7 +14,18 @@ export function getGroupsBaseDir(gitnexusDir?: string): string {
   return path.join(gitnexusDir || getDefaultGitnexusDir(), 'groups');
 }
 
+const GROUP_NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9_-]*$/;
+
+export function validateGroupName(name: string): void {
+  if (!GROUP_NAME_RE.test(name)) {
+    throw new Error(
+      `Invalid group name "${name}". Names must start with a letter or digit and contain only [a-zA-Z0-9_-].`,
+    );
+  }
+}
+
 export function getGroupDir(gitnexusDir: string, groupName: string): string {
+  validateGroupName(groupName);
   return path.join(gitnexusDir, 'groups', groupName);
 }
 

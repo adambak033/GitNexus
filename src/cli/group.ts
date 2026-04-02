@@ -157,35 +157,30 @@ export function registerGroupCommands(program: Command): void {
       const { getGroupDir, getDefaultGitnexusDir } = await import('../core/group/storage.js');
       const { loadGroupConfig } = await import('../core/group/config-parser.js');
       const { syncGroup } = await import('../core/group/sync.js');
-      const { closeLbug } = await import('../core/lbug/pool-adapter.js');
 
-      try {
-        const groupDir = getGroupDir(getDefaultGitnexusDir(), name);
-        const config = await loadGroupConfig(groupDir);
+      const groupDir = getGroupDir(getDefaultGitnexusDir(), name);
+      const config = await loadGroupConfig(groupDir);
 
-        console.log(`Syncing group "${name}" (${Object.keys(config.repos).length} repos)...\n`);
+      console.log(`Syncing group "${name}" (${Object.keys(config.repos).length} repos)...\n`);
 
-        const result = await syncGroup(config, {
-          groupDir,
-          allowStale: Boolean(opts.allowStale),
-          verbose: Boolean(opts.verbose),
-          skipEmbeddings: Boolean(opts.skipEmbeddings),
-          exactOnly: Boolean(opts.exactOnly),
-        });
+      const result = await syncGroup(config, {
+        groupDir,
+        allowStale: Boolean(opts.allowStale),
+        verbose: Boolean(opts.verbose),
+        skipEmbeddings: Boolean(opts.skipEmbeddings),
+        exactOnly: Boolean(opts.exactOnly),
+      });
 
-        if (opts.json) {
-          console.log(JSON.stringify(result, null, 2));
-        } else {
-          console.log(`\nMatching cascade:`);
-          const exactLinks = result.crossLinks.filter((l) => l.matchType === 'exact');
-          console.log(`  exact:     ${exactLinks.length} cross-links (confidence 1.0)`);
-          console.log(`  unmatched: ${result.unmatched.length} contracts`);
-          console.log(
-            `\nWrote contracts.json (${result.contracts.length} contracts, ${result.crossLinks.length} cross-links)`,
-          );
-        }
-      } finally {
-        await closeLbug().catch(() => {});
+      if (opts.json) {
+        console.log(JSON.stringify(result, null, 2));
+      } else {
+        console.log(`\nMatching cascade:`);
+        const exactLinks = result.crossLinks.filter((l) => l.matchType === 'exact');
+        console.log(`  exact:     ${exactLinks.length} cross-links (confidence 1.0)`);
+        console.log(`  unmatched: ${result.unmatched.length} contracts`);
+        console.log(
+          `\nWrote contracts.json (${result.contracts.length} contracts, ${result.crossLinks.length} cross-links)`,
+        );
       }
     });
 
