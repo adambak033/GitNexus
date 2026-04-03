@@ -43,7 +43,8 @@ import {
   FUNCTION_NODE_TYPES,
   extractFunctionName,
   getDefinitionNodeFromCaptures,
-  findEnclosingClassId,
+  findEnclosingClassInfo,
+  type EnclosingClassInfo,
   getLabelFromCaptures,
   extractMethodSignature,
   findDescendant,
@@ -324,7 +325,7 @@ const setLanguage = (language: SupportedLanguages, filePath: string): void => {
 // a stored null (enclosing class/function not found = top-level).
 // ============================================================================
 
-const classIdCache = new Map<SyntaxNode, string | null>();
+const classIdCache = new Map<SyntaxNode, EnclosingClassInfo | null>();
 const functionIdCache = new Map<SyntaxNode, string | null>();
 const exportCache = new Map<SyntaxNode, boolean>();
 
@@ -351,6 +352,12 @@ function findEnclosingClassNode(node: SyntaxNode): SyntaxNode | null {
   let current = node.parent;
   while (current) {
     if (CLASS_CONTAINER_TYPES.has(current.type)) {
+      // Ruby singleton_class (class << self) has no name field — walk up to
+      // the enclosing class/module so the caller gets a node with a findable name.
+      if (current.type === 'singleton_class') {
+        current = current.parent;
+        continue;
+      }
       return current;
     }
     current = current.parent;
@@ -528,7 +535,10 @@ const findEnclosingFunctionId = (
           const override = provider.labelOverride(current, label);
           if (override !== null) finalLabel = override;
         }
-        const result = generateId(finalLabel, `${filePath}:${funcName}`);
+        // Qualify with enclosing class to match definition-phase node IDs
+        const classInfo = cachedFindEnclosingClassInfo(current, filePath);
+        const qualifiedName = classInfo ? `${classInfo.className}.${funcName}` : funcName;
+        const result = generateId(finalLabel, `${filePath}:${qualifiedName}`);
         functionIdCache.set(node, result);
         return result;
       }
@@ -544,7 +554,15 @@ const findEnclosingFunctionId = (
           const override = provider.labelOverride(current.previousSibling, finalLabel);
           if (override !== null) finalLabel = override;
         }
-        const result = generateId(finalLabel, `${filePath}:${customResult.funcName}`);
+        // Qualify custom result with enclosing class
+        const classInfo = cachedFindEnclosingClassInfo(
+          current.previousSibling ?? current,
+          filePath,
+        );
+        const qualifiedName = classInfo
+          ? `${classInfo.className}.${customResult.funcName}`
+          : customResult.funcName;
+        const result = generateId(finalLabel, `${filePath}:${qualifiedName}`);
         functionIdCache.set(node, result);
         return result;
       }
@@ -556,12 +574,15 @@ const findEnclosingFunctionId = (
   return null;
 };
 
-/** Cached wrapper for findEnclosingClassId — avoids repeated parent walks. */
-const cachedFindEnclosingClassId = (node: SyntaxNode, filePath: string): string | null => {
+/** Cached wrapper for findEnclosingClassInfo — avoids repeated parent walks. */
+const cachedFindEnclosingClassInfo = (
+  node: SyntaxNode,
+  filePath: string,
+): EnclosingClassInfo | null => {
   const cached = classIdCache.get(node);
   if (cached !== undefined) return cached;
 
-  const result = findEnclosingClassId(node, filePath);
+  const result = findEnclosingClassInfo(node, filePath);
   classIdCache.set(node, result);
   return result;
 };
@@ -1525,10 +1546,8 @@ const processFileGroup = (
             }
 
             if (routed.kind === 'properties') {
-              const propEnclosingClassId = cachedFindEnclosingClassId(
-                captureMap['call'],
-                file.path,
-              );
+              const propEnclosingInfo = cachedFindEnclosingClassInfo(captureMap['call'], file.path);
+              const propEnclosingClassId = propEnclosingInfo?.classId ?? null;
               // Enrich routed properties with FieldExtractor metadata
               let routedFieldMap: Map<string, FieldInfo> | undefined;
               if (provider.fieldExtractor && typeEnv) {
@@ -1544,7 +1563,10 @@ const processFileGroup = (
               }
               for (const item of routed.items) {
                 const routedFieldInfo = routedFieldMap?.get(item.propName);
-                const nodeId = generateId('Property', `${file.path}:${item.propName}`);
+                const propQualifiedName = propEnclosingInfo
+                  ? `${propEnclosingInfo.className}.${item.propName}`
+                  : item.propName;
+                const nodeId = generateId('Property', `${file.path}:${propQualifiedName}`);
                 result.nodes.push({
                   id: nodeId,
                   label: 'Property',
@@ -1737,7 +1759,23 @@ const processFileGroup = (
         : nameNode
           ? nameNode.startPosition.row + lineOffset
           : lineOffset;
-      const nodeId = generateId(nodeLabel, `${file.path}:${nodeName}`);
+
+      // Compute enclosing class BEFORE node ID — needed to qualify method IDs
+      const needsOwner =
+        nodeLabel === 'Method' ||
+        nodeLabel === 'Constructor' ||
+        nodeLabel === 'Property' ||
+        nodeLabel === 'Function';
+      const enclosingClassInfo = needsOwner
+        ? cachedFindEnclosingClassInfo(nameNode || definitionNode, file.path)
+        : null;
+      const enclosingClassId = enclosingClassInfo?.classId ?? null;
+
+      // Qualify method/property IDs with enclosing class name to avoid collisions
+      const qualifiedName = enclosingClassInfo
+        ? `${enclosingClassInfo.className}.${nodeName}`
+        : nodeName;
+      const nodeId = generateId(nodeLabel, `${file.path}:${qualifiedName}`);
 
       const description = provider.descriptionExtractor?.(nodeLabel, nodeName, captureMap);
 
@@ -1811,7 +1849,8 @@ const processFileGroup = (
             const info = methodMap?.get(`${nodeName}:${defLine}`);
             if (info) {
               enrichedByMethodExtractor = true;
-              parameterCount = info.parameters.length;
+              const hasVariadic = info.parameters.some((p) => p.isVariadic);
+              parameterCount = hasVariadic ? undefined : info.parameters.length;
               const types: string[] = [];
               let optionalCount = 0;
               for (const p of info.parameters) {
@@ -1820,7 +1859,9 @@ const processFileGroup = (
               }
               parameterTypes = types.length > 0 ? types : undefined;
               requiredParameterCount =
-                optionalCount > 0 ? parameterCount - optionalCount : undefined;
+                !hasVariadic && optionalCount > 0
+                  ? info.parameters.length - optionalCount
+                  : undefined;
               returnType = info.returnType ?? undefined;
               visibility = info.visibility;
               isStatic = info.isStatic;
@@ -1832,6 +1873,44 @@ const processFileGroup = (
               if (info.isPartial) isPartial = info.isPartial;
               if (info.annotations.length > 0) annotations = info.annotations;
             }
+          }
+        }
+
+        // For top-level methods (e.g. Go method_declaration), try extractFromNode
+        if (
+          !enrichedByMethodExtractor &&
+          provider.methodExtractor?.extractFromNode &&
+          definitionNode
+        ) {
+          const info = provider.methodExtractor.extractFromNode(definitionNode, {
+            filePath: file.path,
+            language,
+          });
+          if (info) {
+            enrichedByMethodExtractor = true;
+            const hasVariadic = info.parameters.some((p) => p.isVariadic);
+            parameterCount = hasVariadic ? undefined : info.parameters.length;
+            const types: string[] = [];
+            let optionalCount = 0;
+            for (const p of info.parameters) {
+              if (p.type !== null) types.push(p.type);
+              if (p.isOptional) optionalCount++;
+            }
+            parameterTypes = types.length > 0 ? types : undefined;
+            requiredParameterCount =
+              !hasVariadic && optionalCount > 0
+                ? info.parameters.length - optionalCount
+                : undefined;
+            returnType = info.returnType ?? undefined;
+            visibility = info.visibility;
+            isStatic = info.isStatic;
+            isAbstract = info.isAbstract;
+            isFinal = info.isFinal;
+            if (info.isVirtual) isVirtual = info.isVirtual;
+            if (info.isOverride) isOverride = info.isOverride;
+            if (info.isAsync) isAsync = info.isAsync;
+            if (info.isPartial) isPartial = info.isPartial;
+            if (info.annotations.length > 0) annotations = info.annotations;
           }
         }
 
@@ -1915,16 +1994,7 @@ const processFileGroup = (
         },
       });
 
-      // Compute enclosing class for Method/Constructor/Property/Function — used for both ownerId and HAS_METHOD
-      // Function is included because Kotlin/Rust/Python capture class methods as Function nodes
-      const needsOwner =
-        nodeLabel === 'Method' ||
-        nodeLabel === 'Constructor' ||
-        nodeLabel === 'Property' ||
-        nodeLabel === 'Function';
-      const enclosingClassId = needsOwner
-        ? cachedFindEnclosingClassId(nameNode || definitionNode, file.path)
-        : null;
+      // enclosingClassId already computed above (before nodeId generation)
 
       result.symbols.push({
         filePath: file.path,

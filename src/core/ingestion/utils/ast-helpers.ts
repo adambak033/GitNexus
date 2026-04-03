@@ -103,7 +103,14 @@ export const FUNCTION_DECLARATION_TYPES = new Set([
   'function_item',
 ]);
 
-/** AST node types that represent a class-like container (for HAS_METHOD edge extraction) */
+/**
+ * AST node types that represent a class-like container (for HAS_METHOD edge extraction).
+ *
+ * INVARIANT: When a language config adds a new node type to `typeDeclarationNodes`,
+ * that type must also be added here AND to `CONTAINER_TYPE_TO_LABEL` below,
+ * otherwise `findEnclosingClassNode` won't recognize it and methods may get
+ * orphaned HAS_METHOD edges or incorrect labels.
+ */
 export const CLASS_CONTAINER_TYPES = new Set([
   'class_declaration',
   'abstract_class_declaration',
@@ -118,10 +125,16 @@ export const CLASS_CONTAINER_TYPES = new Set([
   'enum_item',
   'class_definition',
   'trait_declaration',
+  // PHP
+  'enum_declaration',
   'protocol_declaration',
+  // Dart
+  'mixin_declaration',
+  'extension_declaration',
   // Ruby
   'class',
   'module',
+  'singleton_class', // Ruby: class << self
   // Kotlin
   'object_declaration',
   'companion_object',
@@ -140,10 +153,14 @@ export const CONTAINER_TYPE_TO_LABEL: Record<string, string> = {
   struct_item: 'Struct',
   enum_item: 'Enum',
   trait_declaration: 'Trait',
+  enum_declaration: 'Enum',
   record_declaration: 'Record',
   protocol_declaration: 'Interface',
+  mixin_declaration: 'Mixin',
+  extension_declaration: 'Extension',
   class: 'Class',
   module: 'Module',
+  singleton_class: 'Class', // Ruby: class << self inherits enclosing class name
   object_declaration: 'Class',
   companion_object: 'Class',
 };
@@ -206,33 +223,42 @@ export function getLabelFromCaptures(
   return 'CodeElement';
 }
 
-/** Walk up AST to find enclosing class/struct/interface/impl, return its generateId or null.
+/** Enclosing class info: both the generated node ID and the bare class name. */
+export interface EnclosingClassInfo {
+  classId: string; // e.g. "Class:animal.dart:Animal"
+  className: string; // e.g. "Animal"
+}
+
+/** Walk up AST to find enclosing class/struct/interface/impl, return its ID and name.
  *  For Go method_declaration nodes, extracts receiver type (e.g. `func (u *User) Save()` → User struct). */
-export const findEnclosingClassId = (node: SyntaxNode, filePath: string): string | null => {
+export const findEnclosingClassInfo = (
+  node: SyntaxNode,
+  filePath: string,
+): EnclosingClassInfo | null => {
   let current = node.parent;
   while (current) {
     // Go: method_declaration has a receiver parameter with the struct type
     if (current.type === 'method_declaration') {
       const receiver = current.childForFieldName?.('receiver');
       if (receiver) {
-        // receiver is a parameter_list: (u *User) or (u User)
         const paramDecl = receiver.namedChildren?.find?.(
           (c: SyntaxNode) => c.type === 'parameter_declaration',
         );
         if (paramDecl) {
           const typeNode = paramDecl.childForFieldName?.('type');
           if (typeNode) {
-            // Unwrap pointer_type (*User → User)
             const inner = typeNode.type === 'pointer_type' ? typeNode.firstNamedChild : typeNode;
             if (inner && (inner.type === 'type_identifier' || inner.type === 'identifier')) {
-              return generateId('Struct', `${filePath}:${inner.text}`);
+              return {
+                classId: generateId('Struct', `${filePath}:${inner.text}`),
+                className: inner.text,
+              };
             }
           }
         }
       }
     }
     // Go: type_declaration wrapping a struct_type (type User struct { ... })
-    // field_declaration → field_declaration_list → struct_type → type_spec → type_declaration
     if (current.type === 'type_declaration') {
       const typeSpec = current.children?.find((c: SyntaxNode) => c.type === 'type_spec');
       if (typeSpec) {
@@ -241,26 +267,66 @@ export const findEnclosingClassId = (node: SyntaxNode, filePath: string): string
           const nameNode = typeSpec.childForFieldName?.('name');
           if (nameNode) {
             const label = typeBody.type === 'struct_type' ? 'Struct' : 'Interface';
-            return generateId(label, `${filePath}:${nameNode.text}`);
+            return {
+              classId: generateId(label, `${filePath}:${nameNode.text}`),
+              className: nameNode.text,
+            };
           }
         }
       }
     }
     if (CLASS_CONTAINER_TYPES.has(current.type)) {
       // Rust impl_item: for `impl Trait for Struct {}`, pick the type after `for`
+      // NOTE: This impl_item ownership logic is duplicated in rust.ts:extractOwnerName.
+      // If modifying this block, update the other location too.
       if (current.type === 'impl_item') {
         const children = current.children ?? [];
         const forIdx = children.findIndex((c: SyntaxNode) => c.text === 'for');
         if (forIdx !== -1) {
           const nameNode = children
             .slice(forIdx + 1)
-            .find((c: SyntaxNode) => c.type === 'type_identifier' || c.type === 'identifier');
+            .find(
+              (c: SyntaxNode) =>
+                c.type === 'type_identifier' ||
+                c.type === 'scoped_type_identifier' ||
+                c.type === 'identifier',
+            );
           if (nameNode) {
-            return generateId('Impl', `${filePath}:${nameNode.text}`);
+            return {
+              classId: generateId('Struct', `${filePath}:${nameNode.text}`),
+              className: nameNode.text,
+            };
           }
         }
-        // Fall through: plain `impl Struct {}` — use first type_identifier below
+        const firstType = children.find((c: SyntaxNode) => c.type === 'type_identifier');
+        if (firstType) {
+          return {
+            classId: generateId('Impl', `${filePath}:${firstType.text}`),
+            className: firstType.text,
+          };
+        }
       }
+
+      // Ruby singleton_class (class << self): walk up to the enclosing class/module
+      // to inherit its name. singleton_class has no name field — its receiver is
+      // `self` (node type 'self'), not 'identifier' or 'constant'.
+      if (current.type === 'singleton_class') {
+        let ancestor = current.parent;
+        while (ancestor) {
+          if (ancestor.type === 'class' || ancestor.type === 'module') {
+            const classNameNode = ancestor.childForFieldName?.('name');
+            if (classNameNode) {
+              return {
+                classId: generateId('Class', `${filePath}:${classNameNode.text}`),
+                className: classNameNode.text,
+              };
+            }
+          }
+          ancestor = ancestor.parent;
+        }
+        // No enclosing class/module — skip singleton_class and keep walking up
+      }
+
       const nameNode =
         current.childForFieldName?.('name') ??
         current.children?.find(
@@ -272,12 +338,20 @@ export const findEnclosingClassId = (node: SyntaxNode, filePath: string): string
         );
       if (nameNode) {
         const label = CONTAINER_TYPE_TO_LABEL[current.type] || 'Class';
-        return generateId(label, `${filePath}:${nameNode.text}`);
+        return {
+          classId: generateId(label, `${filePath}:${nameNode.text}`),
+          className: nameNode.text,
+        };
       }
     }
     current = current.parent;
   }
   return null;
+};
+
+/** Convenience wrapper: returns just the class ID string (backward compat). */
+export const findEnclosingClassId = (node: SyntaxNode, filePath: string): string | null => {
+  return findEnclosingClassInfo(node, filePath)?.classId ?? null;
 };
 
 /**

@@ -11,15 +11,17 @@ import { extractVueScript, isVueSetupTopLevel } from './vue-sfc-extractor.js';
 import { yieldToEventLoop } from './utils/event-loop.js';
 import {
   getDefinitionNodeFromCaptures,
-  findEnclosingClassId,
+  findEnclosingClassInfo,
   extractMethodSignature,
   getLabelFromCaptures,
   CLASS_CONTAINER_TYPES,
   type SyntaxNode,
+  type EnclosingClassInfo,
 } from './utils/ast-helpers.js';
 import { detectFrameworkFromAST } from './framework-detection.js';
 import { buildTypeEnv } from './type-env.js';
 import type { FieldInfo, FieldExtractorContext } from './field-types.js';
+import type { MethodInfo } from './method-types.js';
 import type { LanguageProvider } from './language-provider.js';
 import { WorkerPool } from './workers/worker-pool.js';
 import type {
@@ -185,14 +187,17 @@ const processParsingWithWorkers = async (
 
 // Inline caches to avoid repeated parent-walks per node (same pattern as parse-worker.ts).
 // Keyed by tree-sitter node reference — cleared at the start of each file.
-const classIdCache = new Map<SyntaxNode, string | null>();
+const classInfoCache = new Map<SyntaxNode, EnclosingClassInfo | null>();
 const exportCache = new Map<SyntaxNode, boolean>();
 
-const cachedFindEnclosingClassId = (node: SyntaxNode, filePath: string): string | null => {
-  const cached = classIdCache.get(node);
+const cachedFindEnclosingClassInfo = (
+  node: SyntaxNode,
+  filePath: string,
+): EnclosingClassInfo | null => {
+  const cached = classInfoCache.get(node);
   if (cached !== undefined) return cached;
-  const result = findEnclosingClassId(node, filePath);
-  classIdCache.set(node, result);
+  const result = findEnclosingClassInfo(node, filePath);
+  classInfoCache.set(node, result);
   return result;
 };
 
@@ -211,6 +216,13 @@ const cachedExportCheck = (
 // FieldExtractor cache for sequential path — same pattern as parse-worker.ts
 const seqFieldInfoCache = new Map<number, Map<string, FieldInfo>>();
 
+// MethodExtractor cache for sequential path — avoids re-traversing the same class
+// body once per method. Keyed on classNode.id (tree-sitter node identity number).
+const seqMethodExtractCache = new Map<
+  number,
+  { ownerName: string | undefined; methods: MethodInfo[] } | null
+>();
+
 function seqFindEnclosingClassNode(node: SyntaxNode): SyntaxNode | null {
   let current = node.parent;
   while (current) {
@@ -218,6 +230,35 @@ function seqFindEnclosingClassNode(node: SyntaxNode): SyntaxNode | null {
     current = current.parent;
   }
   return null;
+}
+
+/** Convert MethodInfo from methodExtractor into flat properties for a graph node. */
+function buildMethodProps(info: MethodInfo): Record<string, unknown> {
+  const types: string[] = [];
+  let optionalCount = 0;
+  let hasVariadic = false;
+  for (const p of info.parameters) {
+    if (p.type !== null) types.push(p.type);
+    if (p.isOptional) optionalCount++;
+    if (p.isVariadic) hasVariadic = true;
+  }
+  return {
+    parameterCount: hasVariadic ? undefined : info.parameters.length,
+    ...(!hasVariadic && optionalCount > 0
+      ? { requiredParameterCount: info.parameters.length - optionalCount }
+      : {}),
+    ...(types.length > 0 ? { parameterTypes: types } : {}),
+    returnType: info.returnType ?? undefined,
+    visibility: info.visibility,
+    isStatic: info.isStatic,
+    isAbstract: info.isAbstract,
+    isFinal: info.isFinal,
+    ...(info.isVirtual ? { isVirtual: info.isVirtual } : {}),
+    ...(info.isOverride ? { isOverride: info.isOverride } : {}),
+    ...(info.isAsync ? { isAsync: info.isAsync } : {}),
+    ...(info.isPartial ? { isPartial: info.isPartial } : {}),
+    ...(info.annotations.length > 0 ? { annotations: info.annotations } : {}),
+  };
 }
 
 /** Minimal no-op SymbolTable stub for FieldExtractorContext (sequential path has a real
@@ -260,9 +301,10 @@ const processParsingSequential = async (
     const file = files[i];
 
     // Reset memoization before each new file (node refs are per-tree)
-    classIdCache.clear();
+    classInfoCache.clear();
     exportCache.clear();
     seqFieldInfoCache.clear();
+    seqMethodExtractCache.clear();
 
     onFileProgress?.(i + 1, total, file.path);
 
@@ -354,32 +396,102 @@ const processParsingSequential = async (
         : nameNode
           ? nameNode.startPosition.row + lineOffset
           : lineOffset;
-      const nodeId = generateId(nodeLabel, `${file.path}:${nodeName}`);
-
       const definitionNode = getDefinitionNodeFromCaptures(captureMap);
+
+      // Compute enclosing class BEFORE node ID — needed to qualify method IDs
+      const needsOwner =
+        nodeLabel === 'Method' ||
+        nodeLabel === 'Constructor' ||
+        nodeLabel === 'Property' ||
+        nodeLabel === 'Function';
+      const enclosingClassInfo = needsOwner
+        ? cachedFindEnclosingClassInfo(nameNode || definitionNodeForRange, file.path)
+        : null;
+      const enclosingClassId = enclosingClassInfo?.classId ?? null;
+
+      // Qualify method/property IDs with enclosing class name to avoid collisions
+      // e.g. "Method:animal.dart:Animal.speak" vs "Method:animal.dart:Dog.speak"
+      const qualifiedName = enclosingClassInfo
+        ? `${enclosingClassInfo.className}.${nodeName}`
+        : nodeName;
+      const nodeId = generateId(nodeLabel, `${file.path}:${qualifiedName}`);
       const frameworkHint = definitionNode
         ? detectFrameworkFromAST(language, (definitionNode.text || '').slice(0, 300))
         : null;
 
-      // Extract method signature for Method/Constructor nodes
-      const methodSig =
-        nodeLabel === 'Function' || nodeLabel === 'Method' || nodeLabel === 'Constructor'
-          ? extractMethodSignature(definitionNode)
-          : undefined;
+      // Extract method metadata for Function/Method/Constructor nodes.
+      // Try the per-language methodExtractor first (provides isAbstract, isStatic,
+      // visibility, annotations, etc.). Fall back to extractMethodSignature for
+      // basic parameterCount/parameterTypes/returnType when no methodExtractor exists.
+      const isMethodLike =
+        nodeLabel === 'Function' || nodeLabel === 'Method' || nodeLabel === 'Constructor';
+      let methodProps: Record<string, unknown> = {};
+      if (isMethodLike && definitionNode) {
+        let enriched = false;
 
-      // Language-specific return type fallback (e.g. Ruby YARD @return [Type])
-      // Also upgrades uninformative AST types like PHP `array` with PHPDoc `@return User[]`
-      if (
-        methodSig &&
-        (!methodSig.returnType ||
-          methodSig.returnType === 'array' ||
-          methodSig.returnType === 'iterable') &&
-        definitionNode
-      ) {
-        const tc = provider.typeConfig;
-        if (tc?.extractReturnType) {
-          const docReturn = tc.extractReturnType(definitionNode);
-          if (docReturn) methodSig.returnType = docReturn;
+        if (provider.methodExtractor) {
+          // Try class-based extraction (method inside a class/struct/trait body)
+          const classNode = seqFindEnclosingClassNode(definitionNode);
+          if (classNode) {
+            // Cache extract() results per class node to avoid re-traversing the
+            // same class body for every method it contains (O(N) -> O(1) per hit).
+            let result:
+              | { ownerName: string | undefined; methods: MethodInfo[] }
+              | null
+              | undefined = seqMethodExtractCache.get(classNode.id);
+            if (result === undefined) {
+              result =
+                provider.methodExtractor.extract(classNode, {
+                  filePath: file.path,
+                  language,
+                }) ?? null;
+              seqMethodExtractCache.set(classNode.id, result);
+            }
+            if (result?.methods?.length) {
+              const defLine = definitionNode.startPosition.row + 1;
+              const info = result.methods.find((m) => m.name === nodeName && m.line === defLine);
+              if (info) {
+                enriched = true;
+                methodProps = buildMethodProps(info);
+              }
+            }
+          }
+
+          // For top-level methods (e.g. Go method_declaration), try extractFromNode
+          if (!enriched && provider.methodExtractor.extractFromNode) {
+            const info = provider.methodExtractor.extractFromNode(definitionNode, {
+              filePath: file.path,
+              language,
+            });
+            if (info) {
+              enriched = true;
+              methodProps = buildMethodProps(info);
+            }
+          }
+        }
+
+        // Fallback to generic extractMethodSignature
+        if (!enriched) {
+          const sig = extractMethodSignature(definitionNode);
+          methodProps = {
+            parameterCount: sig.parameterCount,
+            ...(sig.requiredParameterCount !== undefined
+              ? { requiredParameterCount: sig.requiredParameterCount }
+              : {}),
+            ...(sig.parameterTypes ? { parameterTypes: sig.parameterTypes } : {}),
+            returnType: sig.returnType,
+          };
+        }
+
+        // Language-specific return type fallback (e.g. Ruby YARD @return [Type])
+        // Also upgrades uninformative AST types like PHP `array` with PHPDoc `@return User[]`
+        const rt = methodProps.returnType as string | undefined;
+        if (!rt || rt === 'array' || rt === 'iterable') {
+          const tc = provider.typeConfig;
+          if (tc?.extractReturnType) {
+            const docReturn = tc.extractReturnType(definitionNode);
+            if (docReturn) methodProps.returnType = docReturn;
+          }
         }
       }
 
@@ -410,31 +522,13 @@ const processParsingSequential = async (
                 astFrameworkReason: frameworkHint.reason,
               }
             : {}),
-          ...(methodSig
-            ? {
-                parameterCount: methodSig.parameterCount,
-                ...(methodSig.requiredParameterCount !== undefined
-                  ? { requiredParameterCount: methodSig.requiredParameterCount }
-                  : {}),
-                ...(methodSig.parameterTypes ? { parameterTypes: methodSig.parameterTypes } : {}),
-                returnType: methodSig.returnType,
-              }
-            : {}),
+          ...methodProps,
         },
       };
 
       graph.addNode(node);
 
-      // Compute enclosing class for Method/Constructor/Property/Function — used for both ownerId and HAS_METHOD
-      // Function is included because Kotlin/Rust/Python capture class methods as Function nodes
-      const needsOwner =
-        nodeLabel === 'Method' ||
-        nodeLabel === 'Constructor' ||
-        nodeLabel === 'Property' ||
-        nodeLabel === 'Function';
-      const enclosingClassId = needsOwner
-        ? cachedFindEnclosingClassId(nameNode || definitionNodeForRange, file.path)
-        : null;
+      // enclosingClassId already computed above (before nodeId generation)
 
       // Extract declared type and field metadata for Property nodes
       let declaredType: string | undefined;
@@ -471,10 +565,10 @@ const processParsingSequential = async (
       if (declaredType !== undefined) node.properties.declaredType = declaredType;
 
       symbolTable.add(file.path, nodeName, nodeId, nodeLabel, {
-        parameterCount: methodSig?.parameterCount,
-        requiredParameterCount: methodSig?.requiredParameterCount,
-        parameterTypes: methodSig?.parameterTypes,
-        returnType: methodSig?.returnType,
+        parameterCount: methodProps.parameterCount as number | undefined,
+        requiredParameterCount: methodProps.requiredParameterCount as number | undefined,
+        parameterTypes: methodProps.parameterTypes as string[] | undefined,
+        returnType: methodProps.returnType as string | undefined,
         declaredType,
         ownerId: enclosingClassId ?? undefined,
       });
