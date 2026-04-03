@@ -65,6 +65,11 @@ import type { ConstructorBinding } from '../type-env.js';
 import { detectFrameworkFromAST } from '../framework-detection.js';
 import { generateId } from '../../../lib/utils.js';
 import { preprocessImportPath } from '../import-processor.js';
+import {
+  extractVueScript,
+  extractTemplateComponents,
+  isVueSetupTopLevel,
+} from '../vue-sfc-extractor.js';
 import type { NamedBinding } from '../named-bindings/types.js';
 import type { NodeLabel } from 'gitnexus-shared';
 import type { FieldInfo, FieldExtractorContext } from '../field-types.js';
@@ -283,6 +288,7 @@ const languageMap: Record<string, TreeSitterLanguage> = {
   ...(Kotlin ? { [SupportedLanguages.Kotlin]: Kotlin } : {}),
   [SupportedLanguages.PHP]: PHP.php_only,
   [SupportedLanguages.Ruby]: Ruby,
+  [SupportedLanguages.Vue]: TypeScript.typescript,
   ...(Dart ? { [SupportedLanguages.Dart]: Dart } : {}),
   ...(Swift ? { [SupportedLanguages.Swift]: Swift } : {}),
 };
@@ -1212,12 +1218,24 @@ const processFileGroup = (
     // Skip files larger than the max tree-sitter buffer (32 MB)
     if (file.content.length > TREE_SITTER_MAX_BUFFER) continue;
 
+    // Vue SFC preprocessing: extract <script> block content
+    let parseContent = file.content;
+    let lineOffset = 0;
+    let isVueSetup = false;
+    if (language === SupportedLanguages.Vue) {
+      const extracted = extractVueScript(file.content);
+      if (!extracted) continue; // skip .vue files with no script block
+      parseContent = extracted.scriptContent;
+      lineOffset = extracted.lineOffset;
+      isVueSetup = extracted.isSetup;
+    }
+
     clearCaches(); // Reset memoization before each new file
 
     let tree;
     try {
-      tree = parser.parse(file.content, undefined, {
-        bufferSize: getTreeSitterBufferSize(file.content.length),
+      tree = parser.parse(parseContent, undefined, {
+        bufferSize: getTreeSitterBufferSize(parseContent.length),
       });
     } catch (err) {
       console.warn(
@@ -1370,7 +1388,7 @@ const processFileGroup = (
             routePath,
             httpMethod,
             decoratorName,
-            lineNumber: decoratorNode.startPosition.row,
+            lineNumber: decoratorNode.startPosition.row + lineOffset,
           });
         }
         // MCP/RPC tool detection: @mcp.tool(), @app.tool(), @server.tool()
@@ -1392,7 +1410,7 @@ const processFileGroup = (
           result.fetchCalls.push({
             filePath: file.path,
             fetchURL: urlNode.text,
-            lineNumber: captureMap['route.fetch'].startPosition.row,
+            lineNumber: captureMap['route.fetch'].startPosition.row + lineOffset,
           });
         }
         continue;
@@ -1408,7 +1426,7 @@ const processFileGroup = (
           result.fetchCalls.push({
             filePath: file.path,
             fetchURL: url,
-            lineNumber: captureMap['http_client'].startPosition.row,
+            lineNumber: captureMap['http_client'].startPosition.row + lineOffset,
           });
         }
         continue;
@@ -1432,7 +1450,7 @@ const processFileGroup = (
             routePath,
             httpMethod,
             decoratorName: `express.${method}`,
-            lineNumber: captureMap['express_route'].startPosition.row,
+            lineNumber: captureMap['express_route'].startPosition.row + lineOffset,
           });
         }
         continue;
@@ -1715,10 +1733,10 @@ const processFileGroup = (
       const nodeName = nameNode ? nameNode.text : 'init';
       const definitionNode = getDefinitionNodeFromCaptures(captureMap);
       const startLine = definitionNode
-        ? definitionNode.startPosition.row
+        ? definitionNode.startPosition.row + lineOffset
         : nameNode
-          ? nameNode.startPosition.row
-          : 0;
+          ? nameNode.startPosition.row + lineOffset
+          : lineOffset;
       const nodeId = generateId(nodeLabel, `${file.path}:${nodeName}`);
 
       const description = provider.descriptionExtractor?.(nodeLabel, nodeName, captureMap);
@@ -1753,7 +1771,7 @@ const processFileGroup = (
                 filePath: file.path,
                 toolName: nodeName,
                 description: dec.arg || '',
-                lineNumber: definitionNode.startPosition.row,
+                lineNumber: definitionNode.startPosition.row + lineOffset,
               });
             }
             fileDecorators.delete(checkLine);
@@ -1865,14 +1883,13 @@ const processFileGroup = (
         properties: {
           name: nodeName,
           filePath: file.path,
-          startLine: definitionNode ? definitionNode.startPosition.row : startLine,
-          endLine: definitionNode ? definitionNode.endPosition.row : startLine,
+          startLine: definitionNode ? definitionNode.startPosition.row + lineOffset : startLine,
+          endLine: definitionNode ? definitionNode.endPosition.row + lineOffset : startLine,
           language: language,
-          isExported: cachedExportCheck(
-            provider.exportChecker,
-            nameNode || definitionNode,
-            nodeName,
-          ),
+          isExported:
+            language === SupportedLanguages.Vue && isVueSetup
+              ? isVueSetupTopLevel(nameNode || definitionNode)
+              : cachedExportCheck(provider.exportChecker, nameNode || definitionNode, nodeName),
           ...(frameworkHint
             ? {
                 astFrameworkMultiplier: frameworkHint.entryPointMultiplier,
@@ -1964,7 +1981,20 @@ const processFileGroup = (
     }
 
     // Extract ORM queries (Prisma, Supabase)
-    extractORMQueries(file.path, file.content, result.ormQueries);
+    extractORMQueries(file.path, parseContent, result.ormQueries);
+
+    // Vue: emit CALLS edges for components used in <template>
+    if (language === SupportedLanguages.Vue) {
+      const templateComponents = extractTemplateComponents(file.content);
+      for (const componentName of templateComponents) {
+        result.calls.push({
+          filePath: file.path,
+          calledName: componentName,
+          sourceId: generateId('File', file.path),
+          callForm: 'free',
+        });
+      }
+    }
   }
 };
 
