@@ -75,7 +75,7 @@ describe('TypeScript heritage resolution', () => {
   });
 
   it('no OVERRIDES edges target Property nodes', () => {
-    const overrides = getRelationships(result, 'OVERRIDES');
+    const overrides = getRelationships(result, 'METHOD_OVERRIDES');
     for (const edge of overrides) {
       const target = result.graph.getNode(edge.rel.targetId);
       expect(target).toBeDefined();
@@ -886,7 +886,7 @@ describe('TypeScript return type inference via explicit function return type', (
   });
 
   it('resolves user.save() to User#save via return type of getUser(): User', () => {
-    // TS has explicit return types in the source, so extractMethodSignature captures
+    // TS has explicit return types in the source, so the method extractor captures
     // the return type. The TS extractInitializer handles `const user = getUser()`
     // via the variable_declarator path, enabling save() to resolve to User#save.
     const calls = getRelationships(result, 'CALLS');
@@ -2393,5 +2393,106 @@ describe('TypeScript method enrichment', () => {
       (c) => c.target === 'classify' && c.sourceFilePath.includes('app.ts'),
     );
     expect(classifyCall).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Interface dispatch: METHOD_IMPLEMENTS edges
+// ---------------------------------------------------------------------------
+
+describe('TypeScript interface dispatch (METHOD_IMPLEMENTS)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'typescript-interface-dispatch'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects IRepository interface and SqlRepository class', () => {
+    const classes = getNodesByLabel(result, 'Class');
+    const ifaces = getNodesByLabel(result, 'Interface');
+    expect(classes).toContain('SqlRepository');
+    expect(ifaces).toContain('IRepository');
+  });
+
+  it('emits IMPLEMENTS edge SqlRepository → IRepository', () => {
+    const impl = getRelationships(result, 'IMPLEMENTS');
+    const edge = impl.find((e) => e.source === 'SqlRepository' && e.target === 'IRepository');
+    expect(edge).toBeDefined();
+  });
+
+  it('emits METHOD_IMPLEMENTS edges for find and save', () => {
+    const mi = getRelationships(result, 'METHOD_IMPLEMENTS');
+    const findEdge = mi.find(
+      (e) =>
+        e.source === 'find' &&
+        e.target === 'find' &&
+        e.sourceFilePath.includes('sql-repository') &&
+        e.targetFilePath.includes('repository'),
+    );
+    const saveEdge = mi.find(
+      (e) =>
+        e.source === 'save' &&
+        e.target === 'save' &&
+        e.sourceFilePath.includes('sql-repository') &&
+        e.targetFilePath.includes('repository'),
+    );
+    expect(findEdge).toBeDefined();
+    expect(saveEdge).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Overloaded method disambiguation: interface with overloaded find + save,
+// concrete class implements all three. TypeScript overloads collapse to one
+// implementation signature — expect the implementation body, not individual
+// overload signatures.
+// ---------------------------------------------------------------------------
+
+describe('TypeScript overloaded method disambiguation', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'ts-overload-dispatch'), () => {});
+  }, 60000);
+
+  it('emits METHOD_IMPLEMENTS edge for find', () => {
+    const mi = getRelationships(result, 'METHOD_IMPLEMENTS');
+    const findEdge = mi.find(
+      (e) =>
+        e.source === 'find' &&
+        e.target === 'find' &&
+        e.sourceFilePath.includes('sql-repository') &&
+        e.targetFilePath.includes('repository'),
+    );
+    expect(findEdge).toBeDefined();
+  });
+
+  it('emits METHOD_IMPLEMENTS edge for save', () => {
+    const mi = getRelationships(result, 'METHOD_IMPLEMENTS');
+    const saveEdge = mi.find(
+      (e) =>
+        e.source === 'save' &&
+        e.target === 'save' &&
+        e.sourceFilePath.includes('sql-repository') &&
+        e.targetFilePath.includes('repository'),
+    );
+    expect(saveEdge).toBeDefined();
+  });
+
+  it('TypeScript overloads collapse — find has one implementation METHOD_IMPLEMENTS edge', () => {
+    const mi = getRelationships(result, 'METHOD_IMPLEMENTS');
+    // TypeScript overloads collapse to one implementation signature,
+    // so we expect a single METHOD_IMPLEMENTS edge for find (not two)
+    const findEdges = mi.filter(
+      (e) =>
+        e.source === 'find' &&
+        e.target === 'find' &&
+        e.sourceFilePath.includes('sql-repository') &&
+        e.targetFilePath.includes('repository'),
+    );
+    expect(findEdges.length).toBe(1);
   });
 });

@@ -1103,7 +1103,7 @@ async function runChunkedParseAndResolve(
  * Post-parse graph analysis: MRO, community detection, process extraction.
  *
  * @reads  graph (all nodes and relationships from parse + resolve phases)
- * @writes graph (Community nodes, Process nodes, MEMBER_OF edges, STEP_IN_PROCESS edges, OVERRIDES edges)
+ * @writes graph (Community nodes, Process nodes, MEMBER_OF edges, STEP_IN_PROCESS edges, METHOD_OVERRIDES edges)
  */
 async function runGraphAnalysisPhases(
   graph: ReturnType<typeof createKnowledgeGraph>,
@@ -1126,7 +1126,7 @@ async function runGraphAnalysisPhases(
   const mroResult = computeMRO(graph);
   if (isDev && mroResult.entries.length > 0) {
     console.log(
-      `🔀 MRO: ${mroResult.entries.length} classes analyzed, ${mroResult.ambiguityCount} ambiguities found, ${mroResult.overrideEdges} OVERRIDES edges`,
+      `🔀 MRO: ${mroResult.entries.length} classes analyzed, ${mroResult.ambiguityCount} ambiguities, ${mroResult.overrideEdges} METHOD_OVERRIDES, ${mroResult.methodImplementsEdges} METHOD_IMPLEMENTS`,
     );
   }
 

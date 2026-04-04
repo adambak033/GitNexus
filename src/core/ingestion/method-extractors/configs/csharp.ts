@@ -187,6 +187,7 @@ export const csharpMethodConfig: MethodExtractionConfig = {
     'destructor_declaration',
     'operator_declaration',
     'conversion_operator_declaration',
+    'local_function_statement',
   ],
   bodyNodeTypes: ['declaration_list'],
 

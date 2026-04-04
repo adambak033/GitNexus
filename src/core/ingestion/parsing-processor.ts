@@ -12,7 +12,6 @@ import { yieldToEventLoop } from './utils/event-loop.js';
 import {
   getDefinitionNodeFromCaptures,
   findEnclosingClassInfo,
-  extractMethodSignature,
   getLabelFromCaptures,
   CLASS_CONTAINER_TYPES,
   type SyntaxNode,
@@ -22,6 +21,7 @@ import { detectFrameworkFromAST } from './framework-detection.js';
 import { buildTypeEnv } from './type-env.js';
 import type { FieldInfo, FieldExtractorContext } from './field-types.js';
 import type { MethodInfo } from './method-types.js';
+import { buildMethodProps, arityForIdFromInfo } from './utils/method-props.js';
 import type { LanguageProvider } from './language-provider.js';
 import { WorkerPool } from './workers/worker-pool.js';
 import type {
@@ -232,35 +232,6 @@ function seqFindEnclosingClassNode(node: SyntaxNode): SyntaxNode | null {
   return null;
 }
 
-/** Convert MethodInfo from methodExtractor into flat properties for a graph node. */
-function buildMethodProps(info: MethodInfo): Record<string, unknown> {
-  const types: string[] = [];
-  let optionalCount = 0;
-  let hasVariadic = false;
-  for (const p of info.parameters) {
-    if (p.type !== null) types.push(p.type);
-    if (p.isOptional) optionalCount++;
-    if (p.isVariadic) hasVariadic = true;
-  }
-  return {
-    parameterCount: hasVariadic ? undefined : info.parameters.length,
-    ...(!hasVariadic && optionalCount > 0
-      ? { requiredParameterCount: info.parameters.length - optionalCount }
-      : {}),
-    ...(types.length > 0 ? { parameterTypes: types } : {}),
-    returnType: info.returnType ?? undefined,
-    visibility: info.visibility,
-    isStatic: info.isStatic,
-    isAbstract: info.isAbstract,
-    isFinal: info.isFinal,
-    ...(info.isVirtual ? { isVirtual: info.isVirtual } : {}),
-    ...(info.isOverride ? { isOverride: info.isOverride } : {}),
-    ...(info.isAsync ? { isAsync: info.isAsync } : {}),
-    ...(info.isPartial ? { isPartial: info.isPartial } : {}),
-    ...(info.annotations.length > 0 ? { annotations: info.annotations } : {}),
-  };
-}
-
 /** Minimal no-op SymbolTable stub for FieldExtractorContext (sequential path has a real
  *  SymbolTable, but it's incomplete at this stage — use the stub for safety). */
 const NOOP_SYMBOL_TABLE_SEQ = {
@@ -372,7 +343,10 @@ const processParsingSequential = async (
 
     // Build per-file type environment for FieldExtractor context (lightweight — skipped if no fieldExtractor)
     const typeEnv = provider.fieldExtractor
-      ? buildTypeEnv(tree, language, { enclosingFunctionFinder: provider.enclosingFunctionFinder })
+      ? buildTypeEnv(tree, language, {
+          enclosingFunctionFinder: provider.enclosingFunctionFinder,
+          extractFunctionName: provider.methodExtractor?.extractFunctionName,
+        })
       : null;
 
     matches.forEach((match) => {
@@ -414,18 +388,15 @@ const processParsingSequential = async (
       const qualifiedName = enclosingClassInfo
         ? `${enclosingClassInfo.className}.${nodeName}`
         : nodeName;
-      const nodeId = generateId(nodeLabel, `${file.path}:${qualifiedName}`);
-      const frameworkHint = definitionNode
-        ? detectFrameworkFromAST(language, (definitionNode.text || '').slice(0, 300))
-        : null;
 
-      // Extract method metadata for Function/Method/Constructor nodes.
-      // Try the per-language methodExtractor first (provides isAbstract, isStatic,
-      // visibility, annotations, etc.). Fall back to extractMethodSignature for
-      // basic parameterCount/parameterTypes/returnType when no methodExtractor exists.
+      // Extract method metadata for Function/Method/Constructor nodes BEFORE generating
+      // the node ID — parameterCount is needed to disambiguate overloaded methods.
+      // Use the per-language MethodExtractor for method metadata (isAbstract, isStatic,
+      // visibility, annotations, parameterCount, parameterTypes, returnType, etc.).
       const isMethodLike =
         nodeLabel === 'Function' || nodeLabel === 'Method' || nodeLabel === 'Constructor';
       let methodProps: Record<string, unknown> = {};
+      let arityForId: number | undefined; // raw param count for ID, even for variadic
       if (isMethodLike && definitionNode) {
         let enriched = false;
 
@@ -452,6 +423,7 @@ const processParsingSequential = async (
               const info = result.methods.find((m) => m.name === nodeName && m.line === defLine);
               if (info) {
                 enriched = true;
+                arityForId = arityForIdFromInfo(info);
                 methodProps = buildMethodProps(info);
               }
             }
@@ -465,35 +437,21 @@ const processParsingSequential = async (
             });
             if (info) {
               enriched = true;
+              arityForId = arityForIdFromInfo(info);
               methodProps = buildMethodProps(info);
             }
           }
         }
-
-        // Fallback to generic extractMethodSignature
-        if (!enriched) {
-          const sig = extractMethodSignature(definitionNode);
-          methodProps = {
-            parameterCount: sig.parameterCount,
-            ...(sig.requiredParameterCount !== undefined
-              ? { requiredParameterCount: sig.requiredParameterCount }
-              : {}),
-            ...(sig.parameterTypes ? { parameterTypes: sig.parameterTypes } : {}),
-            returnType: sig.returnType,
-          };
-        }
-
-        // Language-specific return type fallback (e.g. Ruby YARD @return [Type])
-        // Also upgrades uninformative AST types like PHP `array` with PHPDoc `@return User[]`
-        const rt = methodProps.returnType as string | undefined;
-        if (!rt || rt === 'array' || rt === 'iterable') {
-          const tc = provider.typeConfig;
-          if (tc?.extractReturnType) {
-            const docReturn = tc.extractReturnType(definitionNode);
-            if (docReturn) methodProps.returnType = docReturn;
-          }
-        }
       }
+
+      // Append #<paramCount> to Method/Constructor IDs to disambiguate overloads.
+      // Functions are not suffixed — they don't overload by name in the same scope.
+      const needsAritySuffix = nodeLabel === 'Method' || nodeLabel === 'Constructor';
+      const arityTag = needsAritySuffix && arityForId !== undefined ? `#${arityForId}` : '';
+      const nodeId = generateId(nodeLabel, `${file.path}:${qualifiedName}${arityTag}`);
+      const frameworkHint = definitionNode
+        ? detectFrameworkFromAST(language, (definitionNode.text || '').slice(0, 300))
+        : null;
 
       const node: GraphNode = {
         id: nodeId,

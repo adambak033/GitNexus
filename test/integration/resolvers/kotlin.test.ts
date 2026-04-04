@@ -90,7 +90,7 @@ describe('Kotlin heritage resolution', () => {
   });
 
   it('no OVERRIDES edges target Property nodes', () => {
-    const overrides = getRelationships(result, 'OVERRIDES');
+    const overrides = getRelationships(result, 'METHOD_OVERRIDES');
     for (const edge of overrides) {
       const target = result.graph.getNode(edge.rel.targetId);
       expect(target).toBeDefined();
@@ -1809,5 +1809,102 @@ describe('Kotlin method enrichment', () => {
       (c) => c.target === 'classify' && c.sourceFilePath.includes('App.kt'),
     );
     expect(classifyCall).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Interface dispatch: METHOD_IMPLEMENTS edges from concrete → interface methods
+// Repository interface with find/save, SqlRepository implements them
+// ---------------------------------------------------------------------------
+
+describe('Kotlin interface dispatch (METHOD_IMPLEMENTS)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'kotlin-interface-dispatch'), () => {});
+  }, 60000);
+
+  it('detects Repository interface and SqlRepository class', () => {
+    const classes = getNodesByLabel(result, 'Class');
+    const ifaces = getNodesByLabel(result, 'Interface');
+    expect(classes).toContain('SqlRepository');
+    expect(ifaces).toContain('Repository');
+  });
+
+  it('emits IMPLEMENTS edge SqlRepository → Repository', () => {
+    const impl = getRelationships(result, 'IMPLEMENTS');
+    const edge = impl.find((e) => e.source === 'SqlRepository' && e.target === 'Repository');
+    expect(edge).toBeDefined();
+  });
+
+  it('emits METHOD_IMPLEMENTS edges for find and save', () => {
+    const mi = getRelationships(result, 'METHOD_IMPLEMENTS');
+    const findEdge = mi.find(
+      (e) =>
+        e.source === 'find' &&
+        e.target === 'find' &&
+        e.sourceFilePath.includes('SqlRepository') &&
+        e.targetFilePath.includes('Repository'),
+    );
+    const saveEdge = mi.find(
+      (e) =>
+        e.source === 'save' &&
+        e.target === 'save' &&
+        e.sourceFilePath.includes('SqlRepository') &&
+        e.targetFilePath.includes('Repository'),
+    );
+    expect(findEdge).toBeDefined();
+    expect(saveEdge).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Overloaded method disambiguation: interface with overloaded find + save,
+// concrete class implements all three. Verifies METHOD_IMPLEMENTS edges
+// correctly distinguish between overloaded signatures.
+// ---------------------------------------------------------------------------
+
+describe('Kotlin overloaded method disambiguation', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'kotlin-overload-dispatch'), () => {});
+  }, 60000);
+
+  it('detects 2 distinct find Method nodes on SqlRepository', () => {
+    const methods = getNodesByLabelFull(result, 'Method');
+    const sqlRepoFinds = methods.filter(
+      (m) => m.name === 'find' && m.properties.filePath?.includes('SqlRepository'),
+    );
+    expect(sqlRepoFinds.length).toBe(2);
+  });
+
+  it('emits METHOD_IMPLEMENTS edges for both find overloads', () => {
+    const mi = getRelationships(result, 'METHOD_IMPLEMENTS');
+    const findEdges = mi.filter(
+      (e) =>
+        e.source === 'find' &&
+        e.target === 'find' &&
+        e.sourceFilePath.includes('SqlRepository') &&
+        e.targetFilePath.includes('Repository'),
+    );
+    expect(findEdges.length).toBe(2);
+  });
+
+  it('emits METHOD_IMPLEMENTS edge for save', () => {
+    const mi = getRelationships(result, 'METHOD_IMPLEMENTS');
+    const saveEdge = mi.find(
+      (e) =>
+        e.source === 'save' &&
+        e.target === 'save' &&
+        e.sourceFilePath.includes('SqlRepository') &&
+        e.targetFilePath.includes('Repository'),
+    );
+    expect(saveEdge).toBeDefined();
+  });
+
+  it('emits exactly 3 METHOD_IMPLEMENTS edges total', () => {
+    const mi = getRelationships(result, 'METHOD_IMPLEMENTS');
+    expect(mi.length).toBe(3);
   });
 });

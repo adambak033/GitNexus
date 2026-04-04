@@ -48,6 +48,14 @@ export interface MethodExtractor {
   isTypeDeclaration(node: SyntaxNode): boolean;
   /** Extract method info from a standalone method node (e.g. Go top-level method_declaration). */
   extractFromNode?(node: SyntaxNode, context: MethodExtractorContext): MethodInfo | null;
+  /** Extract function name + label from an AST node during parent-walk.
+   *  Languages with non-standard AST structures (e.g. C/C++ declarator
+   *  unwrapping, Swift init/deinit, Rust impl_item) provide this hook
+   *  to replace the generic name-field lookup.
+   *  Return null to fall through to the generic extractor. */
+  extractFunctionName?(
+    node: SyntaxNode,
+  ): { funcName: string | null; label: import('gitnexus-shared').NodeLabel } | null;
 }
 
 export interface MethodExtractionConfig {
@@ -75,4 +83,9 @@ export interface MethodExtractionConfig {
     ownerNode: SyntaxNode,
     context: MethodExtractorContext,
   ) => MethodInfo | null;
+  /** Extract function name + label from an AST node during parent-walk.
+   *  Passed through to the MethodExtractor by createMethodExtractor. */
+  extractFunctionName?: (
+    node: SyntaxNode,
+  ) => { funcName: string | null; label: import('gitnexus-shared').NodeLabel } | null;
 }

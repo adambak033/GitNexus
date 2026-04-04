@@ -15,6 +15,50 @@ import type { SyntaxNode } from '../../utils/ast-helpers.js';
 
 const VISIBILITY_MODIFIERS = new Set(['private', 'protected', 'public']);
 
+/** Regex to extract YARD `@return [Type]` annotations from comments. */
+const YARD_RETURN_RE = /@return\s+\[([^\]]+)\]/;
+
+/**
+ * Extract the simple type name from a YARD type string.
+ * Handles qualified types ("Models::User" -> "User"), generics ("Array<User>"
+ * -> "Array"), nullable ("String, nil" -> "String"), and rejects ambiguous
+ * unions ("String, Integer" -> undefined).
+ */
+function extractYardTypeName(yardType: string): string | undefined {
+  const trimmed = yardType.trim();
+
+  // Bracket-balanced split on commas to handle generics like Hash<Symbol, User>
+  const parts: string[] = [];
+  let depth = 0,
+    start = 0;
+  for (let i = 0; i < trimmed.length; i++) {
+    if (trimmed[i] === '<') depth++;
+    else if (trimmed[i] === '>') depth--;
+    else if (trimmed[i] === ',' && depth === 0) {
+      parts.push(trimmed.slice(start, i).trim());
+      start = i + 1;
+    }
+  }
+  parts.push(trimmed.slice(start).trim());
+  const filtered = parts.filter((p) => p !== '' && p !== 'nil');
+  if (filtered.length !== 1) return undefined; // ambiguous union
+
+  const typePart = filtered[0];
+
+  // Qualified: "Models::User" -> "User"
+  const segments = typePart.split('::');
+  const last = segments[segments.length - 1];
+
+  // Generic: "Array<User>" -> "Array"
+  const genericMatch = last.match(/^(\w+)\s*[<{(]/);
+  if (genericMatch) return genericMatch[1];
+
+  // Simple identifier
+  if (/^\w+$/.test(last)) return last;
+
+  return undefined;
+}
+
 /**
  * Extract visibility for a Ruby method by walking backwards through the
  * parent body_statement's named children from the method node's position.
@@ -166,8 +210,30 @@ export const rubyMethodConfig: MethodExtractionConfig = {
     return nameNode?.text;
   },
 
-  extractReturnType(_node) {
-    // Ruby has no type annotations — return type is always null
+  extractReturnType(node) {
+    // Walk backwards through preceding siblings looking for YARD @return [Type].
+    // Try direct siblings first, then fall back to parent (body_statement) siblings
+    // for class methods where the comment may be a sibling of the body_statement.
+    const search = (startNode: SyntaxNode): string | undefined => {
+      let sibling = startNode.previousSibling;
+      while (sibling) {
+        if (sibling.type === 'comment') {
+          const match = YARD_RETURN_RE.exec(sibling.text);
+          if (match) return extractYardTypeName(match[1]);
+        } else if (sibling.isNamed) {
+          break;
+        }
+        sibling = sibling.previousSibling;
+      }
+      return undefined;
+    };
+
+    const result = search(node);
+    if (result) return result;
+
+    if (node.parent?.type === 'body_statement') {
+      return search(node.parent);
+    }
     return undefined;
   },
 

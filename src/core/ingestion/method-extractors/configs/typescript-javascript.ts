@@ -125,8 +125,46 @@ function extractTsJsParameters(node: SyntaxNode): ParameterInfo[] {
   return params;
 }
 
+/** Regex to extract @returns or @return from JSDoc comments: `@returns {Type}` */
+const JSDOC_RETURN_RE = /@returns?\s*\{([^}]+)\}/;
+
+/**
+ * Minimal sanitization for JSDoc return types — preserves generic wrappers
+ * (e.g. `Promise<User>`) so that extractReturnTypeName in call-processor
+ * can apply WRAPPER_GENERICS unwrapping. Only strips JSDoc-specific syntax markers.
+ */
+function sanitizeJsDocReturnType(raw: string): string | undefined {
+  let type = raw.trim();
+  // Strip JSDoc nullable/non-nullable prefixes: ?User → User, !User → User
+  if (type.startsWith('?') || type.startsWith('!')) type = type.slice(1);
+  // Strip module: prefix — module:models.User → models.User
+  if (type.startsWith('module:')) type = type.slice(7);
+  // Reject unions (ambiguous)
+  if (type.includes('|')) return undefined;
+  if (!type) return undefined;
+  return type;
+}
+
+/**
+ * Walk backwards through preceding siblings looking for a JSDoc comment containing
+ * `@returns {Type}` or `@return {Type}`. Stops at the first non-comment named node
+ * (excluding decorators, which precede methods in TS/JS).
+ */
+function extractJsDocReturnType(node: SyntaxNode): string | undefined {
+  let sibling = node.previousSibling;
+  while (sibling) {
+    if (sibling.type === 'comment') {
+      const match = JSDOC_RETURN_RE.exec(sibling.text);
+      if (match) return sanitizeJsDocReturnType(match[1]);
+    } else if (sibling.isNamed && sibling.type !== 'decorator') break;
+    sibling = sibling.previousSibling;
+  }
+  return undefined;
+}
+
 /**
  * Extract return type from return_type field, unwrapping type_annotation.
+ * Falls back to JSDoc `@returns {Type}` when the AST has no return type annotation.
  *
  * tree-sitter-typescript uses `return_type` as the field name (not `type` like JVM).
  * The return_type field points to a type_annotation node that must be unwrapped.
@@ -140,7 +178,8 @@ function extractTsJsReturnType(node: SyntaxNode): string | undefined {
     }
     return returnType.text?.trim();
   }
-  return undefined;
+  // AST has no return type annotation — try JSDoc fallback
+  return extractJsDocReturnType(node);
 }
 
 /**
@@ -227,7 +266,14 @@ const shared: Omit<MethodExtractionConfig, 'language'> = {
   //     are not discovered because class_expression is not in typeDeclarationNodes.
   //   - declare module / declare global augmentations — methods inside ambient_module_declaration
   //     wrappers are not surfaced because the top-level walker doesn't descend into them.
-  methodNodeTypes: ['method_definition', 'method_signature', 'abstract_method_signature'],
+  methodNodeTypes: [
+    'method_definition',
+    'method_signature',
+    'abstract_method_signature',
+    'function_declaration',
+    'generator_function_declaration',
+    'function_signature',
+  ],
   bodyNodeTypes: ['class_body', 'interface_body'],
 
   extractName(node) {

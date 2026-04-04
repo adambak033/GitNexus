@@ -86,7 +86,7 @@ describe('C# heritage resolution', () => {
   });
 
   it('no OVERRIDES edges target Property nodes', () => {
-    const overrides = getRelationships(result, 'OVERRIDES');
+    const overrides = getRelationships(result, 'METHOD_OVERRIDES');
     for (const edge of overrides) {
       const target = result.graph.getNode(edge.rel.targetId);
       expect(target).toBeDefined();
@@ -1720,5 +1720,111 @@ describe('C# method enrichment', () => {
       (c) => c.target === 'Classify' && c.sourceFilePath.includes('App.cs'),
     );
     expect(classifyCall).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Interface dispatch: METHOD_IMPLEMENTS edges
+// ---------------------------------------------------------------------------
+
+describe('C# interface dispatch (METHOD_IMPLEMENTS)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'csharp-interface-dispatch'), () => {});
+  }, 60000);
+
+  it('detects IRepository interface and SqlRepository class', () => {
+    const classes = getNodesByLabel(result, 'Class');
+    const ifaces = getNodesByLabel(result, 'Interface');
+    expect(classes).toContain('SqlRepository');
+    expect(ifaces).toContain('IRepository');
+  });
+
+  it('emits IMPLEMENTS edge SqlRepository → IRepository', () => {
+    const impl = getRelationships(result, 'IMPLEMENTS');
+    const edge = impl.find((e) => e.source === 'SqlRepository' && e.target === 'IRepository');
+    expect(edge).toBeDefined();
+  });
+
+  it('emits METHOD_IMPLEMENTS edges for Find and Save', () => {
+    const mi = getRelationships(result, 'METHOD_IMPLEMENTS');
+    const findEdge = mi.find(
+      (e) =>
+        e.source === 'Find' &&
+        e.target === 'Find' &&
+        e.sourceFilePath.includes('SqlRepository') &&
+        e.targetFilePath.includes('IRepository'),
+    );
+    const saveEdge = mi.find(
+      (e) =>
+        e.source === 'Save' &&
+        e.target === 'Save' &&
+        e.sourceFilePath.includes('SqlRepository') &&
+        e.targetFilePath.includes('IRepository'),
+    );
+    expect(findEdge).toBeDefined();
+    expect(saveEdge).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Overloaded method disambiguation: METHOD_IMPLEMENTS with overloads
+// IRepository declares Find(int), Find(string), Save(string).
+// SqlRepository implements all three.
+// Overloaded methods (same name, different params) collapse into a single
+// graph node (generateId drops startLine), so Find appears once per file.
+// METHOD_IMPLEMENTS still emits one edge per unique (source, target) pair.
+// ---------------------------------------------------------------------------
+
+describe('C# overloaded method disambiguation (METHOD_IMPLEMENTS)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'csharp-overload-dispatch'), () => {});
+  }, 60000);
+
+  it('detects 2 distinct Find Method nodes on SqlRepository (different arities)', () => {
+    const methods = getNodesByLabelFull(result, 'Method');
+    const findOnSql = methods.filter(
+      (m) => m.name === 'Find' && m.properties.filePath?.includes('SqlRepository'),
+    );
+    expect(findOnSql.length).toBe(2);
+  });
+
+  it('emits METHOD_IMPLEMENTS edges for both Find overloads', () => {
+    const mi = getRelationships(result, 'METHOD_IMPLEMENTS');
+    const findEdges = mi.filter(
+      (e) =>
+        e.source === 'Find' &&
+        e.target === 'Find' &&
+        e.sourceFilePath.includes('SqlRepository') &&
+        e.targetFilePath.includes('IRepository'),
+    );
+    expect(findEdges.length).toBe(2);
+  });
+
+  it('emits METHOD_IMPLEMENTS for Save -> IRepository.Save', () => {
+    const mi = getRelationships(result, 'METHOD_IMPLEMENTS');
+    const saveEdge = mi.find(
+      (e) =>
+        e.source === 'Save' &&
+        e.target === 'Save' &&
+        e.sourceFilePath.includes('SqlRepository') &&
+        e.targetFilePath.includes('IRepository'),
+    );
+    expect(saveEdge).toBeDefined();
+  });
+
+  it('emits exactly 3 METHOD_IMPLEMENTS edges', () => {
+    const mi = getRelationships(result, 'METHOD_IMPLEMENTS');
+    expect(mi.length).toBe(3);
+  });
+
+  it('detects SqlRepository class and IRepository interface', () => {
+    const classes = getNodesByLabel(result, 'Class');
+    const ifaces = getNodesByLabel(result, 'Interface');
+    expect(classes).toContain('SqlRepository');
+    expect(ifaces).toContain('IRepository');
   });
 });

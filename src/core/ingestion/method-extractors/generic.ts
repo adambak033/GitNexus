@@ -86,6 +86,8 @@ export function createMethodExtractor(config: MethodExtractionConfig): MethodExt
       if (!methodNodeSet.has(node.type)) return null;
       return buildMethod(node, node, context, config);
     },
+
+    ...(config.extractFunctionName ? { extractFunctionName: config.extractFunctionName } : {}),
   };
 }
 
