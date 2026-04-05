@@ -17,6 +17,8 @@ import {
   genericFuncName,
   inferFunctionLabel,
 } from './utils/ast-helpers.js';
+import { typeTagForId, constTagForId, buildCollisionGroups } from './utils/method-props.js';
+import type { MethodInfo } from './method-types.js';
 import {
   countCallArguments,
   inferCallForm,
@@ -221,6 +223,14 @@ const TYPE_PRESERVING_METHODS = new Set([
   'orElseThrow', // Java Optional
 ]);
 
+/** Cache for method extraction results in findEnclosingFunction fallback path.
+ *  Keyed by classNode.id to avoid re-extracting the same class body per call site.
+ *  Cleared between files at line ~611 in the processCalls file loop. */
+const enclosingFnExtractCache = new Map<
+  number,
+  import('./method-types.js').ExtractedMethods | null
+>();
+
 /**
  * Walk up the AST from a node to find the enclosing function/method.
  * Returns null if the call is at module/file level (top-level code).
@@ -248,15 +258,20 @@ const findEnclosingFunction = (
           }
           const classInfo = findEnclosingClassInfo(current, filePath);
           if (classInfo) {
-            const match = resolved.candidates.find((c) => c.ownerId === classInfo.classId);
-            if (match) return match.nodeId;
+            const classMatches = resolved.candidates.filter((c) => c.ownerId === classInfo.classId);
+            // Unique class match — return it (no same-arity ambiguity)
+            if (classMatches.length === 1) return classMatches[0].nodeId;
+            // Multiple same-class candidates (same-arity overloads) — fall through
+            // to the fallback path which computes the exact ID with type-hash.
+            if (classMatches.length > 1) {
+              /* fall through to manual ID construction below */
+            } else {
+              // No class match — return first candidate as before
+              return resolved.candidates[0].nodeId;
+            }
+          } else {
+            return resolved.candidates[0].nodeId;
           }
-          if (process.env.NODE_ENV === 'development' && classInfo) {
-            console.warn(
-              `[CallProcessor] Enclosing class '${classInfo.className}' found but no candidate matched — falling back to ${resolved.candidates[0].nodeId}`,
-            );
-          }
-          return resolved.candidates[0].nodeId;
         }
 
         // Fallback: qualify the generated ID to match definition-phase node IDs
@@ -265,21 +280,63 @@ const findEnclosingFunction = (
           const override = provider.labelOverride(current, label);
           if (override !== null) finalLabel = override;
         }
-        const classInfo = findEnclosingClassInfo(current, filePath);
-        const qualifiedName = classInfo ? `${classInfo.className}.${funcName}` : funcName;
-        // Include #<arity> suffix to match definition-phase Method/Constructor IDs.
-        // Use provider.methodExtractor.extractFromNode — same extractor as definition phase.
+        const classInfo2 = findEnclosingClassInfo(current, filePath);
+        const qualifiedName = classInfo2 ? `${classInfo2.className}.${funcName}` : funcName;
+        // Include #<arity> and ~typeTag suffix to match definition-phase Method/Constructor IDs.
+        const language = getLanguageFromFilename(filePath);
         let arity: number | undefined;
-        if (finalLabel === 'Method' || finalLabel === 'Constructor') {
-          const language = getLanguageFromFilename(filePath);
-          const info = language
-            ? provider.methodExtractor?.extractFromNode?.(current, { filePath, language })
-            : undefined;
-          if (info) {
-            arity = info.parameters.some((p) => p.isVariadic) ? undefined : info.parameters.length;
+        let encTypeTag = '';
+        if (
+          (finalLabel === 'Method' || finalLabel === 'Constructor') &&
+          provider.methodExtractor &&
+          language
+        ) {
+          // Get class method map (cached per classNode.id) and look up current method
+          // by funcName:line. This avoids per-call-site extractFromNode AST walks.
+          let classNode = current.parent;
+          while (classNode && !provider.methodExtractor.isTypeDeclaration(classNode)) {
+            classNode = classNode.parent;
+          }
+          let info: MethodInfo | undefined;
+          if (classNode) {
+            let extracted = enclosingFnExtractCache.get(classNode.id);
+            if (extracted === undefined) {
+              extracted =
+                provider.methodExtractor.extract(classNode, { filePath, language }) ?? null;
+              enclosingFnExtractCache.set(classNode.id, extracted);
+            }
+            if (extracted?.methods?.length) {
+              const defLine = current.startPosition.row + 1;
+              info = extracted.methods.find((m) => m.name === funcName && m.line === defLine);
+              if (info) {
+                arity = info.parameters.some((p) => p.isVariadic)
+                  ? undefined
+                  : info.parameters.length;
+              }
+              if (arity !== undefined && info) {
+                const methodMap = new Map<string, MethodInfo>();
+                for (const m of extracted.methods) methodMap.set(`${m.name}:${m.line}`, m);
+                const groups = buildCollisionGroups(methodMap);
+                encTypeTag =
+                  typeTagForId(methodMap, funcName, arity, info, language, groups) +
+                  constTagForId(methodMap, funcName, arity, info, groups);
+              }
+            }
+          }
+          // Fallback: extractFromNode for top-level methods without a class
+          if (!info && provider.methodExtractor.extractFromNode) {
+            const nodeInfo = provider.methodExtractor.extractFromNode(current, {
+              filePath,
+              language,
+            });
+            if (nodeInfo) {
+              arity = nodeInfo.parameters.some((p) => p.isVariadic)
+                ? undefined
+                : nodeInfo.parameters.length;
+            }
           }
         }
-        const arityTag = arity !== undefined ? `#${arity}` : '';
+        const arityTag = arity !== undefined ? `#${arity}${encTypeTag}` : '';
         return generateId(finalLabel, `${filePath}:${qualifiedName}${arityTag}`);
       }
     }
@@ -296,38 +353,88 @@ const findEnclosingFunction = (
           }
           const classInfo = findEnclosingClassInfo(current.previousSibling ?? current, filePath);
           if (classInfo) {
-            const match = resolved.candidates.find((c) => c.ownerId === classInfo.classId);
-            if (match) return match.nodeId;
+            const classMatches = resolved.candidates.filter((c) => c.ownerId === classInfo.classId);
+            if (classMatches.length === 1) return classMatches[0].nodeId;
+            if (classMatches.length > 1) {
+              /* fall through to manual ID construction below */
+            } else {
+              return resolved.candidates[0].nodeId;
+            }
+          } else {
+            return resolved.candidates[0].nodeId;
           }
-          if (process.env.NODE_ENV === 'development' && classInfo) {
-            console.warn(
-              `[CallProcessor] Enclosing class '${classInfo.className}' found but no candidate matched — falling back to ${resolved.candidates[0].nodeId}`,
-            );
-          }
-          return resolved.candidates[0].nodeId;
         }
         let finalLabel = customResult.label;
         if (provider.labelOverride) {
           const override = provider.labelOverride(current.previousSibling!, finalLabel);
           if (override !== null) finalLabel = override;
         }
-        const classInfo = findEnclosingClassInfo(current.previousSibling ?? current, filePath);
-        const qualifiedName = classInfo
-          ? `${classInfo.className}.${customResult.funcName}`
+        const classInfo2 = findEnclosingClassInfo(current.previousSibling ?? current, filePath);
+        const qualifiedName = classInfo2
+          ? `${classInfo2.className}.${customResult.funcName}`
           : customResult.funcName;
-        // Include #<arity> suffix to match definition-phase Method/Constructor IDs.
+        // Include #<arity> and ~typeTag suffix to match definition-phase Method/Constructor IDs.
         const sigNode = current.previousSibling ?? current;
+        const language2 = getLanguageFromFilename(filePath);
         let arity2: number | undefined;
-        if (finalLabel === 'Method' || finalLabel === 'Constructor') {
-          const language = getLanguageFromFilename(filePath);
-          const info = language
-            ? provider.methodExtractor?.extractFromNode?.(sigNode, { filePath, language })
-            : undefined;
-          if (info) {
-            arity2 = info.parameters.some((p) => p.isVariadic) ? undefined : info.parameters.length;
+        let encTypeTag2 = '';
+        if (
+          (finalLabel === 'Method' || finalLabel === 'Constructor') &&
+          provider.methodExtractor &&
+          language2
+        ) {
+          let classNode2 = (current.previousSibling ?? current).parent;
+          while (classNode2 && !provider.methodExtractor.isTypeDeclaration(classNode2)) {
+            classNode2 = classNode2.parent;
+          }
+          let info2: MethodInfo | undefined;
+          if (classNode2) {
+            let extracted2 = enclosingFnExtractCache.get(classNode2.id);
+            if (extracted2 === undefined) {
+              extracted2 =
+                provider.methodExtractor.extract(classNode2, { filePath, language: language2 }) ??
+                null;
+              enclosingFnExtractCache.set(classNode2.id, extracted2);
+            }
+            if (extracted2?.methods?.length) {
+              const defLine2 = sigNode.startPosition.row + 1;
+              info2 = extracted2.methods.find(
+                (m) => m.name === customResult.funcName && m.line === defLine2,
+              );
+              if (info2) {
+                arity2 = info2.parameters.some((p) => p.isVariadic)
+                  ? undefined
+                  : info2.parameters.length;
+              }
+              if (arity2 !== undefined && info2) {
+                const methodMap = new Map<string, MethodInfo>();
+                for (const m of extracted2.methods) methodMap.set(`${m.name}:${m.line}`, m);
+                const groups2 = buildCollisionGroups(methodMap);
+                encTypeTag2 =
+                  typeTagForId(
+                    methodMap,
+                    customResult.funcName,
+                    arity2,
+                    info2,
+                    language2,
+                    groups2,
+                  ) + constTagForId(methodMap, customResult.funcName, arity2, info2, groups2);
+              }
+            }
+          }
+          if (!info2 && provider.methodExtractor.extractFromNode) {
+            const nodeInfo = provider.methodExtractor.extractFromNode(sigNode, {
+              filePath,
+              language: language2,
+            });
+            if (nodeInfo) {
+              arity2 = nodeInfo.parameters.some((p) => p.isVariadic)
+                ? undefined
+                : nodeInfo.parameters.length;
+            }
           }
         }
-        const arityTag2 = arity2 !== undefined ? `#${arity2}` : '';
+        const arityTag2 = arity2 !== undefined ? `#${arity2}${encTypeTag2}` : '';
         return generateId(finalLabel, `${filePath}:${qualifiedName}${arityTag2}`);
       }
     }
@@ -535,6 +642,7 @@ export const processCalls = async (
 
   for (let i = 0; i < files.length; i++) {
     const file = files[i];
+    enclosingFnExtractCache.clear();
     onProgress?.(i + 1, files.length);
     if (i % 20 === 0) await yieldToEventLoop();
 
@@ -1448,6 +1556,12 @@ type ReceiverTypeIndex = Map<string, Map<string, ReceiverTypeEntry>>;
  * The verified map is keyed by `scope\0varName` where scope is either
  * "funcName@startIndex" (inside a function) or "" (file level).
  * Index structure: Map<funcName, Map<varName, ReceiverTypeEntry>>
+ *
+ * Known limitation: the index collapses scope keys to bare funcName,
+ * so two same-arity overloads with the same local variable name but
+ * different types will mark that variable as ambiguous. A future
+ * enhancement should key by full scope (funcName@startIndex) and carry
+ * scope keys through findEnclosingFunction's return type.
  */
 const buildReceiverTypeIndex = (map: Map<string, string>): ReceiverTypeIndex => {
   const index: ReceiverTypeIndex = new Map();

@@ -21,7 +21,13 @@ import { detectFrameworkFromAST } from './framework-detection.js';
 import { buildTypeEnv } from './type-env.js';
 import type { FieldInfo, FieldExtractorContext } from './field-types.js';
 import type { MethodInfo } from './method-types.js';
-import { buildMethodProps, arityForIdFromInfo } from './utils/method-props.js';
+import {
+  buildMethodProps,
+  arityForIdFromInfo,
+  typeTagForId,
+  constTagForId,
+  buildCollisionGroups,
+} from './utils/method-props.js';
 import type { LanguageProvider } from './language-provider.js';
 import { WorkerPool } from './workers/worker-pool.js';
 import type {
@@ -222,6 +228,11 @@ const seqMethodExtractCache = new Map<
   number,
   { ownerName: string | undefined; methods: MethodInfo[] } | null
 >();
+// Derived method map + collision groups cache — avoids rebuilding per method.
+const seqMethodMapCache = new Map<
+  number,
+  { map: Map<string, MethodInfo>; groups: Map<string, MethodInfo[]> }
+>();
 
 function seqFindEnclosingClassNode(node: SyntaxNode): SyntaxNode | null {
   let current = node.parent;
@@ -276,6 +287,7 @@ const processParsingSequential = async (
     exportCache.clear();
     seqFieldInfoCache.clear();
     seqMethodExtractCache.clear();
+    seqMethodMapCache.clear();
 
     onFileProgress?.(i + 1, total, file.path);
 
@@ -397,6 +409,9 @@ const processParsingSequential = async (
         nodeLabel === 'Function' || nodeLabel === 'Method' || nodeLabel === 'Constructor';
       let methodProps: Record<string, unknown> = {};
       let arityForId: number | undefined; // raw param count for ID, even for variadic
+      let seqDefMethodInfo: MethodInfo | undefined;
+      let seqDefMethods: MethodInfo[] | undefined;
+      let seqClassNodeId: number | undefined;
       if (isMethodLike && definitionNode) {
         let enriched = false;
 
@@ -425,6 +440,9 @@ const processParsingSequential = async (
                 enriched = true;
                 arityForId = arityForIdFromInfo(info);
                 methodProps = buildMethodProps(info);
+                seqDefMethodInfo = info;
+                seqDefMethods = result.methods;
+                seqClassNodeId = classNode.id;
               }
             }
           }
@@ -446,8 +464,34 @@ const processParsingSequential = async (
 
       // Append #<paramCount> to Method/Constructor IDs to disambiguate overloads.
       // Functions are not suffixed — they don't overload by name in the same scope.
+      // When same-arity collisions exist, append ~type1,type2 for further disambiguation.
       const needsAritySuffix = nodeLabel === 'Method' || nodeLabel === 'Constructor';
-      const arityTag = needsAritySuffix && arityForId !== undefined ? `#${arityForId}` : '';
+      let arityTag = needsAritySuffix && arityForId !== undefined ? `#${arityForId}` : '';
+      if (arityTag && seqDefMethods && seqDefMethodInfo && seqClassNodeId !== undefined) {
+        // Use cached method map + collision groups (built once per class, not per method)
+        let cached = seqMethodMapCache.get(seqClassNodeId);
+        if (!cached) {
+          const tempMap = new Map<string, MethodInfo>();
+          for (const m of seqDefMethods) tempMap.set(`${m.name}:${m.line}`, m);
+          cached = { map: tempMap, groups: buildCollisionGroups(tempMap) };
+          seqMethodMapCache.set(seqClassNodeId, cached);
+        }
+        arityTag += typeTagForId(
+          cached.map,
+          nodeName,
+          arityForId,
+          seqDefMethodInfo,
+          language,
+          cached.groups,
+        );
+        arityTag += constTagForId(
+          cached.map,
+          nodeName,
+          arityForId,
+          seqDefMethodInfo,
+          cached.groups,
+        );
+      }
       const nodeId = generateId(nodeLabel, `${file.path}:${qualifiedName}${arityTag}`);
       const frameworkHint = definitionNode
         ? detectFrameworkFromAST(language, (definitionNode.text || '').slice(0, 300))
