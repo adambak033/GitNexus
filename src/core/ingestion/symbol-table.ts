@@ -89,6 +89,14 @@ export interface SymbolTable {
   lookupMethodByOwner: (ownerNodeId: string, methodName: string) => SymbolDefinition | undefined;
 
   /**
+   * Look up class-like definitions (Class, Struct, Interface, Enum, Record) by name.
+   * O(1) via dedicated eagerly-populated index keyed by symbol name.
+   * Returns all matching definitions across files (e.g. partial classes).
+   * Used by Phase 1 semantic-model tasks to replace filtered lookupFuzzy calls.
+   */
+  lookupClassByName: (name: string) => SymbolDefinition[];
+
+  /**
    * Debugging: See how many symbols are tracked
    */
   getStats: () => { fileCount: number; globalSymbolCount: number };
@@ -122,7 +130,12 @@ export const createSymbolTable = (): SymbolTable => {
   // Method symbols with ownerId are indexed. Supports overloads (array values).
   const methodByOwner = new Map<string, SymbolDefinition[]>();
 
+  // 6. Eagerly-populated Class-type Index — keyed by symbol name.
+  // Only Class, Struct, Interface, Enum, Record symbols are indexed.
+  const classByName = new Map<string, SymbolDefinition[]>();
+
   const CALLABLE_TYPES = new Set(['Function', 'Method', 'Constructor']);
+  const CLASS_TYPES = new Set(['Class', 'Struct', 'Interface', 'Enum', 'Record']);
 
   const add = (
     filePath: string,
@@ -194,6 +207,16 @@ export const createSymbolTable = (): SymbolTable => {
       }
     }
 
+    // C3. Class-like types go to classByName index (in addition to globalIndex).
+    if (CLASS_TYPES.has(type)) {
+      const existing = classByName.get(name);
+      if (existing) {
+        existing.push(def);
+      } else {
+        classByName.set(name, [def]);
+      }
+    }
+
     // D. Invalidate the lazy callable index only when adding callable types
     if (CALLABLE_TYPES.has(type)) {
       callableIndex = null;
@@ -254,6 +277,10 @@ export const createSymbolTable = (): SymbolTable => {
     return defs[0];
   };
 
+  const lookupClassByName = (name: string): SymbolDefinition[] => {
+    return classByName.get(name) ?? [];
+  };
+
   const getStats = () => ({
     fileCount: fileIndex.size,
     globalSymbolCount: globalIndex.size,
@@ -265,6 +292,7 @@ export const createSymbolTable = (): SymbolTable => {
     callableIndex = null;
     fieldByOwner.clear();
     methodByOwner.clear();
+    classByName.clear();
   };
 
   return {
@@ -276,6 +304,7 @@ export const createSymbolTable = (): SymbolTable => {
     lookupFuzzyCallable,
     lookupFieldByOwner,
     lookupMethodByOwner,
+    lookupClassByName,
     getStats,
     clear,
   };
