@@ -132,6 +132,23 @@ describe('C# ambiguous symbol resolution', () => {
   });
 });
 
+describe('C# qualified class names', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'csharp-qualified-types'), () => {});
+  }, 60000);
+
+  it('stores distinct qualified names for same-named classes across namespaces', () => {
+    const users = getNodesByLabelFull(result, 'Class').filter((node) => node.name === 'User');
+    expect(users).toHaveLength(2);
+    expect(users.map((node) => node.properties.qualifiedName).sort()).toEqual([
+      'Data.Auth.User',
+      'Services.Auth.User',
+    ]);
+  });
+});
+
 describe('C# call resolution with arity filtering', () => {
   let result: PipelineResult;
 

@@ -255,6 +255,23 @@ describe('Ruby member-call resolution', () => {
   });
 });
 
+describe('Ruby qualified class names', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'ruby-qualified-types'), () => {});
+  }, 60000);
+
+  it('stores distinct qualified names for same-named classes across modules', () => {
+    const users = getNodesByLabelFull(result, 'Class').filter((node) => node.name === 'User');
+    expect(users).toHaveLength(2);
+    expect(users.map((node) => node.properties.qualifiedName).sort()).toEqual([
+      'Admin.User',
+      'Services.Auth.User',
+    ]);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Ambiguous: Handler in two dirs, require_relative disambiguates
 // ---------------------------------------------------------------------------

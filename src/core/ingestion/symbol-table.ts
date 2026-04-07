@@ -1,9 +1,15 @@
 import type { NodeLabel } from 'gitnexus-shared';
 
+export const CLASS_TYPES = new Set(['Class', 'Struct', 'Interface', 'Enum', 'Record']);
+
 export interface SymbolDefinition {
   nodeId: string;
   filePath: string;
   type: NodeLabel;
+  /** Canonical dot-separated qualified type name for class-like symbols
+   *  (e.g. `App.Models.User`). Falls back to the simple symbol name when no
+   *  package/namespace/module scope exists or no explicit qualified metadata is provided. */
+  qualifiedName?: string;
   parameterCount?: number;
   /** Number of required (non-optional, non-default) parameters.
    *  Enables range-based arity filtering: argCount >= requiredParameterCount && argCount <= parameterCount. */
@@ -36,6 +42,7 @@ export interface SymbolTable {
       returnType?: string;
       declaredType?: string;
       ownerId?: string;
+      qualifiedName?: string;
     },
   ) => void;
 
@@ -97,6 +104,14 @@ export interface SymbolTable {
   lookupClassByName: (name: string) => SymbolDefinition[];
 
   /**
+   * Look up class-like definitions by canonical qualified name.
+   * Qualified names are normalized to dot-separated scope segments across languages,
+   * e.g. `App.Models.User`, `com.example.User`, or `Admin.User`.
+   * Top-level class-like symbols with no explicit scope are indexed under their simple name.
+   */
+  lookupClassByQualifiedName: (qualifiedName: string) => SymbolDefinition[];
+
+  /**
    * Debugging: See how many symbols are tracked
    */
   getStats: () => { fileCount: number; globalSymbolCount: number };
@@ -133,9 +148,9 @@ export const createSymbolTable = (): SymbolTable => {
   // 6. Eagerly-populated Class-type Index — keyed by symbol name.
   // Only Class, Struct, Interface, Enum, Record symbols are indexed.
   const classByName = new Map<string, SymbolDefinition[]>();
+  const classByQualifiedName = new Map<string, SymbolDefinition[]>();
 
   const CALLABLE_TYPES = new Set(['Function', 'Method', 'Constructor']);
-  const CLASS_TYPES = new Set(['Class', 'Struct', 'Interface', 'Enum', 'Record']);
 
   const add = (
     filePath: string,
@@ -149,12 +164,17 @@ export const createSymbolTable = (): SymbolTable => {
       returnType?: string;
       declaredType?: string;
       ownerId?: string;
+      qualifiedName?: string;
     },
   ) => {
+    const qualifiedName = CLASS_TYPES.has(type)
+      ? (metadata?.qualifiedName ?? name)
+      : metadata?.qualifiedName;
     const def: SymbolDefinition = {
       nodeId,
       filePath,
       type,
+      ...(qualifiedName !== undefined ? { qualifiedName } : {}),
       ...(metadata?.parameterCount !== undefined
         ? { parameterCount: metadata.parameterCount }
         : {}),
@@ -214,6 +234,14 @@ export const createSymbolTable = (): SymbolTable => {
         existing.push(def);
       } else {
         classByName.set(name, [def]);
+      }
+
+      const qualifiedKey = qualifiedName ?? name;
+      const qualifiedMatches = classByQualifiedName.get(qualifiedKey);
+      if (qualifiedMatches) {
+        qualifiedMatches.push(def);
+      } else {
+        classByQualifiedName.set(qualifiedKey, [def]);
       }
     }
 
@@ -281,6 +309,10 @@ export const createSymbolTable = (): SymbolTable => {
     return classByName.get(name) ?? [];
   };
 
+  const lookupClassByQualifiedName = (qualifiedName: string): SymbolDefinition[] => {
+    return classByQualifiedName.get(qualifiedName) ?? [];
+  };
+
   const getStats = () => ({
     fileCount: fileIndex.size,
     globalSymbolCount: globalIndex.size,
@@ -293,6 +325,7 @@ export const createSymbolTable = (): SymbolTable => {
     fieldByOwner.clear();
     methodByOwner.clear();
     classByName.clear();
+    classByQualifiedName.clear();
   };
 
   return {
@@ -305,6 +338,7 @@ export const createSymbolTable = (): SymbolTable => {
     lookupFieldByOwner,
     lookupMethodByOwner,
     lookupClassByName,
+    lookupClassByQualifiedName,
     getStats,
     clear,
   };

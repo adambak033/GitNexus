@@ -137,6 +137,23 @@ describe('Java ambiguous symbol resolution', () => {
   });
 });
 
+describe('Java qualified class names', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'java-qualified-types'), () => {});
+  }, 60000);
+
+  it('stores distinct qualified names for same-named classes across packages', () => {
+    const users = getNodesByLabelFull(result, 'Class').filter((node) => node.name === 'User');
+    expect(users).toHaveLength(2);
+    expect(users.map((node) => node.properties.qualifiedName).sort()).toEqual([
+      'com.example.admin.User',
+      'com.example.models.User',
+    ]);
+  });
+});
+
 describe('Java call resolution with arity filtering', () => {
   let result: PipelineResult;
 
