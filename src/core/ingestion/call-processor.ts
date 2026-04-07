@@ -51,6 +51,9 @@ import { extractParsedCallSite } from './call-sites/extract-language-call-site.j
  *  Populated during call processing, consumed by Phase 14 re-resolution pass. */
 export type ExportedTypeMap = Map<string, Map<string, string>>;
 
+/** Types that represent class-like declarations (used for receiver/owner resolution). */
+const CLASS_LIKE_TYPES = new Set(['Class', 'Struct', 'Interface', 'Enum', 'Record', 'Impl']);
+
 const MAX_EXPORTS_PER_FILE = 500;
 const MAX_TYPE_NAME_LENGTH = 256;
 
@@ -784,17 +787,7 @@ export const processCalls = async (
         }
         if (!receiverTypeName && receiverText) {
           const resolved = ctx.resolve(receiverText, file.path);
-          if (
-            resolved?.candidates.some(
-              (d) =>
-                d.type === 'Class' ||
-                d.type === 'Struct' ||
-                d.type === 'Interface' ||
-                d.type === 'Enum' ||
-                d.type === 'Record' ||
-                d.type === 'Impl',
-            )
-          ) {
+          if (resolved?.candidates.some((d) => CLASS_LIKE_TYPES.has(d.type))) {
             receiverTypeName = receiverText;
           }
         }
@@ -1656,15 +1649,7 @@ const resolveFieldOwnership = (
 ): { nodeId: string; declaredType?: string } | undefined => {
   const typeResolved = ctx.resolve(receiverName, filePath);
   if (!typeResolved) return undefined;
-  const classDef = typeResolved.candidates.find(
-    (d) =>
-      d.type === 'Class' ||
-      d.type === 'Struct' ||
-      d.type === 'Interface' ||
-      d.type === 'Enum' ||
-      d.type === 'Record' ||
-      d.type === 'Impl',
-  );
+  const classDef = typeResolved.candidates.find((d) => CLASS_LIKE_TYPES.has(d.type));
   if (!classDef) return undefined;
 
   return ctx.symbols.lookupFieldByOwner(classDef.nodeId, fieldName) ?? undefined;
@@ -1683,15 +1668,7 @@ const resolveMethodByOwner = (
 ): SymbolDefinition | undefined => {
   const typeResolved = ctx.resolve(receiverTypeName, filePath);
   if (!typeResolved) return undefined;
-  const classDef = typeResolved.candidates.find(
-    (d) =>
-      d.type === 'Class' ||
-      d.type === 'Struct' ||
-      d.type === 'Interface' ||
-      d.type === 'Enum' ||
-      d.type === 'Record' ||
-      d.type === 'Impl',
-  );
+  const classDef = typeResolved.candidates.find((d) => CLASS_LIKE_TYPES.has(d.type));
   if (!classDef) return undefined;
 
   return ctx.symbols.lookupMethodByOwner(classDef.nodeId, methodName);
@@ -2036,17 +2013,7 @@ export const processAssignmentsFromExtracted = (
     // Tier 3: static class-as-receiver fallback
     if (!receiverTypeName) {
       const resolved = ctx.resolve(asn.receiverText, asn.filePath);
-      if (
-        resolved?.candidates.some(
-          (d) =>
-            d.type === 'Class' ||
-            d.type === 'Struct' ||
-            d.type === 'Interface' ||
-            d.type === 'Enum' ||
-            d.type === 'Record' ||
-            d.type === 'Impl',
-        )
-      ) {
+      if (resolved?.candidates.some((d) => CLASS_LIKE_TYPES.has(d.type))) {
         receiverTypeName = asn.receiverText;
       }
     }
