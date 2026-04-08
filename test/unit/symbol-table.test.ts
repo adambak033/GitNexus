@@ -88,7 +88,12 @@ describe('SymbolTable', () => {
 
   describe('getStats', () => {
     it('returns zero counts for empty table', () => {
-      expect(table.getStats()).toEqual({ fileCount: 0, globalSymbolCount: 0 });
+      expect(table.getStats()).toEqual({
+        fileCount: 0,
+        globalSymbolCount: 0,
+        fuzzyCallCount: 0,
+        fuzzyCallableCallCount: 0,
+      });
     });
 
     it('tracks unique file count correctly', () => {
@@ -484,7 +489,12 @@ describe('SymbolTable', () => {
       });
       table.add('src/models.ts', 'User', 'class:User', 'Class');
       table.clear();
-      expect(table.getStats()).toEqual({ fileCount: 0, globalSymbolCount: 0 });
+      expect(table.getStats()).toEqual({
+        fileCount: 0,
+        globalSymbolCount: 0,
+        fuzzyCallCount: 0,
+        fuzzyCallableCallCount: 0,
+      });
       expect(table.lookupExact('src/a.ts', 'foo')).toBeUndefined();
       expect(table.lookupFuzzy('foo')).toEqual([]);
       expect(table.lookupFieldByOwner('class:User', 'address')).toBeUndefined();
@@ -497,7 +507,12 @@ describe('SymbolTable', () => {
       table.add('src/a.ts', 'foo', 'func:foo', 'Function');
       table.clear();
       table.add('src/b.ts', 'bar', 'func:bar', 'Function');
-      expect(table.getStats()).toEqual({ fileCount: 1, globalSymbolCount: 1 });
+      expect(table.getStats()).toEqual({
+        fileCount: 1,
+        globalSymbolCount: 1,
+        fuzzyCallCount: 0,
+        fuzzyCallableCallCount: 0,
+      });
     });
 
     it('resets callableIndex so first lookup after clear rebuilds from scratch', () => {
