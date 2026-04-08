@@ -787,6 +787,8 @@ export const processCalls = async (
           ctx,
           undefined,
           widenCache,
+          undefined,
+          heritageMap,
         );
 
         if (!resolved) return;
@@ -1033,6 +1035,8 @@ export const processCalls = async (
         ctx,
         hints,
         widenCache,
+        undefined,
+        heritageMap,
       );
 
       if (!resolved) return;
@@ -1285,6 +1289,7 @@ const resolveCallTarget = (
   overloadHints?: OverloadHints,
   widenCache?: WidenCache,
   preComputedArgTypes?: (string | undefined)[],
+  heritageMap?: HeritageMap,
 ): ResolveResult | null => {
   const tiered = ctx.resolve(call.calledName, currentFile);
   if (!tiered) return null;
@@ -1360,6 +1365,35 @@ const resolveCallTarget = (
   // belong to the wrong class (e.g. super.save() should hit the parent's save,
   // not the child's own save method in the same file).
   if (call.callForm === 'member' && call.receiverTypeName) {
+    // D0. MRO fast path: when heritageMap is available, try owner-scoped + MRO
+    //     lookup before falling back to the expensive D2 fuzzy widening.
+    //     This short-circuits the lookupFuzzy call for every cross-file member call.
+    //     Skip conditions:
+    //     (a) overloadHints or preComputedArgTypes present — the MRO lookup may
+    //         pick the wrong overload for same-return-type overloads since it
+    //         does not consider argument types. D2-D4+E handles those correctly.
+    //     (b) A module alias on call.receiverName is active for this file — the
+    //         alias block above already narrowed `filteredCandidates` to a
+    //         specific file (e.g. Python `import auth; auth.user.save()`).
+    //         resolveMethodByOwner re-resolves `receiverTypeName` from scratch
+    //         via `ctx.resolve`, which ignores that narrowing and could pick a
+    //         homonymous class from the wrong file. Fall through to D1-D4 which
+    //         respects the alias-filtered candidate pool.
+    const hasActiveModuleAlias =
+      !!call.receiverName && ctx.moduleAliasMap?.get(currentFile)?.has(call.receiverName) === true;
+    if (!overloadHints && !preComputedArgTypes && !hasActiveModuleAlias) {
+      const mroResult = resolveMethodByOwner(
+        call.receiverTypeName,
+        call.calledName,
+        currentFile,
+        ctx,
+        heritageMap,
+      );
+      if (mroResult) {
+        return toResolveResult(mroResult, tiered.tier);
+      }
+    }
+
     // D1. Resolve the receiver type
     const typeResolved = ctx.resolve(call.receiverTypeName, currentFile);
     if (typeResolved && typeResolved.candidates.length > 0) {
@@ -1628,8 +1662,12 @@ const resolveMethodByOwner = (
     }
   }
 
-  // Fallback when no HeritageMap (or the file extension is unrecognized):
-  // plain direct lookup with no ancestor walk.
+  // Fallback when no HeritageMap (or the file extension is unrecognized by
+  // `getLanguageFromFilename`, e.g. a synthetic path or an extension that is
+  // not registered in supported-languages.ts): plain direct lookup with no
+  // ancestor walk. All primary languages register their extensions, so this
+  // branch is only reached for edge cases where the MRO walk would not be
+  // applicable anyway. D1-D4 in resolveCallTarget still runs on D0 miss.
   return ctx.symbols.lookupMethodByOwner(classDef.nodeId, methodName);
 };
 
@@ -1839,6 +1877,10 @@ const walkMixedChain = (
         { calledName: step.name, callForm: 'member', receiverTypeName: currentType },
         filePath,
         ctx,
+        undefined,
+        undefined,
+        undefined,
+        heritageMap,
       );
       if (!resolved) {
         // Stdlib passthrough: unwrap(), clone(), etc. preserve the receiver type
@@ -1988,6 +2030,7 @@ export const processCallsFromExtracted = async (
         undefined,
         widenCache,
         effectiveCall.argTypes,
+        heritageMap,
       );
       if (!resolved) {
         // Vue template component fallback: match calledName against imported .vue basenames
