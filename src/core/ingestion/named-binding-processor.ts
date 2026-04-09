@@ -41,7 +41,7 @@ export function walkBindingChain(
     const targetName = binding.exportedName;
     const resolvedDefs =
       targetName !== lookupName || depth > 0
-        ? symbolTable.lookupFuzzy(targetName).filter((def) => def.filePath === binding.sourcePath)
+        ? symbolTable.lookupExactAll(binding.sourcePath, targetName)
         : allDefs.filter((def) => def.filePath === binding.sourcePath);
 
     if (resolvedDefs.length > 0) return resolvedDefs;
