@@ -8,6 +8,7 @@ import { CALL_EXPRESSION_TYPES } from './utils/call-analysis.js';
 import { SupportedLanguages } from 'gitnexus-shared';
 import { TYPED_PARAMETER_TYPES } from './type-extractors/shared.js';
 import { getProvider } from './languages/index.js';
+import type { BindingAccumulator, BindingEntry } from './binding-accumulator.js';
 import type {
   ClassNameLookup,
   ReturnTypeLookup,
@@ -42,7 +43,21 @@ type TypeEnv = Map<string, Map<string, string>>;
 const FILE_SCOPE = '';
 
 /** Shared empty map for files with no file-scope bindings. */
-const EMPTY_FILE_SCOPE: ReadonlyMap<string, string> = new Map();
+/**
+ * Create a fresh empty Map for the "no file-scope bindings" fallback.
+ *
+ * **Why not a shared sentinel**: we previously used a module-level
+ * `const EMPTY_FILE_SCOPE = new Map()` typed as `ReadonlyMap` and shared
+ * across every TypeEnv instance. That was a latent singleton-poisoning
+ * footgun: any caller that did `(fileScope() as Map).set(...)` — or any
+ * future refactor that widened the return type — would silently corrupt
+ * every subsequent "empty" return for the process lifetime. A Proxy
+ * wrapper was considered but broke Map's internal-slot methods (`.size`,
+ * iteration protocol). Allocating a fresh empty Map per call is a few
+ * bytes per file — immediately GC'd, no measurable cost even at 10k files
+ * — and eliminates the shared-mutation hazard entirely.
+ */
+const emptyFileScope = (): ReadonlyMap<string, string> => new Map();
 
 /** Fallback for languages where class names aren't in a 'name' field (e.g. Kotlin uses type_identifier). */
 const findTypeIdentifierChild = (node: SyntaxNode): SyntaxNode | null => {
@@ -73,6 +88,10 @@ export interface TypeEnvironment {
    *  Populated when a variable has BOTH a declared base type AND a more specific
    *  constructor type (e.g., `Animal a = new Dog()` → key maps to 'Dog'). */
   readonly constructorTypeMap: ReadonlyMap<string, string>;
+  /** Copy all scoped bindings into a BindingAccumulator.
+   *  Must be called at most once per TypeEnv instance — throws on second call.
+   *  The source `env` is not cleared (TypeEnv is per-file and discarded immediately after). */
+  flush(filePath: string, accumulator: BindingAccumulator): void;
 }
 
 /**
@@ -822,6 +841,7 @@ export const buildTypeEnv = (
   const parentMap = options?.parentMap;
   const extractFuncNameHook = options?.extractFunctionName;
   const env: TypeEnv = new Map();
+  let flushed = false;
   const patternOverrides: PatternOverrides = new Map();
   // Phase P: maps `scope\0varName` → constructor type when a declaration has BOTH
   // a base type annotation AND a more specific constructor initializer.
@@ -1242,9 +1262,47 @@ export const buildTypeEnv = (
         extractFuncNameHook,
       ),
     constructorBindings: bindings,
-    fileScope: () => env.get(FILE_SCOPE) ?? EMPTY_FILE_SCOPE,
+    fileScope: () => env.get(FILE_SCOPE) ?? emptyFileScope(),
     allScopes: () => env as ReadonlyMap<string, ReadonlyMap<string, string>>,
     constructorTypeMap,
+    flush(filePath: string, accumulator: BindingAccumulator): void {
+      if (flushed) {
+        throw new Error(
+          `[TypeEnvironment] flush called twice for ${filePath} — flush is single-use`,
+        );
+      }
+      // Narrow flush() to iterate only the FILE_SCOPE entry, mirroring the
+      // worker-path narrowing in parse-worker.ts (commit 803631fe). Before
+      // this change, both execution paths had the same asymmetry bug: the
+      // worker path was fixed but the sequential path (this code) still
+      // wrote function-scope entries into long-lived accumulator storage
+      // that no consumer reads until Phase 9 lands.
+      //
+      // Phase 9 reversion: when a downstream consumer of function-scope
+      // bindings exists, restore the nested iteration:
+      //
+      //   for (const [scope, scopeMap] of env) {
+      //     for (const [varName, typeName] of scopeMap) {
+      //       entries.push({ scope, varName, typeName });
+      //     }
+      //   }
+      //
+      // See BindingAccumulator class JSDoc and FileScopeBindings JSDoc in
+      // parse-worker.ts for the full reversion checklist.
+      const fileScope = env.get(FILE_SCOPE) ?? emptyFileScope();
+      const entries: BindingEntry[] = [];
+      for (const [varName, typeName] of fileScope) {
+        entries.push({ scope: '', varName, typeName });
+      }
+      if (entries.length > 0) {
+        accumulator.appendFile(filePath, entries);
+      }
+      // Mark the env as flushed AFTER the successful append. If appendFile
+      // throws (e.g., accumulator is already finalized due to a lifecycle
+      // ordering bug), the caller can catch and retry — the single-use
+      // guard now tracks "data was written", not "flush was attempted".
+      flushed = true;
+    },
   };
 };
 

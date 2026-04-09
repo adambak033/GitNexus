@@ -235,10 +235,33 @@ export interface FileConstructorBindings {
   bindings: ConstructorBinding[];
 }
 
-/** File-scope type bindings from TypeEnv fixpoint — used for cross-file ExportedTypeMap. */
-export interface FileTypeEnvBindings {
+/** All-scope type bindings from TypeEnv — includes function-local scopes.
+ *  Used by BindingAccumulator for cross-file type propagation (Phase 9+).
+ *
+ *  Carries only file-scope entries (`scope = ''`). Serializing function-scope
+ *  bindings over IPC cost ~4.9 MB with zero downstream consumers.
+ *  `parse-worker.ts` now iterates only `typeEnv.fileScope()` and the
+ *  sequential path's `type-env.ts::flush()` is also narrowed to file
+ *  scope — see the `BindingAccumulator` class JSDoc for the unified
+ *  narrowing contract across both execution paths.
+ *
+ *  **Phase 9 reversion checklist** (when a downstream consumer of
+ *  function-scope bindings lands):
+ *    1. Change the loop in `runParseJob` below from `typeEnv.fileScope()`
+ *       back to `typeEnv.allScopes()`.
+ *    2. Emit three-element tuples `[scope, varName, typeName]`.
+ *    3. Widen the `bindings` field on this interface back to
+ *       `[string, string, string][]`.
+ *    4. Update the pipeline adapter in `pipeline.ts` to unpack three
+ *       elements and populate `BindingEntry.scope` from the first tuple
+ *       element instead of hardcoding `''`.
+ *    5. Also revert `type-env.ts::flush()` to iterate `env` instead of
+ *       just `FILE_SCOPE` if the sequential path needs function-scope data too.
+ *    6. Consider renaming this interface back to `FileAllScopeBindings`
+ *       along with widening. */
+export interface FileScopeBindings {
   filePath: string;
-  /** [varName, typeName] pairs from file scope (scope = '') */
+  /** [varName, typeName] pairs from the file scope only. */
   bindings: [string, string][];
 }
 
@@ -256,8 +279,8 @@ export interface ParseWorkerResult {
   toolDefs: ExtractedToolDef[];
   ormQueries: ExtractedORMQuery[];
   constructorBindings: FileConstructorBindings[];
-  /** File-scope type bindings from TypeEnv fixpoint for exported symbol collection. */
-  typeEnvBindings: FileTypeEnvBindings[];
+  /** All-scope type bindings from TypeEnv for BindingAccumulator (includes function-local). */
+  fileScopeBindings: FileScopeBindings[];
   skippedLanguages: Record<string, number>;
   fileCount: number;
 }
@@ -690,7 +713,7 @@ const processBatch = (
     toolDefs: [],
     ormQueries: [],
     constructorBindings: [],
-    typeEnvBindings: [],
+    fileScopeBindings: [],
     skippedLanguages: {},
     fileCount: 0,
   };
@@ -1386,14 +1409,23 @@ const processFileGroup = (
       });
     }
 
-    // Extract file-scope bindings for ExportedTypeMap (closes worker/sequential quality gap).
-    // Sequential path uses collectExportedBindings(typeEnv) directly; worker path serializes
-    // these bindings so the main thread can merge them into ExportedTypeMap.
+    // Serialize file-scope bindings for BindingAccumulator. These feed the
+    // ExportedTypeMap enrichment loop in pipeline.ts — the only current
+    // consumer of worker-path binding data.
+    //
+    // Historical note: we previously serialized all scopes
+    // (`typeEnv.allScopes()`), which pushed ~4.9 MB of function-scope
+    // bindings across the IPC boundary on every worker batch with zero
+    // downstream readers. Narrowing to `fileScope()` recovers that cost.
+    // See the `FileScopeBindings` JSDoc above for the Phase 9 reversion
+    // path when a function-scope consumer lands.
     const fileScope = typeEnv.fileScope();
     if (fileScope.size > 0) {
-      const bindings: [string, string][] = [];
-      for (const [name, type] of fileScope) bindings.push([name, type]);
-      result.typeEnvBindings.push({ filePath: file.path, bindings });
+      const scopeBindings: [string, string][] = [];
+      for (const [varName, typeName] of fileScope) {
+        scopeBindings.push([varName, typeName]);
+      }
+      result.fileScopeBindings.push({ filePath: file.path, bindings: scopeBindings });
     }
 
     // Per-file map: decorator end-line → decorator info, for associating with definitions
@@ -2113,7 +2145,7 @@ let accumulated: ParseWorkerResult = {
   toolDefs: [],
   ormQueries: [],
   constructorBindings: [],
-  typeEnvBindings: [],
+  fileScopeBindings: [],
   skippedLanguages: {},
   fileCount: 0,
 };
@@ -2133,7 +2165,7 @@ const mergeResult = (target: ParseWorkerResult, src: ParseWorkerResult) => {
   target.toolDefs.push(...src.toolDefs);
   target.ormQueries.push(...src.ormQueries);
   target.constructorBindings.push(...src.constructorBindings);
-  target.typeEnvBindings.push(...src.typeEnvBindings);
+  target.fileScopeBindings.push(...src.fileScopeBindings);
   for (const [lang, count] of Object.entries(src.skippedLanguages)) {
     target.skippedLanguages[lang] = (target.skippedLanguages[lang] || 0) + count;
   }
@@ -2184,7 +2216,7 @@ parentPort!.on('message', (msg: WorkerIncomingMessage) => {
         toolDefs: [],
         ormQueries: [],
         constructorBindings: [],
-        typeEnvBindings: [],
+        fileScopeBindings: [],
         skippedLanguages: {},
         fileCount: 0,
       };
