@@ -1905,3 +1905,427 @@ describe('resolveCallTarget D0 skip conditions (SM-11)', () => {
     expect(result!.nodeId).toBe('method:User:save');
   });
 });
+
+// ---------------------------------------------------------------------------
+// resolveStaticCall — SM-12: constructor/static call resolution
+// ---------------------------------------------------------------------------
+
+import { resolveStaticCall } from '../../src/core/ingestion/call-processor.js';
+
+describe('resolveStaticCall', () => {
+  let ctx: ResolutionContext;
+
+  beforeEach(() => {
+    ctx = createResolutionContext();
+  });
+
+  it('resolves constructor with ownerId via lookupMethodByOwner', () => {
+    ctx.symbols.add('src/user.ts', 'User', 'class:User', 'Class');
+    ctx.symbols.add('src/user.ts', 'User', 'ctor:User', 'Constructor', {
+      returnType: 'User',
+      ownerId: 'class:User',
+    });
+    ctx.importMap.set('src/app.ts', new Set(['src/user.ts']));
+
+    const result = resolveStaticCall('User', 'src/app.ts', ctx);
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('ctor:User');
+  });
+
+  it('returns class node when no constructor exists', () => {
+    ctx.symbols.add('src/user.ts', 'User', 'class:User', 'Class');
+    ctx.importMap.set('src/app.ts', new Set(['src/user.ts']));
+
+    const result = resolveStaticCall('User', 'src/app.ts', ctx);
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('class:User');
+  });
+
+  it('returns null for non-class symbol', () => {
+    ctx.symbols.add('src/utils.ts', 'helper', 'func:helper', 'Function');
+    ctx.importMap.set('src/app.ts', new Set(['src/utils.ts']));
+
+    const result = resolveStaticCall('helper', 'src/app.ts', ctx);
+
+    expect(result).toBeNull();
+  });
+
+  it('returns null when className does not exist', () => {
+    const result = resolveStaticCall('NonExistent', 'src/app.ts', ctx);
+
+    expect(result).toBeNull();
+  });
+
+  it('returns null when Constructor nodes lack ownerId', () => {
+    ctx.symbols.add('src/user.ts', 'User', 'class:User', 'Class');
+    ctx.symbols.add('src/user.ts', 'User', 'ctor:User', 'Constructor', {
+      parameterCount: 1,
+    });
+    ctx.importMap.set('src/app.ts', new Set(['src/user.ts']));
+
+    // Constructor lacks ownerId, so lookupMethodByOwner won't find it.
+    // resolveStaticCall detects Constructor nodes and returns null to
+    // let filterCallableCandidates handle the Constructor-vs-Class preference.
+    const result = resolveStaticCall('User', 'src/app.ts', ctx);
+
+    expect(result).toBeNull();
+  });
+
+  it('disambiguates constructor by arity', () => {
+    ctx.symbols.add('src/user.ts', 'User', 'class:User', 'Class');
+    ctx.symbols.add('src/user.ts', 'User', 'ctor:User:0', 'Constructor', {
+      parameterCount: 0,
+      returnType: 'User',
+      ownerId: 'class:User',
+    });
+    ctx.symbols.add('src/user.ts', 'User', 'ctor:User:2', 'Constructor', {
+      parameterCount: 2,
+      returnType: 'User',
+      ownerId: 'class:User',
+    });
+    ctx.importMap.set('src/app.ts', new Set(['src/user.ts']));
+
+    const result = resolveStaticCall('User', 'src/app.ts', ctx, 2);
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('ctor:User:2');
+  });
+
+  it('returns correct confidence tier for import-scoped class', () => {
+    ctx.symbols.add('src/user.ts', 'User', 'class:User', 'Class');
+    ctx.importMap.set('src/app.ts', new Set(['src/user.ts']));
+
+    const result = resolveStaticCall('User', 'src/app.ts', ctx);
+
+    expect(result).not.toBeNull();
+    expect(result!.confidence).toBe(0.9); // import-scoped tier
+    expect(result!.reason).toBe('import-resolved');
+  });
+
+  it('returns correct confidence tier for same-file class', () => {
+    ctx.symbols.add('src/app.ts', 'User', 'class:User', 'Class');
+
+    const result = resolveStaticCall('User', 'src/app.ts', ctx);
+
+    expect(result).not.toBeNull();
+    expect(result!.confidence).toBe(0.95); // same-file tier
+    expect(result!.reason).toBe('same-file');
+  });
+
+  it('returns null for ambiguous homonym classes without constructor', () => {
+    ctx.symbols.add('src/a.ts', 'User', 'class:a:User', 'Class');
+    ctx.symbols.add('src/b.ts', 'User', 'class:b:User', 'Class');
+    ctx.importMap.set('src/app.ts', new Set(['src/a.ts', 'src/b.ts']));
+
+    const result = resolveStaticCall('User', 'src/app.ts', ctx);
+
+    // Two classes with same name — ambiguous, should return null
+    expect(result).toBeNull();
+  });
+
+  it('routes through resolveCallTarget for constructor callForm', () => {
+    ctx.symbols.add('src/user.ts', 'User', 'class:User', 'Class');
+    ctx.importMap.set('src/app.ts', new Set(['src/user.ts']));
+
+    const result = _resolveCallTargetForTesting(
+      {
+        calledName: 'User',
+        callForm: 'constructor',
+      },
+      'src/app.ts',
+      ctx,
+    );
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('class:User');
+  });
+
+  it('routes through resolveCallTarget for free-form call targeting a class (Swift/Kotlin)', () => {
+    ctx.symbols.add('src/user.swift', 'User', 'class:User', 'Class');
+    ctx.importMap.set('src/app.swift', new Set(['src/user.swift']));
+
+    const result = _resolveCallTargetForTesting(
+      {
+        calledName: 'User',
+        callForm: 'free',
+      },
+      'src/app.swift',
+      ctx,
+    );
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('class:User');
+  });
+
+  it('reuses the pre-computed tiered result instead of calling ctx.resolve twice', () => {
+    ctx.symbols.add('src/user.ts', 'User', 'class:User', 'Class');
+    ctx.symbols.add('src/user.ts', 'User', 'ctor:User', 'Constructor', {
+      returnType: 'User',
+      ownerId: 'class:User',
+    });
+    ctx.importMap.set('src/app.ts', new Set(['src/user.ts']));
+
+    // Spy on ctx.resolve to prove the override short-circuits the second lookup.
+    const originalResolve = ctx.resolve.bind(ctx);
+    let resolveCallCount = 0;
+    ctx.resolve = ((name: string, fromFile: string) => {
+      resolveCallCount++;
+      return originalResolve(name, fromFile);
+    }) as typeof ctx.resolve;
+
+    const tieredOverride = originalResolve('User', 'src/app.ts');
+    expect(tieredOverride).not.toBeNull();
+    resolveCallCount = 0; // reset after the setup call
+
+    const result = resolveStaticCall('User', 'src/app.ts', ctx, undefined, tieredOverride!);
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('ctor:User');
+    expect(resolveCallCount).toBe(0); // ctx.resolve must not have been called again
+  });
+
+  it('routes through resolveCallTarget for Java constructor call (new User())', () => {
+    ctx.symbols.add('src/User.java', 'User', 'class:java:User', 'Class');
+    ctx.symbols.add('src/User.java', 'User', 'ctor:java:User', 'Constructor', {
+      returnType: 'User',
+      ownerId: 'class:java:User',
+    });
+    ctx.importMap.set('src/App.java', new Set(['src/User.java']));
+
+    const result = _resolveCallTargetForTesting(
+      {
+        calledName: 'User',
+        callForm: 'constructor',
+      },
+      'src/App.java',
+      ctx,
+    );
+
+    expect(result).not.toBeNull();
+    // Prefers Constructor node over Class node when ownerId is present.
+    expect(result!.nodeId).toBe('ctor:java:User');
+  });
+
+  it('routes through resolveCallTarget for Python free-form constructor (User())', () => {
+    ctx.symbols.add('models/user.py', 'User', 'class:py:User', 'Class');
+    ctx.importMap.set('app.py', new Set(['models/user.py']));
+
+    const result = _resolveCallTargetForTesting(
+      {
+        calledName: 'User',
+        callForm: 'free',
+      },
+      'app.py',
+      ctx,
+    );
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('class:py:User');
+  });
+
+  it('routes through resolveCallTarget for Kotlin free-form constructor (User())', () => {
+    ctx.symbols.add('src/User.kt', 'User', 'class:kt:User', 'Class');
+    ctx.importMap.set('src/App.kt', new Set(['src/User.kt']));
+
+    const result = _resolveCallTargetForTesting(
+      {
+        calledName: 'User',
+        callForm: 'free',
+      },
+      'src/App.kt',
+      ctx,
+    );
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('class:kt:User');
+  });
+
+  // -------------------------------------------------------------------------
+  // Instantiability guard (Codex review follow-up, plan 2026-04-09-002):
+  // The step-5 class-node fallback must only return instantiable kinds
+  // (Class / Struct / Record). Interface / Trait / Impl / Enum targets are
+  // null-routed to prevent false CALLS edges to non-instantiable nodes.
+  // -------------------------------------------------------------------------
+
+  it('returns a Struct node when no constructor exists (positive regression guard)', () => {
+    ctx.symbols.add('src/user.rs', 'User', 'struct:User', 'Struct');
+    ctx.importMap.set('src/app.rs', new Set(['src/user.rs']));
+
+    const result = resolveStaticCall('User', 'src/app.rs', ctx);
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('struct:User');
+  });
+
+  it('returns a Record node when no constructor exists (positive regression guard)', () => {
+    ctx.symbols.add('src/User.cs', 'User', 'record:User', 'Record');
+    ctx.importMap.set('src/App.cs', new Set(['src/User.cs']));
+
+    const result = resolveStaticCall('User', 'src/App.cs', ctx);
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('record:User');
+  });
+
+  it('null-routes when the sole candidate is an Interface (Java/C#/TS)', () => {
+    // Constructor-shaped call on an interface name — not legal source, but
+    // the resolver must refuse to emit a CALLS edge to a non-instantiable node.
+    ctx.symbols.add('src/validator.java', 'IValidator', 'iface:IValidator', 'Interface');
+    ctx.importMap.set('src/app.java', new Set(['src/validator.java']));
+
+    const result = resolveStaticCall('IValidator', 'src/app.java', ctx);
+
+    expect(result).toBeNull();
+  });
+
+  it('null-routes when the sole candidate is a Trait (PHP/Rust/Scala)', () => {
+    // PHP `HasTimestamps` trait — not instantiable via constructor syntax.
+    ctx.symbols.add('src/timestamps.php', 'HasTimestamps', 'trait:HasTimestamps', 'Trait');
+    ctx.importMap.set('src/model.php', new Set(['src/timestamps.php']));
+
+    const result = resolveStaticCall('HasTimestamps', 'src/model.php', ctx);
+
+    expect(result).toBeNull();
+  });
+
+  it('null-routes when the sole candidate is a Rust Trait (Display)', () => {
+    ctx.symbols.add('src/fmt.rs', 'Display', 'trait:rs:Display', 'Trait');
+    ctx.importMap.set('src/app.rs', new Set(['src/fmt.rs']));
+
+    const result = resolveStaticCall('Display', 'src/app.rs', ctx);
+
+    expect(result).toBeNull();
+  });
+
+  it('prefers the Struct over the Impl when both share the same name and file (Rust shadowing)', () => {
+    // Rust `impl User { ... }` alongside `struct User { ... }` in the same file.
+    // Same-file tier returns both via lookupExactAll, both pass CLASS_LIKE_TYPES,
+    // but the instantiability filter must strip the Impl so the Struct wins.
+    ctx.symbols.add('src/user.rs', 'User', 'struct:rs:User', 'Struct');
+    ctx.symbols.add('src/user.rs', 'User', 'impl:rs:User', 'Impl');
+
+    const result = resolveStaticCall('User', 'src/user.rs', ctx);
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('struct:rs:User');
+  });
+
+  it('null-routes when the sole candidate is a Rust Impl block (no Struct present)', () => {
+    // Pathological extractor output: only the Impl survives tier resolution.
+    // The instantiability filter must reject it rather than emit a wrong edge.
+    ctx.symbols.add('src/user.rs', 'User', 'impl:rs:User', 'Impl');
+
+    const result = resolveStaticCall('User', 'src/user.rs', ctx);
+
+    expect(result).toBeNull();
+  });
+
+  it('still returns an explicit Constructor even when the owner is an Impl (step-3 preservation)', () => {
+    // Step 3 (lookupMethodByOwner walk) must not be affected by the step-5
+    // tightening — a legitimate Constructor node owned by an Impl in a Rust
+    // extractor still resolves correctly. The Struct is also present so that
+    // step-1's lookupClassByName pre-check succeeds (Impl alone isn't in the
+    // classByName index).
+    ctx.symbols.add('src/user.rs', 'User', 'struct:rs:User', 'Struct');
+    ctx.symbols.add('src/user.rs', 'User', 'impl:rs:User', 'Impl');
+    ctx.symbols.add('src/user.rs', 'User', 'ctor:rs:User', 'Constructor', {
+      returnType: 'User',
+      ownerId: 'impl:rs:User',
+    });
+    ctx.importMap.set('src/app.rs', new Set(['src/user.rs']));
+
+    const result = resolveStaticCall('User', 'src/app.rs', ctx);
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('ctor:rs:User');
+  });
+
+  it('routes through resolveCallTarget and null-routes Interface constructor-shaped calls', () => {
+    ctx.symbols.add('src/validator.java', 'IValidator', 'iface:IValidator', 'Interface');
+    ctx.importMap.set('src/app.java', new Set(['src/validator.java']));
+
+    const result = _resolveCallTargetForTesting(
+      {
+        calledName: 'IValidator',
+        callForm: 'constructor',
+      },
+      'src/app.java',
+      ctx,
+    );
+
+    // Full cascade: S0 → resolveStaticCall → step-5 instantiability filter → null.
+    // If any downstream path silently re-introduces the wrong edge, this fails.
+    expect(result).toBeNull();
+  });
+
+  it('routes through resolveCallTarget and null-routes Trait free-form calls', () => {
+    ctx.symbols.add('src/timestamps.php', 'HasTimestamps', 'trait:HasTimestamps', 'Trait');
+    ctx.importMap.set('src/model.php', new Set(['src/timestamps.php']));
+
+    const result = _resolveCallTargetForTesting(
+      {
+        calledName: 'HasTimestamps',
+        callForm: 'free',
+      },
+      'src/model.php',
+      ctx,
+    );
+
+    expect(result).toBeNull();
+  });
+
+  it('routes Record free-form constructor call through S0 (C# record / Kotlin data class)', () => {
+    // Verifies that `freeFormHasClassTarget` triggers S0 for Record candidates.
+    // Before the alignment fix, `Record` was absent from the trigger `.some()`,
+    // so S0 was bypassed and Record free-form calls fell through to the
+    // constructor-form retry path. This test would have silently passed with
+    // the old (wasteful) code path — with the fix, S0 resolves it directly.
+    ctx.symbols.add('src/User.cs', 'User', 'record:cs:User', 'Record');
+    ctx.importMap.set('src/App.cs', new Set(['src/User.cs']));
+
+    const result = _resolveCallTargetForTesting(
+      {
+        calledName: 'User',
+        callForm: 'free',
+      },
+      'src/App.cs',
+      ctx,
+    );
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('record:cs:User');
+  });
+
+  it('threads argCount through resolveCallTarget → S0 → resolveStaticCall for arity disambiguation', () => {
+    // Regression guard: if call.argCount were ever dropped at the S0 call
+    // site, the 2-arg constructor would resolve to the 0-arg overload (or
+    // return null via ambiguity). This test fails in either case.
+    ctx.symbols.add('src/user.ts', 'User', 'class:User', 'Class');
+    ctx.symbols.add('src/user.ts', 'User', 'ctor:User:0', 'Constructor', {
+      parameterCount: 0,
+      returnType: 'User',
+      ownerId: 'class:User',
+    });
+    ctx.symbols.add('src/user.ts', 'User', 'ctor:User:2', 'Constructor', {
+      parameterCount: 2,
+      returnType: 'User',
+      ownerId: 'class:User',
+    });
+    ctx.importMap.set('src/app.ts', new Set(['src/user.ts']));
+
+    const result = _resolveCallTargetForTesting(
+      {
+        calledName: 'User',
+        callForm: 'constructor',
+        argCount: 2,
+      },
+      'src/app.ts',
+      ctx,
+    );
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('ctor:User:2');
+  });
+});

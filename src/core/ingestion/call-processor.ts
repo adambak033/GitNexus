@@ -1,9 +1,11 @@
 import { KnowledgeGraph } from '../graph/types.js';
 import { ASTCache } from './ast-cache.js';
 import type { SymbolDefinition, SymbolTable } from './symbol-table.js';
+import { CLASS_TYPES } from './symbol-table.js';
 import Parser from 'tree-sitter';
 import type { ResolutionContext } from './resolution-context.js';
 import { TIER_CONFIDENCE, type ResolutionTier } from './resolution-context.js';
+import type { TieredCandidates } from './resolution-context.js';
 import { isLanguageAvailable, loadParser, loadLanguage } from '../tree-sitter/parser-loader.js';
 import { getProvider } from './languages/index.js';
 import { generateId } from '../../lib/utils.js';
@@ -52,8 +54,51 @@ import { extractParsedCallSite } from './call-sites/extract-language-call-site.j
  *  Populated during call processing, consumed by Phase 14 re-resolution pass. */
 export type ExportedTypeMap = Map<string, Map<string, string>>;
 
-/** Types that represent class-like declarations (used for receiver/owner resolution). */
-const CLASS_LIKE_TYPES = new Set(['Class', 'Struct', 'Interface', 'Enum', 'Record', 'Impl']);
+/**
+ * Type labels treated as class-like **method-dispatch receivers** by the call
+ * resolver — the set walked by the MRO / heritage path for member and static
+ * method calls.
+ *
+ * Derived from `CLASS_TYPES` (the heritage-index set in symbol-table) plus
+ * `Impl` — Rust `impl` blocks are the definition site of methods for a struct
+ * and must be walkable as receiver-type candidates even though they are not
+ * indexed by `lookupClassByName` (which keys off struct/trait names). Keeping
+ * this set a strict superset of `CLASS_TYPES` guarantees that anything
+ * reachable via `lookupClassByName` also passes this filter, so the two call
+ * paths cannot diverge silently.
+ *
+ * `Interface` is included even though interfaces cannot be directly
+ * instantiated in Java/C#/TypeScript: the resolver still needs to reach
+ * interface nodes for static-method dispatch (`Interface.staticMethod()`) and
+ * default-method resolution via the MRO walker.
+ *
+ * **Do not reuse this set for constructor-fallback filtering.** Constructors
+ * can only instantiate a narrower subset — see `INSTANTIABLE_CLASS_TYPES`
+ * below. `resolveStaticCall`'s step-5 class-node fallback uses the narrower
+ * set to prevent false `CALLS` edges from constructor-shaped calls to
+ * `Interface`, `Trait`, or `Impl` nodes.
+ */
+const CLASS_LIKE_TYPES = new Set<string>([...CLASS_TYPES, 'Impl']);
+
+/**
+ * Type labels that can be the target of a constructor-shaped call when no
+ * explicit `Constructor` symbol is indexed — the "return the type itself as
+ * the call target" fallback set.
+ *
+ * Strict subset of both `CLASS_LIKE_TYPES` and `CONSTRUCTOR_TARGET_TYPES`.
+ * Excludes:
+ *   - `Interface` / `Trait` — not instantiable by definition in any
+ *     supported language.
+ *   - `Impl` — Rust `impl` blocks are method-definition containers, not
+ *     the type itself; the owning `Struct` is the correct target.
+ *   - `Enum` — excluded pending language-specific support with motivating
+ *     test fixtures (matches `CONSTRUCTOR_TARGET_TYPES`).
+ *
+ * Used exclusively by `resolveStaticCall`'s step-5 class-node fallback.
+ * Keep in sync with `CONSTRUCTOR_TARGET_TYPES` (which additionally contains
+ * `'Constructor'` for explicit-constructor-node filtering) when extending.
+ */
+const INSTANTIABLE_CLASS_TYPES = new Set<string>(['Class', 'Struct', 'Record']);
 
 const MAX_EXPORTS_PER_FILE = 500;
 const MAX_TYPE_NAME_LENGTH = 256;
@@ -1331,14 +1376,55 @@ const resolveCallTarget = (
     call.callForm,
   );
 
+  // S0. Constructor/static fast path (SM-12): O(1) class + constructor lookup
+  //     via lookupClassByName + lookupMethodByOwner before falling back to the
+  //     existing filtering + fuzzy-widening path. Falls back to the class node
+  //     itself when no Constructor symbol is indexed for the type.
+  //
+  //     Handles:
+  //     (a) callForm === 'constructor' — explicit `new User()` in Java/TS/C#/etc.
+  //     (b) callForm === 'free' with class target — implicit `User()` in Swift/Kotlin
+  //
+  //     Known gaps (handled by the existing tail fallback at the bottom of
+  //     this function, not S0):
+  //     - `callForm === 'member'` constructor patterns (e.g. Python
+  //       `models.User()` after `import models`, Ruby `User.new`). Extending
+  //       S0 to cover them would require threading receiver-type resolution
+  //       through the module-alias logic; revisit if it shows up as a hot
+  //       spot.
+  //
+  //     The `.some()` trigger below must stay aligned with
+  //     `INSTANTIABLE_CLASS_TYPES` — any type admitted here that is not in
+  //     that set will cause S0 → `resolveStaticCall` to run and return null,
+  //     wasting two lookup passes per call. `Enum` is deliberately excluded
+  //     (same rationale as `INSTANTIABLE_CLASS_TYPES`); `Record` is included
+  //     so C# records and Kotlin data classes reach the fast path.
+  const freeFormHasClassTarget =
+    call.callForm === 'free' &&
+    filteredCandidates.length === 0 &&
+    tiered.candidates.some((c) => c.type === 'Class' || c.type === 'Struct' || c.type === 'Record');
+  if (call.callForm === 'constructor' || freeFormHasClassTarget) {
+    // Reuse the pre-computed `tiered` result — resolveStaticCall's class name
+    // is identical to `call.calledName` here, so re-running ctx.resolve would
+    // duplicate the tiered-lookup work performed at the top of this function.
+    const staticResult = resolveStaticCall(
+      call.calledName,
+      currentFile,
+      ctx,
+      call.argCount,
+      tiered,
+    );
+    if (staticResult) return staticResult;
+  }
+
   // Swift/Kotlin: constructor calls look like free function calls (no `new` keyword).
   // If free-form filtering found no callable candidates but the symbol resolves to a
   // Class/Struct, retry with constructor form so CONSTRUCTOR_TARGET_TYPES applies.
   if (filteredCandidates.length === 0 && call.callForm === 'free') {
-    const hasTypeTarget = tiered.candidates.some(
-      (c) => c.type === 'Class' || c.type === 'Struct' || c.type === 'Enum',
-    );
-    if (hasTypeTarget) {
+    // `freeFormHasClassTarget` was already computed for the S0 fast path
+    // above under the same `callForm === 'free' && filteredCandidates.length === 0`
+    // precondition. Reuse it to avoid a second `.some()` scan on the same pool.
+    if (freeFormHasClassTarget) {
       filteredCandidates = filterCallableCandidates(
         tiered.candidates,
         call.argCount,
@@ -1841,6 +1927,153 @@ export const resolveMemberCall = (
   );
   if (!resolved) return null;
   return toResolveResult(resolved.def, resolved.tier);
+};
+
+// ---------------------------------------------------------------------------
+// SM-12: Constructor/static call resolution (no fuzzy lookup)
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve a constructor or static call using class-scoped lookup (no fuzzy lookup).
+ * Used for `new User()` / `User()` calls where the calledName targets a class.
+ *
+ * Uses {@link SymbolTable.lookupClassByName} for O(1) class lookup and
+ * {@link SymbolTable.lookupMethodByOwner} for constructor resolution.
+ * {@link resolveCallTarget} delegates here for constructor and free-form calls
+ * that target a class, before falling back to the more expensive fuzzy-widening
+ * path (D1-D4).
+ *
+ * Resolution strategy:
+ *   1. `lookupClassByName(className)` — O(1) pre-check; bail early if no class exists.
+ *   2. `ctx.resolve(className, currentFile)` — import-scoped tier for confidence.
+ *   3. Filter to class-like candidates via `CLASS_LIKE_TYPES` and walk each
+ *      with `lookupMethodByOwner(classNodeId, className, argCount)` — O(1)
+ *      constructor lookup. Only accept results with `type === 'Constructor'`.
+ *   4. If step 3 found nothing and the tiered pool contains ownerless
+ *      `Constructor` nodes (common in some extractors), bail out so
+ *      `filterCallableCandidates` downstream handles Constructor-vs-Class
+ *      preference correctly.
+ *   5. Class-node fallback: filter `classCandidates` through
+ *      `INSTANTIABLE_CLASS_TYPES` and return the sole survivor when there is
+ *      exactly one. Null-route on zero survivors (Interface / Trait / Impl
+ *      stripped) or multiple (homonym ambiguity).
+ *
+ * @param className   - The class name (e.g. 'User'). Also used as the method
+ *                       name for the `lookupMethodByOwner` scan, because the
+ *                       only constructor-shaped call we handle today is
+ *                       `ClassName(...)` / `new ClassName(...)`. Named
+ *                       constructors like Dart `User.fromJson()` arrive as
+ *                       member calls and route through `resolveMemberCall`,
+ *                       so this function does not yet need a separate
+ *                       `methodName` parameter. Revisit if a language surfaces
+ *                       a static-method-shaped call with a distinct member
+ *                       name.
+ * @param currentFile - File path of the call site
+ * @param ctx         - Resolution context
+ * @param argCount    - Optional argument count for arity filtering
+ * @param tieredOverride - Pre-computed tiered candidates for `className` from
+ *                       an upstream `ctx.resolve` call. When provided, skips
+ *                       the redundant lookup inside this function. Leave
+ *                       unset for direct callers without a prior resolution.
+ */
+export const resolveStaticCall = (
+  className: string,
+  currentFile: string,
+  ctx: ResolutionContext,
+  argCount?: number,
+  tieredOverride?: TieredCandidates,
+): ResolveResult | null => {
+  // 1. Pre-check: does a class with this name exist at all? (O(1))
+  //    This guards against the expensive `ctx.resolve` walk when the name
+  //    is clearly not class-like (e.g. plain functions). When `tieredOverride`
+  //    is supplied, the caller has already paid for the tiered lookup, so this
+  //    pre-check still prevents the class-candidate filter + lookupMethodByOwner
+  //    loop from running on obviously non-class targets.
+  const allClasses = ctx.symbols.lookupClassByName(className);
+  if (allClasses.length === 0) return null;
+
+  // 2. Scope via ctx.resolve for import-tier information. Reuse the caller's
+  //    tiered result when provided — it is computed from the same name and
+  //    file context, so re-running the walk would be a pure waste.
+  const typeResolved = tieredOverride ?? ctx.resolve(className, currentFile);
+  if (!typeResolved) return null;
+
+  const classCandidates = typeResolved.candidates.filter((c) => CLASS_LIKE_TYPES.has(c.type));
+  if (classCandidates.length === 0) return null;
+
+  // 3. Try lookupMethodByOwner for explicit Constructor nodes.
+  //    Only accept results with type === 'Constructor' — a Method or Function
+  //    that happens to share the class name (e.g. C++ methods named after
+  //    their class) is not a constructor for resolution purposes.
+  //    Same dedup logic as resolveMethodByOwner: diamond inheritance converging
+  //    on the same constructor collapses to one hit.
+  //
+  //    Same-name assumption: the lookup key is `${candidate.nodeId}\0${className}`,
+  //    so this finds Constructor nodes whose symbol name equals the class name
+  //    (`class User` with a `Constructor` named `User`). Constructors indexed
+  //    under a different name (e.g. Python `__init__`) will not be found here —
+  //    but they also won't appear in the tiered pool for `ctx.resolve(className)`
+  //    for the same reason, so step 4's Constructor-presence check will not
+  //    see them either. The two miss cases are symmetric. If a future extractor
+  //    indexes Constructor nodes under an alternative name while still setting
+  //    `ownerId`, this assumption will need revisiting.
+  let firstDef: SymbolDefinition | undefined;
+  let ambiguous = false;
+  for (const candidate of classCandidates) {
+    const def = ctx.symbols.lookupMethodByOwner(candidate.nodeId, className, argCount);
+    if (!def || def.type !== 'Constructor') continue;
+    if (!firstDef) {
+      firstDef = def;
+    } else if (def.nodeId !== firstDef.nodeId) {
+      ambiguous = true;
+      break;
+    }
+  }
+
+  if (firstDef && !ambiguous) {
+    return toResolveResult(firstDef, typeResolved.tier);
+  }
+
+  // 4. lookupMethodByOwner found nothing — check whether the tiered pool
+  //    contains Constructor nodes that lack ownerId (common in some extractors).
+  //    If so, bail out so the existing filterCallableCandidates path handles
+  //    Constructor-vs-Class preference correctly.
+  //
+  //    This branch also catches the step-3 ambiguous case (`ambiguous = true`
+  //    with two distinct Constructor nodes across multiple class candidates):
+  //    the same Constructor nodes are indexed under the class name in the
+  //    tiered pool, so `.some(Constructor)` is true here and we defer to
+  //    `filterCallableCandidates` downstream rather than guess which overload
+  //    to pick. Do not remove this check without also handling the ambiguous
+  //    step-3 path explicitly.
+  if (typeResolved.candidates.some((c) => c.type === 'Constructor')) {
+    return null;
+  }
+
+  // 5. No constructor nodes at all — fall back to the class node itself, but
+  //    ONLY when it is actually instantiable. Interface / Trait / Impl / Enum
+  //    are deliberately excluded via `INSTANTIABLE_CLASS_TYPES` to prevent
+  //    false `CALLS` edges from constructor-shaped calls to non-instantiable
+  //    nodes. This also disambiguates the Rust same-file shadowing case
+  //    (`struct User` + `impl User` both present at same-file tier): the
+  //    Impl is stripped, leaving the Struct as the sole instantiable target.
+  //    Addresses Codex review finding on PR #754.
+  const instantiableCandidates = classCandidates.filter((c) =>
+    INSTANTIABLE_CLASS_TYPES.has(c.type),
+  );
+  // Three outcomes below, in order of likelihood after the fix:
+  //   length === 0 → all candidates were stripped as non-instantiable (e.g.
+  //     Interface / Trait / Impl). Null-route via the fall-through `return
+  //     null` — this is the dominant Codex-fix case.
+  //   length === 1 → a single instantiable candidate remains, return it.
+  //   length  >  1 → two or more instantiable classes share the name (e.g.
+  //     homonym classes across files with no import narrowing). Fall through
+  //     to `return null` so the caller null-routes rather than guess.
+  if (instantiableCandidates.length === 1) {
+    return toResolveResult(instantiableCandidates[0], typeResolved.tier);
+  }
+
+  return null;
 };
 
 // ---------------------------------------------------------------------------
