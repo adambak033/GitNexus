@@ -83,17 +83,15 @@ const createMockSymbolTable = (overrides: Partial<SymbolTable> = {}): SymbolTabl
   lookupExact: () => undefined,
   lookupExactFull: () => undefined,
   lookupExactAll: () => [],
-  lookupFuzzy: () => [],
-  lookupFuzzyCallable: () => [],
+  lookupCallableByName: () => [],
   lookupFieldByOwner: () => undefined,
   lookupMethodByOwner: () => undefined,
   lookupClassByName: () => [],
   lookupClassByQualifiedName: () => [],
+  lookupImplByName: () => [],
+  getFiles: () => [][Symbol.iterator](),
   getStats: () => ({
     fileCount: 0,
-    globalSymbolCount: 0,
-    fuzzyCallCount: 0,
-    fuzzyCallableCallCount: 0,
   }),
   clear: () => {},
   ...overrides,
@@ -1195,7 +1193,7 @@ class RepoService {
   describe('destructured call results', () => {
     // Minimal mock SymbolTable for call-result return type lookup
     const makeSymbolTable = (callables: Array<{ name: string; returnType?: string }>) => ({
-      lookupFuzzyCallable: (name: string) =>
+      lookupCallableByName: (name: string) =>
         callables
           .filter((c) => c.name === name)
           .map((c) => ({
@@ -1205,11 +1203,10 @@ class RepoService {
             returnType: c.returnType,
           })),
       lookupClassByName: () => [],
-      lookupFuzzy: () => [],
       lookupExact: () => undefined,
       lookupExactFull: () => undefined,
       add: () => {},
-      getStats: () => ({ fileCount: 0, globalSymbolCount: 0 }),
+      getStats: () => ({ fileCount: 0 }),
       clear: () => {},
     });
 
@@ -2055,7 +2052,7 @@ class RepoService {
           lookupExact: () => undefined,
           lookupExactFull: () => undefined,
           add: () => {},
-          getStats: () => ({ fileCount: 0, globalSymbolCount: 0 }),
+          getStats: () => ({ fileCount: 0 }),
           clear: () => {},
         };
         const typeEnv = buildTypeEnv(tree, 'kotlin', { symbolTable: mockSymbolTable as any });
@@ -2073,14 +2070,12 @@ class RepoService {
         );
         const mockSymbolTable = {
           lookupClassByName: () => [],
-          lookupFuzzy: (name: string) =>
-            name === 'doStuff' ? [{ nodeId: 'n1', filePath: 'utils.kt', type: 'Function' }] : [],
-          lookupFuzzyCallable: () => [],
+          lookupCallableByName: () => [],
           lookupFieldByOwner: () => undefined,
           lookupExact: () => undefined,
           lookupExactFull: () => undefined,
           add: () => {},
-          getStats: () => ({ fileCount: 0, globalSymbolCount: 0 }),
+          getStats: () => ({ fileCount: 0 }),
           clear: () => {},
         };
         const typeEnv = buildTypeEnv(tree, 'kotlin', { symbolTable: mockSymbolTable as any });
@@ -2460,7 +2455,7 @@ function process(repo: Repo) {
 `,
           TypeScript.typescript,
         );
-        const lookupFuzzyCallable = vi.fn(() => []);
+        const lookupCallableByName = vi.fn(() => []);
         const symbolTable = createMockSymbolTable({
           lookupClassByName: (name: string) =>
             name === 'Repo' ? [createClassDef('Repo', 'Class', 'models.ts')] : [],
@@ -2474,11 +2469,11 @@ function process(repo: Repo) {
                   returnType: 'Profile',
                 }
               : undefined,
-          lookupFuzzyCallable,
+          lookupCallableByName,
         });
         const typeEnv = buildTypeEnv(tree, 'typescript', { symbolTable });
         expect(flatGet(typeEnv, 'profile')).toBe('Profile');
-        expect(lookupFuzzyCallable).not.toHaveBeenCalledWith('getProfile');
+        expect(lookupCallableByName).not.toHaveBeenCalledWith('getProfile');
       });
 
       it('inherited method return type resolution uses lookupMethodByOwner on parent owners', () => {
@@ -2490,7 +2485,7 @@ function process(repo: Repo) {
 `,
           TypeScript.typescript,
         );
-        const lookupFuzzyCallable = vi.fn(() => []);
+        const lookupCallableByName = vi.fn(() => []);
         const symbolTable = createMockSymbolTable({
           lookupClassByName: (name: string) => {
             if (name === 'Repo') return [createClassDef('Repo', 'Class', 'models.ts')];
@@ -2507,14 +2502,14 @@ function process(repo: Repo) {
                   returnType: 'Profile',
                 }
               : undefined,
-          lookupFuzzyCallable,
+          lookupCallableByName,
         });
         const typeEnv = buildTypeEnv(tree, 'typescript', {
           symbolTable,
           parentMap: new Map([['Repo', ['BaseRepo']]]),
         });
         expect(flatGet(typeEnv, 'profile')).toBe('Profile');
-        expect(lookupFuzzyCallable).not.toHaveBeenCalledWith('getProfile');
+        expect(lookupCallableByName).not.toHaveBeenCalledWith('getProfile');
       });
 
       it('method return type resolution handles multiple class defs when only one owner has the method', () => {
@@ -2526,7 +2521,7 @@ function process(repo: Repo) {
 `,
           TypeScript.typescript,
         );
-        const lookupFuzzyCallable = vi.fn(() => []);
+        const lookupCallableByName = vi.fn(() => []);
         const symbolTable = createMockSymbolTable({
           lookupClassByName: (name: string) =>
             name === 'Repo'
@@ -2549,11 +2544,11 @@ function process(repo: Repo) {
                 }
               : undefined,
           lookupExactAll: () => [],
-          lookupFuzzyCallable,
+          lookupCallableByName,
         });
         const typeEnv = buildTypeEnv(tree, 'typescript', { symbolTable });
         expect(flatGet(typeEnv, 'profile')).toBe('Profile');
-        expect(lookupFuzzyCallable).not.toHaveBeenCalledWith('getProfile');
+        expect(lookupCallableByName).not.toHaveBeenCalledWith('getProfile');
       });
 
       it('method return type resolution with multiple class defs falls back to MRO when direct owners miss', () => {
@@ -2565,7 +2560,7 @@ function process(repo: Repo) {
 `,
           TypeScript.typescript,
         );
-        const lookupFuzzyCallable = vi.fn(() => []);
+        const lookupCallableByName = vi.fn(() => []);
         const symbolTable = createMockSymbolTable({
           lookupClassByName: (name: string) => {
             if (name === 'Repo') {
@@ -2588,14 +2583,14 @@ function process(repo: Repo) {
                 }
               : undefined,
           lookupExactAll: () => [],
-          lookupFuzzyCallable,
+          lookupCallableByName,
         });
         const typeEnv = buildTypeEnv(tree, 'typescript', {
           symbolTable,
           parentMap: new Map([['Repo', ['BaseRepo']]]),
         });
         expect(flatGet(typeEnv, 'profile')).toBe('Profile');
-        expect(lookupFuzzyCallable).not.toHaveBeenCalledWith('getProfile');
+        expect(lookupCallableByName).not.toHaveBeenCalledWith('getProfile');
       });
 
       it('method return type resolution stays unresolved when multiple class defs each define the method', () => {
@@ -2607,7 +2602,7 @@ function process(repo: Repo) {
 `,
           TypeScript.typescript,
         );
-        const lookupFuzzyCallable = vi.fn(() => []);
+        const lookupCallableByName = vi.fn(() => []);
         const symbolTable = createMockSymbolTable({
           lookupClassByName: (name: string) =>
             name === 'Repo'
@@ -2642,11 +2637,11 @@ function process(repo: Repo) {
             return undefined;
           },
           lookupExactAll: () => [],
-          lookupFuzzyCallable,
+          lookupCallableByName,
         });
         const typeEnv = buildTypeEnv(tree, 'typescript', { symbolTable });
         expect(flatGet(typeEnv, 'profile')).toBeUndefined();
-        expect(lookupFuzzyCallable).not.toHaveBeenCalledWith('getProfile');
+        expect(lookupCallableByName).not.toHaveBeenCalledWith('getProfile');
       });
 
       it('method return type resolution preserves same-return overload success', () => {
@@ -2658,7 +2653,7 @@ function process(repo: Repo) {
 `,
           TypeScript.typescript,
         );
-        const lookupFuzzyCallable = vi.fn(() => []);
+        const lookupCallableByName = vi.fn(() => []);
         const symbolTable = createMockSymbolTable({
           lookupClassByName: (name: string) =>
             name === 'Repo' ? [createClassDef('Repo', 'Class', 'models.ts')] : [],
@@ -2691,11 +2686,11 @@ function process(repo: Repo) {
                   },
                 ]
               : [],
-          lookupFuzzyCallable,
+          lookupCallableByName,
         });
         const typeEnv = buildTypeEnv(tree, 'typescript', { symbolTable });
         expect(flatGet(typeEnv, 'profile')).toBe('Profile');
-        expect(lookupFuzzyCallable).not.toHaveBeenCalledWith('getProfile');
+        expect(lookupCallableByName).not.toHaveBeenCalledWith('getProfile');
       });
 
       it('method return type resolution stays unresolved for ambiguous overloads with differing returns', () => {
@@ -2707,7 +2702,7 @@ function process(repo: Repo) {
 `,
           TypeScript.typescript,
         );
-        const lookupFuzzyCallable = vi.fn(() => []);
+        const lookupCallableByName = vi.fn(() => []);
         const symbolTable = createMockSymbolTable({
           lookupClassByName: (name: string) => {
             if (name === 'Repo') return [createClassDef('Repo', 'Class', 'models.ts')];
@@ -2743,14 +2738,14 @@ function process(repo: Repo) {
                   },
                 ]
               : [],
-          lookupFuzzyCallable,
+          lookupCallableByName,
         });
         const typeEnv = buildTypeEnv(tree, 'typescript', {
           symbolTable,
           parentMap: new Map([['Repo', ['BaseRepo']]]),
         });
         expect(flatGet(typeEnv, 'profile')).toBeUndefined();
-        expect(lookupFuzzyCallable).not.toHaveBeenCalledWith('getProfile');
+        expect(lookupCallableByName).not.toHaveBeenCalledWith('getProfile');
       });
 
       it('inherited method return type resolution preserves same-return overload success on parent owners', () => {
@@ -2762,7 +2757,7 @@ function process(repo: Repo) {
 `,
           TypeScript.typescript,
         );
-        const lookupFuzzyCallable = vi.fn(() => []);
+        const lookupCallableByName = vi.fn(() => []);
         const symbolTable = createMockSymbolTable({
           lookupClassByName: (name: string) => {
             if (name === 'Repo') return [createClassDef('Repo', 'Class', 'models.ts')];
@@ -2798,14 +2793,14 @@ function process(repo: Repo) {
                   },
                 ]
               : [],
-          lookupFuzzyCallable,
+          lookupCallableByName,
         });
         const typeEnv = buildTypeEnv(tree, 'typescript', {
           symbolTable,
           parentMap: new Map([['Repo', ['BaseRepo']]]),
         });
         expect(flatGet(typeEnv, 'profile')).toBe('Profile');
-        expect(lookupFuzzyCallable).not.toHaveBeenCalledWith('getProfile');
+        expect(lookupCallableByName).not.toHaveBeenCalledWith('getProfile');
       });
 
       it('inherited method return type resolution stays unresolved for ambiguous overloads on parent owners', () => {
@@ -2830,13 +2825,13 @@ function process(repo: Repo) {
           parameterCount: 2,
           returnType: 'Admin',
         });
-        const lookupFuzzyCallable = vi.spyOn(symbolTable, 'lookupFuzzyCallable');
+        const lookupCallableByName = vi.spyOn(symbolTable, 'lookupCallableByName');
         const typeEnv = buildTypeEnv(tree, 'typescript', {
           symbolTable,
           parentMap: new Map([['Repo', ['BaseRepo']]]),
         });
         expect(flatGet(typeEnv, 'profile')).toBeUndefined();
-        expect(lookupFuzzyCallable).not.toHaveBeenCalled();
+        expect(lookupCallableByName).not.toHaveBeenCalled();
       });
     });
 
@@ -5747,7 +5742,7 @@ function process() {
   describe('importedReturnTypes (Phase 14 E3)', () => {
     // Minimal mock SymbolTable that returns a known callable
     const makeSymbolTable = (callables: Array<{ name: string; returnType?: string }>) => ({
-      lookupFuzzyCallable: (name: string) =>
+      lookupCallableByName: (name: string) =>
         callables
           .filter((c) => c.name === name)
           .map((c) => ({
@@ -5757,11 +5752,10 @@ function process() {
             returnType: c.returnType,
           })),
       lookupClassByName: () => [],
-      lookupFuzzy: () => [],
       lookupExact: () => undefined,
       lookupExactFull: () => undefined,
       add: () => {},
-      getStats: () => ({ fileCount: 0, globalSymbolCount: 0 }),
+      getStats: () => ({ fileCount: 0 }),
       clear: () => {},
     });
 
