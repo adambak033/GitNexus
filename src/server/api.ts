@@ -480,12 +480,84 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
     activeRepoPaths.delete(repoPath);
   };
 
-  // Helper: resolve a repo by name from the global registry, or default to first
-  const resolveRepo = async (repoName?: string) => {
+  /**
+   * Maximum time the hold-queue will wait for an active analysis job to complete.
+   * Must stay in sync with the frontend's `fetchRepoInfo({ awaitAnalysis: true })` timeout.
+   */
+  const HOLD_QUEUE_TIMEOUT_SECS = 300; // 5 minutes
+
+  // Helper: resolve a repo by name from the global registry, or default to first.
+  // Pass `req` to enable early exit if the client disconnects during the hold-queue wait.
+  const resolveRepo = async (repoName?: string, isRetry = false, req?: any): Promise<any> => {
     const repos = await listRegisteredRepos();
-    if (repos.length === 0) return null;
-    if (repoName) return repos.find((r) => r.name === repoName) || null;
-    return repos[0]; // default to first
+    let found = null;
+
+    // Normalize: if a full path is passed, extract just the basename.
+    // e.g. "C:\Users\LENOVO\.gitnexus\repos\todo.txt-cli" -> "todo.txt-cli"
+    const normalizedName = repoName ? path.basename(repoName) : undefined;
+
+    if (normalizedName) {
+      found =
+        repos.find((r) => r.name === normalizedName) ||
+        repos.find((r) => r.name.toLowerCase() === normalizedName.toLowerCase()) ||
+        null;
+    } else if (repos.length > 0) {
+      found = repos[0]; // default to first repo
+    }
+
+    // If not yet in the registry, check whether a background job is actively cloning or
+    // analyzing this repo. Hold the connection open (up to 5 minutes) until it completes.
+    // We only wait for in-progress jobs ('queued'|'cloning'|'analyzing') — a 'complete' job
+    // whose repo is still missing means the registry sync failed; the fallback below handles it.
+    if (!found && normalizedName) {
+      const lower = normalizedName.toLowerCase();
+
+      // Track client disconnect to cancel the wait early
+      let clientGone = false;
+      req?.on('close', () => {
+        clientGone = true;
+      });
+
+      for (const job of jobManager.listJobs()) {
+        const isMatch =
+          job.repoName?.toLowerCase() === lower ||
+          (job.repoUrl && path.basename(job.repoUrl).replace('.git', '').toLowerCase() === lower) ||
+          (job.repoPath && path.basename(job.repoPath).toLowerCase() === lower);
+
+        if (isMatch && ['queued', 'cloning', 'analyzing'].includes(job.status)) {
+          if (process.env.DEBUG) {
+            console.log(
+              `[debug] resolveRepo waiting for active job ${job.id} (${normalizedName})...`,
+            );
+          }
+          for (let wait = 0; wait < HOLD_QUEUE_TIMEOUT_SECS; wait++) {
+            if (clientGone) return null; // client disconnected — stop polling
+            const currentJob = jobManager.getJob(job.id);
+            if (!currentJob || currentJob.status === 'failed') break;
+            if (currentJob.status === 'complete') {
+              await backend.init();
+              const freshRepos = await listRegisteredRepos();
+              return freshRepos.find((r) => r.name === normalizedName) || null;
+            }
+            await new Promise((r) => setTimeout(r, 1000));
+          }
+          // Timed out — signal to the caller with a specific message
+          return { __timedOut: true, repoName: normalizedName };
+        }
+      }
+    }
+
+    // Emergency fallback: re-sync the registry to handle Windows file-system race conditions
+    // (e.g. registry file not yet flushed after clone completes).
+    if (!found && normalizedName && !isRetry) {
+      if (process.env.DEBUG) {
+        console.log(`[debug] resolveRepo 404 for "${normalizedName}". Triggering deep init...`);
+      }
+      await backend.init();
+      return await resolveRepo(normalizedName, true, req);
+    }
+
+    return found;
   };
 
   // SSE heartbeat — clients connect to detect server liveness instantly.
@@ -548,9 +620,16 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
   // Get repo info
   app.get('/api/repo', async (req, res) => {
     try {
-      const entry = await resolveRepo(requestedRepo(req));
+      const entry = await resolveRepo(requestedRepo(req), false, req);
       if (!entry) {
         res.status(404).json({ error: 'Repository not found. Run: gitnexus analyze' });
+        return;
+      }
+      // Timed out waiting for an active analysis job
+      if (entry.__timedOut) {
+        res.status(503).json({
+          error: `Repository analysis for "${entry.repoName}" is taking longer than expected. Please try again in a moment.`,
+        });
         return;
       }
       const meta = await loadMeta(entry.storagePath);
