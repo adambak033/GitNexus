@@ -141,6 +141,22 @@ export interface SymbolTable {
   lookupClassByQualifiedName: (qualifiedName: string) => SymbolDefinition[];
 
   /**
+   * Look up Impl nodes by name.
+   * O(1) via dedicated eagerly-populated index keyed by symbol name.
+   * Used by Tier 3 resolution to include Rust impl blocks alongside
+   * class-like candidates so method lookups on `impl User { fn save() }` work
+   * correctly (Rust methods are indexed under the Impl nodeId, not the Struct).
+   */
+  lookupImplByName: (name: string) => SymbolDefinition[];
+
+  /**
+   * Iterate all indexed file paths.
+   * Used by Tier 2b (package-scoped) resolution to walk files matching a
+   * package directory suffix without a global name scan.
+   */
+  getFiles: () => IterableIterator<string>;
+
+  /**
    * Debugging: See how many symbols are tracked
    */
   getStats: () => {
@@ -166,10 +182,10 @@ export const createSymbolTable = (): SymbolTable => {
   // Structure: SymbolName -> [List of Definitions]
   const globalIndex = new Map<string, SymbolDefinition[]>();
 
-  // 3. Lazy Callable Index — populated on first lookupFuzzyCallable call.
+  // 3. Eagerly-populated Callable Index — maintained on add().
   // Structure: SymbolName -> [Callable Definitions]
   // Only Function, Method, Constructor symbols are indexed.
-  let callableIndex: Map<string, SymbolDefinition[]> | null = null;
+  const callableIndex = new Map<string, SymbolDefinition[]>();
 
   // 4. Eagerly-populated Field/Property Index — keyed by "ownerNodeId\0fieldName".
   // Only Property symbols with ownerId and declaredType are indexed.
@@ -184,11 +200,18 @@ export const createSymbolTable = (): SymbolTable => {
   const classByName = new Map<string, SymbolDefinition[]>();
   const classByQualifiedName = new Map<string, SymbolDefinition[]>();
 
+  // 7. Eagerly-populated Impl Index — keyed by symbol name.
+  // Rust impl blocks (type 'Impl') are stored here to keep them out of
+  // classByName (which drives heritage resolution) while still being
+  // reachable from Tier 3 resolution for method lookup.
+  const implByName = new Map<string, SymbolDefinition[]>();
   let fuzzyCallCount = 0;
 
   let fuzzyCallableCallCount = 0;
 
-  const CALLABLE_TYPES = new Set(['Function', 'Method', 'Constructor']);
+  // Must match CALLABLE_SYMBOL_TYPES in call-processor.ts — Macro (C/C++)
+  // and Delegate (C#) are callable targets that Tier 3 must surface.
+  const CALLABLE_TYPES = new Set(['Function', 'Method', 'Constructor', 'Macro', 'Delegate']);
 
   const add = (
     filePath: string,
@@ -291,9 +314,25 @@ export const createSymbolTable = (): SymbolTable => {
       }
     }
 
-    // D. Invalidate the lazy callable index only when adding callable types
+    // C4. Rust Impl blocks go to implByName (separate from classByName to avoid
+    // polluting heritage resolution with Impl nodes as parent candidates).
+    if (type === 'Impl') {
+      const existing = implByName.get(name);
+      if (existing) {
+        existing.push(def);
+      } else {
+        implByName.set(name, [def]);
+      }
+    }
+
+    // D. Eagerly maintain callable index (like classByName, implByName).
     if (CALLABLE_TYPES.has(type)) {
-      callableIndex = null;
+      const existing = callableIndex.get(name);
+      if (existing) {
+        existing.push(def);
+      } else {
+        callableIndex.set(name, [def]);
+      }
     }
   };
 
@@ -318,14 +357,6 @@ export const createSymbolTable = (): SymbolTable => {
 
   const lookupFuzzyCallable = (name: string): SymbolDefinition[] => {
     fuzzyCallableCallCount++;
-    if (!callableIndex) {
-      // Build the callable index lazily on first use
-      callableIndex = new Map();
-      for (const [symName, defs] of globalIndex) {
-        const callables = defs.filter((d) => CALLABLE_TYPES.has(d.type));
-        if (callables.length > 0) callableIndex.set(symName, callables);
-      }
-    }
     return callableIndex.get(name) ?? [];
   };
 
@@ -385,6 +416,16 @@ export const createSymbolTable = (): SymbolTable => {
     return classByQualifiedName.get(qualifiedName) ?? [];
   };
 
+  const lookupImplByName = (name: string): SymbolDefinition[] => {
+    return implByName.get(name) ?? [];
+  };
+
+  /** Returns a live iterator over all indexed file paths (fileIndex.keys()).
+   *  The iterator is invalidated if add() changes fileIndex.size during
+   *  iteration (ES2015 Map spec). Safe in the current pipeline because all
+   *  symbols are added before resolution begins. */
+  const getFiles = (): IterableIterator<string> => fileIndex.keys();
+
   const getStats = () => ({
     fileCount: fileIndex.size,
     globalSymbolCount: globalIndex.size,
@@ -395,11 +436,12 @@ export const createSymbolTable = (): SymbolTable => {
   const clear = () => {
     fileIndex.clear();
     globalIndex.clear();
-    callableIndex = null;
+    callableIndex.clear();
     fieldByOwner.clear();
     methodByOwner.clear();
     classByName.clear();
     classByQualifiedName.clear();
+    implByName.clear();
     fuzzyCallCount = 0;
     fuzzyCallableCallCount = 0;
   };
@@ -415,6 +457,8 @@ export const createSymbolTable = (): SymbolTable => {
     lookupMethodByOwner,
     lookupClassByName,
     lookupClassByQualifiedName,
+    lookupImplByName,
+    getFiles,
     getStats,
     clear,
   };
