@@ -1735,31 +1735,36 @@ describe('resolveMemberCall', () => {
 });
 
 // ---------------------------------------------------------------------------
-// T1: D0 skip-condition tests — verify resolveCallTarget bypasses the
-// resolveMemberCall fast path when overloadHints, preComputedArgTypes, or a
-// module alias is active.
+// T1: resolveCallTarget thin dispatcher (SM-19) — verify the dispatcher
+// routes member/constructor/free calls to the appropriate specialized resolver.
 // ---------------------------------------------------------------------------
 
-describe('resolveCallTarget D0 skip conditions (SM-11)', () => {
+// ---------------------------------------------------------------------------
+// resolveCallTarget thin dispatcher (SM-19)
+// After SM-19, resolveCallTarget is a thin dispatcher that routes to
+// resolveMemberCall, resolveStaticCall, or resolveFreeCall. The D0-D4 fuzzy
+// widening paths have been removed.
+// ---------------------------------------------------------------------------
+
+describe('resolveCallTarget thin dispatcher (SM-19)', () => {
   let ctx: ResolutionContext;
 
   beforeEach(() => {
     ctx = createResolutionContext();
   });
 
-  it('module alias: picks alias-scoped class over homonym (D0 actually bypassed)', () => {
+  it('module alias homonyms: dispatcher resolves via module-alias narrowing to aliased file', () => {
     // Python-style: `import auth; auth.User.save()` where BOTH auth.py and
-    // other.py define a `User` class with a `save` method. The test proves:
+    // other.py define a `User` class with a `save` method.
     //
-    //   1. Without the alias: resolveMemberCall sees two homonym Users,
-    //      both own `save`, and correctly returns null (refuses to guess).
-    //   2. With the alias: D0 is skipped via `hasActiveModuleAlias`, and
-    //      D1-D4 — respecting the alias-narrowed filteredCandidates — picks
-    //      the auth.py User.save method.
-    //
-    // A regression where D0 silently ran would produce null (ambiguous)
-    // instead of the correct answer, so this test actually exercises the
-    // skip path rather than just verifying a single-candidate happy path.
+    // When both homonym files are imported, owner-scoped resolution sees
+    // genuine ambiguity (both `User` classes own a `save` method) and the
+    // only remaining disambiguation signal is the module alias on
+    // `call.receiverName`. The dispatcher consults alias narrowing as a
+    // guarded fallback after owner/file-scoped resolvers return null; the
+    // type-file verification guard requires the alias target file to be
+    // among the receiver type's defining files before alias narrowing is
+    // considered a valid signal.
     ctx.symbols.add('src/auth.py', 'User', 'class:auth:User', 'Class');
     ctx.symbols.add('src/auth.py', 'save', 'method:auth:User:save', 'Method', {
       returnType: 'None',
@@ -1773,37 +1778,25 @@ describe('resolveCallTarget D0 skip conditions (SM-11)', () => {
     ctx.importMap.set('src/app.py', new Set(['src/auth.py', 'src/other.py']));
     ctx.moduleAliasMap.set('src/app.py', new Map([['auth', 'src/auth.py']]));
 
-    // Control: without alias narrowing, resolveMemberCall sees both Users
-    // own `save` and correctly refuses to pick one.
-    const ambiguous = resolveMemberCall('User', 'save', 'src/app.py', ctx);
-    expect(ambiguous).toBeNull();
-
-    // With alias narrowing active, D0 is skipped and D1-D4 picks auth.py's
-    // User.save because the alias block already narrowed filteredCandidates
-    // to auth.py (and the D2 widening step is gated on `!aliasNarrowed`).
-    const aliased = _resolveCallTargetForTesting(
+    const result = _resolveCallTargetForTesting(
       {
         calledName: 'save',
         callForm: 'member',
         receiverTypeName: 'User',
-        receiverName: 'auth', // triggers hasActiveModuleAlias → D0 skipped
+        receiverName: 'auth',
       },
       'src/app.py',
       ctx,
     );
 
-    expect(aliased).not.toBeNull();
-    expect(aliased!.nodeId).toBe('method:auth:User:save');
+    // Module-alias narrowing picks auth.py's save, not other.py's.
+    expect(result).not.toBeNull();
+    expect(result?.nodeId).toBe('method:auth:User:save');
   });
 
-  it('overloadHints present: D0 bypassed, D1-D4 handles resolution', () => {
-    // When overloadHints is supplied, the D0 fast path must be skipped
-    // because lookupMethodByOwner does not consider argument types and
-    // would pick an arbitrary overload for same-return-type overloads.
-    //
-    // This test verifies that the skip does not break resolution: passing
-    // a dummy overloadHints object should still yield the correct method
-    // via the D1-D4 path.
+  it('overloadHints ignored for member calls — resolveMemberCall resolves directly', () => {
+    // With the thin dispatcher, overloadHints are not passed to resolveMemberCall
+    // (it does not accept them). Single-candidate member calls still resolve.
     ctx.symbols.add('src/user.ts', 'User', 'class:User', 'Class');
     ctx.symbols.add('src/user.ts', 'save', 'method:User:save', 'Method', {
       returnType: 'void',
@@ -1811,8 +1804,6 @@ describe('resolveCallTarget D0 skip conditions (SM-11)', () => {
     });
     ctx.importMap.set('src/app.ts', new Set(['src/user.ts']));
 
-    // Minimal stub; D1-D4 only calls tryOverloadDisambiguation when there are
-    // multiple candidates, so an empty object is fine for single-candidate cases.
     const dummyHints = {} as OverloadHints;
 
     const result = _resolveCallTargetForTesting(
@@ -1830,10 +1821,10 @@ describe('resolveCallTarget D0 skip conditions (SM-11)', () => {
     expect(result!.nodeId).toBe('method:User:save');
   });
 
-  it('preComputedArgTypes present: D0 bypassed, D1-D4 handles resolution', () => {
-    // Analogous to the overloadHints case: when preComputedArgTypes is supplied
-    // (worker path), D0 must be skipped so that type-based overload
-    // disambiguation in D1-D4 is authoritative.
+  it('preComputedArgTypes ignored for member calls — resolveMemberCall resolves directly', () => {
+    // Analogous to the overloadHints case: thin dispatcher delegates to
+    // resolveMemberCall which resolves the single candidate without needing
+    // argument-type disambiguation.
     ctx.symbols.add('src/user.ts', 'User', 'class:User', 'Class');
     ctx.symbols.add('src/user.ts', 'save', 'method:User:save', 'Method', {
       returnType: 'void',
