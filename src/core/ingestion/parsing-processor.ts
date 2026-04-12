@@ -4,7 +4,9 @@ import Parser from 'tree-sitter';
 import { loadParser, loadLanguage, isLanguageAvailable } from '../tree-sitter/parser-loader.js';
 import { getProvider } from './languages/index.js';
 import { generateId } from '../../lib/utils.js';
-import type { SymbolTable } from './symbol-table.js';
+import type { SymbolTableReader, SymbolTableWriter } from './model/symbol-table.js';
+// SymbolTableReader is used for the FieldExtractorContext stub; the
+// parsing functions themselves need Writer because they call .add().
 import { ASTCache } from './ast-cache.js';
 import { getLanguageFromFilename, SupportedLanguages } from 'gitnexus-shared';
 import { extractVueScript, isVueSetupTopLevel } from './vue-sfc-extractor.js';
@@ -36,7 +38,6 @@ import type {
   ExtractedImport,
   ExtractedCall,
   ExtractedAssignment,
-  ExtractedHeritage,
   ExtractedRoute,
   ExtractedFetchCall,
   ExtractedDecoratorRoute,
@@ -45,6 +46,7 @@ import type {
   FileScopeBindings,
   ExtractedORMQuery,
 } from './workers/parse-worker.js';
+import type { ExtractedHeritage } from './model/heritage-map.js';
 import { getTreeSitterBufferSize, TREE_SITTER_MAX_BUFFER } from './constants.js';
 
 export type FileProgressCallback = (current: number, total: number, filePath: string) => void;
@@ -70,7 +72,7 @@ export interface WorkerExtractedData {
 const processParsingWithWorkers = async (
   graph: KnowledgeGraph,
   files: { path: string; content: string }[],
-  symbolTable: SymbolTable,
+  symbolTable: SymbolTableWriter,
   astCache: ASTCache,
   workerPool: WorkerPool,
   onFileProgress?: FileProgressCallback,
@@ -250,13 +252,19 @@ function seqFindEnclosingClassNode(node: SyntaxNode): SyntaxNode | null {
   return null;
 }
 
-/** Minimal no-op SymbolTable stub for FieldExtractorContext (sequential path has a real
- *  SymbolTable, but it's incomplete at this stage — use the stub for safety). */
-const NOOP_SYMBOL_TABLE_SEQ = {
-  lookupExactAll: () => [],
+/** Minimal no-op SymbolTable stub for FieldExtractorContext (sequential
+ *  path has a real SymbolTable, but it's incomplete at this stage — use
+ *  the stub for safety). Implements the full {@link SymbolTableReader}
+ *  surface so future extractor additions don't silently fall off an
+ *  `as unknown as` cast. */
+const NOOP_SYMBOL_TABLE_SEQ: SymbolTableReader = {
   lookupExact: () => undefined,
   lookupExactFull: () => undefined,
-} as unknown as SymbolTable;
+  lookupExactAll: () => [],
+  lookupCallableByName: () => [],
+  getFiles: () => [][Symbol.iterator](),
+  getStats: () => ({ fileCount: 0 }),
+};
 
 function seqGetFieldInfo(
   classNode: SyntaxNode,
@@ -278,7 +286,7 @@ function seqGetFieldInfo(
 const processParsingSequential = async (
   graph: KnowledgeGraph,
   files: { path: string; content: string }[],
-  symbolTable: SymbolTable,
+  symbolTable: SymbolTableWriter,
   astCache: ASTCache,
   onFileProgress?: FileProgressCallback,
 ) => {
@@ -650,7 +658,7 @@ const processParsingSequential = async (
 export const processParsing = async (
   graph: KnowledgeGraph,
   files: { path: string; content: string }[],
-  symbolTable: SymbolTable,
+  symbolTable: SymbolTableWriter,
   astCache: ASTCache,
   onFileProgress?: FileProgressCallback,
   workerPool?: WorkerPool,

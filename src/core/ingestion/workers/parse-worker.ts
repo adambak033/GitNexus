@@ -15,7 +15,8 @@ import { createRequire } from 'node:module';
 import { SupportedLanguages } from 'gitnexus-shared';
 import { getProvider } from '../languages/index.js';
 import { getTreeSitterBufferSize, TREE_SITTER_MAX_BUFFER } from '../constants.js';
-import type { SymbolTable } from '../symbol-table.js';
+import type { SymbolTableReader } from '../model/symbol-table.js';
+import type { ExtractedHeritage } from '../model/heritage-map.js';
 
 /** Language grammar type accepted by Parser.setLanguage(). */
 type TreeSitterLanguage = Parameters<typeof Parser.prototype.setLanguage>[0];
@@ -181,13 +182,8 @@ export interface ExtractedAssignment {
   receiverTypeName?: string;
 }
 
-export interface ExtractedHeritage {
-  filePath: string;
-  className: string;
-  parentName: string;
-  /** 'extends' | 'implements' | 'trait-impl' | 'include' | 'extend' | 'prepend' */
-  kind: string;
-}
+// `ExtractedHeritage` now lives in `../model/heritage-map.ts` and is
+// re-exported at the top of this file.
 
 export interface ExtractedRoute {
   filePath: string;
@@ -459,14 +455,20 @@ function findClassNodeByQualifiedName(node: SyntaxNode): SyntaxNode | null {
 
 /**
  * Minimal no-op SymbolTable stub for FieldExtractorContext in the worker.
- * Field extraction only uses symbolTable.lookupExactAll for optional type resolution —
- * returning [] causes the extractor to use the raw type string, which is fine for us.
+ * Field extraction only uses symbolTable.lookupExactAll for optional type
+ * resolution — returning [] causes the extractor to use the raw type
+ * string, which is fine for us. Every other method is a no-op so the
+ * stub remains safe if a future FieldExtractor consults it through the
+ * full {@link SymbolTableReader} surface.
  */
-const NOOP_SYMBOL_TABLE = {
-  lookupExactAll: () => [],
+const NOOP_SYMBOL_TABLE: SymbolTableReader = {
   lookupExact: () => undefined,
   lookupExactFull: () => undefined,
-} as unknown as SymbolTable;
+  lookupExactAll: () => [],
+  lookupCallableByName: () => [],
+  getFiles: () => [][Symbol.iterator](),
+  getStats: () => ({ fileCount: 0 }),
+};
 
 /**
  * Get (or extract and cache) field info for a class node.

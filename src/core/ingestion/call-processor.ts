@@ -1,11 +1,11 @@
 import { KnowledgeGraph } from '../graph/types.js';
 import { ASTCache } from './ast-cache.js';
-import type { SymbolDefinition, SymbolTable } from './symbol-table.js';
-import { CLASS_TYPES, CALLABLE_TYPES } from './symbol-table.js';
+import type { SymbolDefinition, SymbolTableReader } from './model/symbol-table.js';
+import { CLASS_TYPES, CALL_TARGET_TYPES } from './model/symbol-table.js';
 import Parser from 'tree-sitter';
-import type { ResolutionContext } from './resolution-context.js';
-import { TIER_CONFIDENCE, type ResolutionTier } from './resolution-context.js';
-import type { TieredCandidates } from './resolution-context.js';
+import type { ResolutionContext } from './model/resolution-context.js';
+import { TIER_CONFIDENCE, type ResolutionTier } from './model/resolution-context.js';
+import type { TieredCandidates } from './model/resolution-context.js';
 import { isLanguageAvailable, loadParser, loadLanguage } from '../tree-sitter/parser-loader.js';
 import { getProvider } from './languages/index.js';
 import { generateId } from '../../lib/utils.js';
@@ -32,24 +32,24 @@ import {
 } from './utils/call-analysis.js';
 import { buildTypeEnv, isSubclassOf } from './type-env.js';
 import type { ConstructorBinding, TypeEnvironment } from './type-env.js';
-import type { HeritageMap } from './heritage-map.js';
-import { c3Linearize } from './mro-processor.js';
+import type { HeritageMap } from './model/heritage-map.js';
 import type { BindingAccumulator } from './binding-accumulator.js';
 import { getTreeSitterBufferSize } from './constants.js';
 import type {
   ExtractedCall,
   ExtractedAssignment,
-  ExtractedHeritage,
   ExtractedRoute,
   ExtractedFetchCall,
   FileConstructorBindings,
 } from './workers/parse-worker.js';
+import type { ExtractedHeritage } from './model/heritage-map.js';
 import { normalizeFetchURL, routeMatches } from './route-extractors/nextjs.js';
 import { extractTemplateComponents } from './vue-sfc-extractor.js';
 import { extractReturnTypeName, stripNullable } from './type-extractors/shared.js';
 import type { LiteralTypeInferrer } from './type-extractors/types.js';
 import type { SyntaxNode } from './utils/ast-helpers.js';
 import { extractParsedCallSite } from './call-sites/extract-language-call-site.js';
+import { lookupMethodByOwnerWithMRO } from './model/resolve.js';
 
 /** Per-file resolved type bindings for exported symbols.
  *  Populated during call processing, consumed by Phase 14 re-resolution pass. */
@@ -204,7 +204,7 @@ function collectExportedBindings(
  *  exported symbols that have callables with known return types. */
 export function buildExportedTypeMapFromGraph(
   graph: KnowledgeGraph,
-  symbolTable: SymbolTable,
+  symbolTable: SymbolTableReader,
 ): ExportedTypeMap {
   const result: ExportedTypeMap = new Map();
   graph.forEachNode((node) => {
@@ -652,7 +652,7 @@ function findInterfaceDispatchTargets(
 
   const results: ResolveResult[] = [];
   for (const implFile of implFiles) {
-    const methods = ctx.symbols.lookupExactAll(implFile, calledName);
+    const methods = ctx.model.symbols.lookupExactAll(implFile, calledName);
     for (const method of methods) {
       if (method.nodeId !== primaryNodeId) {
         results.push({
@@ -808,7 +808,7 @@ export const processCalls = async (
     const importedReturnTypes = importedReturnTypesMap?.get(file.path);
     const importedRawReturnTypes = importedRawReturnTypesMap?.get(file.path);
     const typeEnv = buildTypeEnv(tree, language, {
-      symbolTable: ctx.symbols,
+      model: ctx.model,
       parentMap,
       importedBindings,
       importedReturnTypes,
@@ -817,7 +817,7 @@ export const processCalls = async (
       extractFunctionName: provider?.methodExtractor?.extractFunctionName,
     });
     if (typeEnv && exportedTypeMap) {
-      const fileExports = collectExportedBindings(typeEnv, file.path, ctx.symbols, graph);
+      const fileExports = collectExportedBindings(typeEnv, file.path, ctx.model.symbols, graph);
       if (fileExports) exportedTypeMap.set(file.path, fileExports);
     }
     if (bindingAccumulator) {
@@ -1021,7 +1021,7 @@ export const processCalls = async (
                   description: item.accessorType,
                 },
               });
-              ctx.symbols.add(file.path, item.propName, nodeId, 'Property', {
+              ctx.model.symbols.add(file.path, item.propName, nodeId, 'Property', {
                 ...(propEnclosingClassId ? { ownerId: propEnclosingClassId } : {}),
                 ...(item.declaredType ? { declaredType: item.declaredType } : {}),
               });
@@ -1093,8 +1093,8 @@ export const processCalls = async (
           if (
             isSubclassOf(ctorType, receiverTypeName, parentMap) ||
             isSubclassOf(ctorType, receiverTypeName, globalParentMap) ||
-            (ctx.symbols.lookupClassByName(ctorType).length > 0 &&
-              ctx.symbols.lookupClassByName(receiverTypeName).length > 0)
+            (ctx.model.types.lookupClassByName(ctorType).length > 0 &&
+              ctx.model.types.lookupClassByName(receiverTypeName).length > 0)
           ) {
             receiverTypeName = ctorType;
           }
@@ -1299,7 +1299,7 @@ export const processCalls = async (
   return collectedHeritage;
 };
 
-// CALLABLE_TYPES imported from symbol-table.ts — single source of truth.
+// FREE_CALLABLE_TYPES imported from symbol-table.ts — single source of truth.
 
 const CONSTRUCTOR_TARGET_TYPES = new Set(['Constructor', 'Class', 'Struct', 'Record']);
 
@@ -1320,10 +1320,14 @@ const filterCallableCandidates = (
     } else {
       const types = candidates.filter((c) => CONSTRUCTOR_TARGET_TYPES.has(c.type));
       kindFiltered =
-        types.length > 0 ? types : candidates.filter((c) => CALLABLE_TYPES.has(c.type));
+        types.length > 0 ? types : candidates.filter((c) => CALL_TARGET_TYPES.has(c.type));
     }
   } else {
-    kindFiltered = candidates.filter((c) => CALLABLE_TYPES.has(c.type));
+    // CALL_TARGET_TYPES (not FREE_CALLABLE_TYPES) — the post-A4 filter must
+    // also admit Method and Constructor candidates, which are now unioned
+    // into the pool from `model.methods.lookupMethodByName` rather than
+    // `symbols.lookupCallableByName`.
+    kindFiltered = candidates.filter((c) => CALL_TARGET_TYPES.has(c.type));
   }
 
   if (kindFiltered.length === 0) return [];
@@ -1360,7 +1364,7 @@ const countCallableCandidates = (
     const typeOk =
       callForm === 'constructor'
         ? CONSTRUCTOR_TARGET_TYPES.has(c.type)
-        : CALLABLE_TYPES.has(c.type);
+        : CALL_TARGET_TYPES.has(c.type);
     if (!typeOk) continue;
     // Arity filter
     if (
@@ -1573,11 +1577,27 @@ const resolveModuleAliasedCall = (
     );
   }
   if (filtered.length === 0) {
-    // Widen to global callable index scoped to the aliased module file.
+    // Widen to global callable+method indexes scoped to the aliased module
+    // file. Function+ownerId (Python/Rust/Kotlin) is still routed to both
+    // indexes until Unit 5 unblocks, so dedup by nodeId.
     const cacheKey = `${call.calledName}\0${moduleFile}`;
     let defs = widenCache?.get(cacheKey);
     if (!defs) {
-      defs = ctx.symbols.lookupCallableByName(call.calledName);
+      const rawCallable = ctx.model.symbols.lookupCallableByName(call.calledName);
+      const rawMethods = ctx.model.methods.lookupMethodByName(call.calledName);
+      const widenCombined: SymbolDefinition[] = [];
+      const widenSeen = new Set<string>();
+      for (const d of rawCallable) {
+        if (widenSeen.has(d.nodeId)) continue;
+        widenSeen.add(d.nodeId);
+        widenCombined.push(d);
+      }
+      for (const d of rawMethods) {
+        if (widenSeen.has(d.nodeId)) continue;
+        widenSeen.add(d.nodeId);
+        widenCombined.push(d);
+      }
+      defs = widenCombined;
       widenCache?.set(cacheKey, defs);
     }
     filtered = filterCallableCandidates(defs, call.argCount, call.callForm).filter(
@@ -1618,11 +1638,26 @@ const resolveMemberCallByFile = (
   const typeNodeIds = new Set(typeResolved.candidates.map((d) => d.nodeId));
   const typeFiles = new Set(typeResolved.candidates.map((d) => d.filePath));
 
-  const methodPool = filterCallableCandidates(
-    ctx.symbols.lookupCallableByName(calledName),
-    argCount,
-    callForm,
-  );
+  // A4 (plan 006, Unit 4): consult both indexes. Strictly-labeled
+  // Method/Constructor are disjoint, but Function+ownerId (Python/Rust/
+  // Kotlin) is routed into BOTH indexes by `wrappedAdd` until Unit 5
+  // unblocks — dedup by nodeId so overload disambiguation doesn't see
+  // phantom duplicates.
+  const rawCallablePool = ctx.model.symbols.lookupCallableByName(calledName);
+  const rawMethodPool = ctx.model.methods.lookupMethodByName(calledName);
+  const combinedPool: SymbolDefinition[] = [];
+  const combinedSeen = new Set<string>();
+  for (const def of rawCallablePool) {
+    if (combinedSeen.has(def.nodeId)) continue;
+    combinedSeen.add(def.nodeId);
+    combinedPool.push(def);
+  }
+  for (const def of rawMethodPool) {
+    if (combinedSeen.has(def.nodeId)) continue;
+    combinedSeen.add(def.nodeId);
+    combinedPool.push(def);
+  }
+  const methodPool = filterCallableCandidates(combinedPool, argCount, callForm);
   const fileFiltered = methodPool.filter((c) => typeFiles.has(c.filePath));
   if (fileFiltered.length === 1) {
     return toResolveResult(fileFiltered[0], typeResolved.tier);
@@ -1951,7 +1986,7 @@ const resolveFieldOwnership = (
   const classDef = typeResolved.candidates.find((d) => CLASS_LIKE_TYPES.has(d.type));
   if (!classDef) return undefined;
 
-  return ctx.symbols.lookupFieldByOwner(classDef.nodeId, fieldName) ?? undefined;
+  return ctx.model.fields.lookupFieldByOwner(classDef.nodeId, fieldName) ?? undefined;
 };
 
 /**
@@ -1987,10 +2022,12 @@ const resolveMethodByOwner = (
   const typeResolved = ctx.resolve(receiverTypeName, filePath);
   if (!typeResolved) return undefined;
 
-  // MRO walking needs a language hint; compute once and reuse for every candidate.
-  // Unknown extension → fall back to plain direct lookup (D1-D4 still runs on miss).
+  // MRO walking needs a language hint so we can derive the per-language
+  // strategy; compute it once and reuse for every candidate. Unknown
+  // extension → fall back to plain direct lookup (D1-D4 still runs on miss).
   const language = heritageMap ? getLanguageFromFilename(filePath) : null;
-  const canWalkMRO = heritageMap != null && language != null;
+  const mroStrategy = language != null ? getProvider(language).mroStrategy : null;
+  const canWalkMRO = heritageMap != null && mroStrategy != null;
 
   // Iterate all class-like candidates tracking the first unambiguous hit.
   // Zero-allocation fast path: the common case is exactly one class candidate,
@@ -2014,11 +2051,11 @@ const resolveMethodByOwner = (
           candidate.nodeId,
           methodName,
           heritageMap,
-          ctx.symbols,
-          language,
+          ctx.model,
+          mroStrategy,
           argCount,
         )
-      : ctx.symbols.lookupMethodByOwner(candidate.nodeId, methodName, argCount);
+      : ctx.model.methods.lookupMethodByOwner(candidate.nodeId, methodName, argCount);
     if (!def) continue;
     if (!firstDef) {
       firstDef = def;
@@ -2212,8 +2249,8 @@ export const resolveFreeCall = (
  * Resolve a constructor or static call using class-scoped lookup (no fuzzy lookup).
  * Used for `new User()` / `User()` calls where the calledName targets a class.
  *
- * Uses {@link SymbolTable.lookupClassByName} for O(1) class lookup and
- * {@link SymbolTable.lookupMethodByOwner} for constructor resolution.
+ * Uses {@link TypeRegistry.lookupClassByName} for O(1) class lookup and
+ * {@link MethodRegistry.lookupMethodByOwner} for constructor resolution.
  * {@link resolveCallTarget} delegates here for constructor and free-form calls
  * that target a class.
  *
@@ -2265,7 +2302,7 @@ export const resolveStaticCall = (
   //    is supplied, the caller has already paid for the tiered lookup, so this
   //    pre-check still prevents the class-candidate filter + lookupMethodByOwner
   //    loop from running on obviously non-class targets.
-  const allClasses = ctx.symbols.lookupClassByName(className);
+  const allClasses = ctx.model.types.lookupClassByName(className);
   if (allClasses.length === 0) return null;
 
   // 2. Scope via ctx.resolve for import-tier information. Reuse the caller's
@@ -2296,7 +2333,7 @@ export const resolveStaticCall = (
   let firstDef: SymbolDefinition | undefined;
   let ambiguous = false;
   for (const candidate of classCandidates) {
-    const def = ctx.symbols.lookupMethodByOwner(candidate.nodeId, className, argCount);
+    const def = ctx.model.methods.lookupMethodByOwner(candidate.nodeId, className, argCount);
     if (!def || def.type !== 'Constructor') continue;
     if (!firstDef) {
       firstDef = def;
@@ -2370,138 +2407,6 @@ export const resolveStaticCall = (
   }
 
   return null;
-};
-
-// ---------------------------------------------------------------------------
-// MRO-aware method resolution via HeritageMap (SM-9)
-// ---------------------------------------------------------------------------
-
-/**
- * Per-HeritageMap cache of C3 linearization results keyed by owner nodeId.
- *
- * HeritageMap instances are immutable after construction, so C3 output is
- * stable for the lifetime of a HeritageMap. WeakMap lets the cache auto-drain
- * when the HeritageMap is garbage collected (end of ingestion run), so we
- * never need to manually invalidate it.
- *
- * `null` is a sentinel for "C3 failed for this owner" (cyclic or inconsistent
- * hierarchy) so we don't re-run the expensive linearization repeatedly.
- */
-const c3LinearizationCache = new WeakMap<HeritageMap, Map<string, readonly string[] | null>>();
-
-const getCachedC3Linearization = (
-  ownerNodeId: string,
-  heritageMap: HeritageMap,
-): readonly string[] | null => {
-  let perHmCache = c3LinearizationCache.get(heritageMap);
-  if (!perHmCache) {
-    perHmCache = new Map();
-    c3LinearizationCache.set(heritageMap, perHmCache);
-  }
-  const cached = perHmCache.get(ownerNodeId);
-  if (cached !== undefined) return cached;
-  const parentMap = buildParentMapFromHeritage(ownerNodeId, heritageMap);
-  const result = c3Linearize(ownerNodeId, parentMap, new Map()) ?? null;
-  perHmCache.set(ownerNodeId, result);
-  return result;
-};
-
-/**
- * Build a parentMap from HeritageMap for use with c3Linearize.
- * Traverses the parent chain starting from startNodeId, collecting all
- * parent→children relationships into a Map<string, string[]>.
- */
-const buildParentMapFromHeritage = (
-  startNodeId: string,
-  heritageMap: HeritageMap,
-): Map<string, string[]> => {
-  const parentMap = new Map<string, string[]>();
-  const visited = new Set<string>();
-  const queue = [startNodeId];
-
-  while (queue.length > 0) {
-    const nodeId = queue.shift()!;
-    if (visited.has(nodeId)) continue;
-    visited.add(nodeId);
-    const parents = heritageMap.getParents(nodeId);
-    if (parents.length > 0) {
-      parentMap.set(nodeId, parents);
-      for (const p of parents) {
-        if (!visited.has(p)) queue.push(p);
-      }
-    }
-  }
-
-  return parentMap;
-};
-
-/**
- * Look up a method on an owner class, walking the parent chain via HeritageMap
- * when the method isn't found on the direct owner.
- *
- * Respects the 5 per-language MRO strategies:
- * - `first-wins`:       BFS ancestor walk, first match wins (default)
- * - `leftmost-base`:    BFS ancestor walk, leftmost base in declaration order wins (C++);
- *                        HeritageMap preserves insertion order matching source declaration,
- *                        so BFS order is equivalent to leftmost-base semantics
- * - `c3`:               C3-linearized ancestor order, first match wins (Python)
- * - `implements-split`: BFS ancestor walk, first match wins (Java/C#) —
- *                        full ambiguity detection for multiple interface defaults
- *                        is handled by computeMRO at graph level
- * - `qualified-syntax`: No auto-resolution (Rust) — returns undefined
- *
- * Delegates to mro-processor.ts c3Linearize for C3 strategy.
- *
- * @internal Exported only to enable unit testing in isolation. The proper
- * entry point for callers outside this module is {@link resolveMethodByOwner},
- * which handles receiver-type resolution before delegating here.
- */
-export const lookupMethodByOwnerWithMRO = (
-  ownerNodeId: string,
-  methodName: string,
-  heritageMap: HeritageMap,
-  symbols: SymbolTable,
-  language: SupportedLanguages,
-  argCount?: number,
-): SymbolDefinition | undefined => {
-  // Direct lookup first (child override — no walk needed).
-  // argCount is threaded through so arity-differing overloads on the direct
-  // owner can be disambiguated before the MRO walk starts.
-  const direct = symbols.lookupMethodByOwner(ownerNodeId, methodName, argCount);
-  if (direct) return direct;
-
-  const strategy = getProvider(language).mroStrategy;
-
-  // Rust: requires qualified syntax (<Type as Trait>::method), no auto-resolution
-  if (strategy === 'qualified-syntax') return undefined;
-
-  // Determine ancestor walk order based on MRO strategy.
-  // readonly to accept the cached (frozen) c3 linearization without copying.
-  let ancestors: readonly string[];
-  if (strategy === 'c3') {
-    // Delegate to mro-processor.ts C3 linearization (memoized per HeritageMap
-    // so repeated calls for the same owner within an ingestion run reuse the
-    // linearization instead of rebuilding the parent map and re-running C3).
-    // c3Linearize returns ancestors only (excludes the owner itself),
-    // matching heritageMap.getAncestors() semantics.
-    const c3Result = getCachedC3Linearization(ownerNodeId, heritageMap);
-    // Fall back to BFS order if C3 fails (cyclic or inconsistent hierarchy).
-    // Note: BFS order may not preserve Python MRO semantics in these edge
-    // cases, but cyclic/inconsistent hierarchies are invalid in Python anyway.
-    ancestors = c3Result ?? heritageMap.getAncestors(ownerNodeId);
-  } else {
-    // first-wins, leftmost-base, implements-split: BFS order via HeritageMap
-    ancestors = heritageMap.getAncestors(ownerNodeId);
-  }
-
-  // Walk ancestors in MRO order — first match wins.
-  // argCount narrows overloaded ancestors the same way as the direct lookup.
-  for (const ancestorId of ancestors) {
-    const method = symbols.lookupMethodByOwner(ancestorId, methodName, argCount);
-    if (method) return method;
-  }
-
-  return undefined;
 };
 
 /**

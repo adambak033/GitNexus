@@ -27,7 +27,7 @@ import {
   type ExportedTypeMap,
   buildExportedTypeMapFromGraph,
 } from './call-processor.js';
-import { buildHeritageMap } from './heritage-map.js';
+import { buildHeritageMap } from './model/heritage-map.js';
 import { nextjsFileToRouteURL, normalizeFetchURL } from './route-extractors/nextjs.js';
 import { expoFileToRouteURL } from './route-extractors/expo.js';
 import { phpFileToRouteURL } from './route-extractors/php.js';
@@ -47,21 +47,22 @@ import type {
   ExtractedCall,
   ExtractedDecoratorRoute,
   ExtractedFetchCall,
-  ExtractedHeritage,
   ExtractedORMQuery,
   ExtractedRoute,
   ExtractedToolDef,
   FileConstructorBindings,
 } from './workers/parse-worker.js';
+import type { ExtractedHeritage } from './model/heritage-map.js';
 import {
   processHeritage,
   processHeritageFromExtracted,
   extractExtractedHeritageFromFiles,
+  getHeritageStrategyForLanguage,
 } from './heritage-processor.js';
 import { computeMRO } from './mro-processor.js';
 import { processCommunities } from './community-processor.js';
 import { processProcesses } from './process-processor.js';
-import { createResolutionContext } from './resolution-context.js';
+import { createResolutionContext } from './model/resolution-context.js';
 import { createASTCache } from './ast-cache.js';
 import { type PipelineProgress, getLanguageFromFilename } from 'gitnexus-shared';
 import { PipelineResult } from '../../types/pipeline.js';
@@ -334,7 +335,7 @@ async function runCrossFileBindingPropagation(
   // For the worker path, buildTypeEnv runs inside workers without SymbolTable,
   // so exported bindings must be collected from graph + SymbolTable in main thread.
   if (exportedTypeMap.size === 0 && graph.nodeCount > 0) {
-    const graphExports = buildExportedTypeMapFromGraph(graph, ctx.symbols);
+    const graphExports = buildExportedTypeMapFromGraph(graph, ctx.model.symbols);
     for (const [fp, exports] of graphExports) exportedTypeMap.set(fp, exports);
   }
 
@@ -361,7 +362,7 @@ async function runCrossFileBindingPropagation(
           filesWithGaps++;
           break;
         }
-        const def = ctx.symbols.lookupExactFull(binding.sourcePath, binding.exportedName);
+        const def = ctx.model.symbols.lookupExactFull(binding.sourcePath, binding.exportedName);
         if (def?.returnType) {
           filesWithGaps++;
           break;
@@ -413,11 +414,15 @@ async function runCrossFileBindingPropagation(
         }
       }
 
-      const importedReturns = buildImportedReturnTypes(filePath, ctx.namedImportMap, ctx.symbols);
+      const importedReturns = buildImportedReturnTypes(
+        filePath,
+        ctx.namedImportMap,
+        ctx.model.symbols,
+      );
       const importedRawReturns = buildImportedRawReturnTypes(
         filePath,
         ctx.namedImportMap,
-        ctx.symbols,
+        ctx.model.symbols,
       );
       if (seeded.size === 0 && importedReturns.size === 0) continue;
       if (!allPathSet.has(filePath)) continue;
@@ -657,7 +662,7 @@ async function runChunkedParseAndResolve(
   allORMQueries: ExtractedORMQuery[];
   bindingAccumulator: BindingAccumulator;
 }> {
-  const symbolTable = ctx.symbols;
+  const symbolTable = ctx.model.symbols;
 
   const parseableScanned = scannedFiles.filter((f) => {
     const lang = getLanguageFromFilename(f.path);
@@ -978,7 +983,9 @@ async function runChunkedParseAndResolve(
 
     // Build unified HeritageMap (parent lookup + implementor index) after all chunks.
     const fullWorkerHeritageMap =
-      deferredWorkerHeritage.length > 0 ? buildHeritageMap(deferredWorkerHeritage, ctx) : undefined;
+      deferredWorkerHeritage.length > 0
+        ? buildHeritageMap(deferredWorkerHeritage, ctx, getHeritageStrategyForLanguage)
+        : undefined;
 
     if (deferredWorkerCalls.length > 0) {
       await processCallsFromExtracted(
@@ -1058,7 +1065,9 @@ async function runChunkedParseAndResolve(
   }
   // Build unified HeritageMap from all sequential heritage (parent lookup + implementor index).
   const sequentialHeritageMap =
-    allSequentialHeritage.length > 0 ? buildHeritageMap(allSequentialHeritage, ctx) : undefined;
+    allSequentialHeritage.length > 0
+      ? buildHeritageMap(allSequentialHeritage, ctx, getHeritageStrategyForLanguage)
+      : undefined;
 
   // Pass 2: Process calls, heritage edges, fetch calls, and ORM queries per chunk.
   // Reuse the file contents cached in Pass 1 instead of re-reading from disk.

@@ -1,11 +1,11 @@
 import { describe, it, expect, vi } from 'vitest';
 import { buildTypeEnv, type TypeEnvironment } from '../../src/core/ingestion/type-env.js';
 import { BindingAccumulator } from '../../src/core/ingestion/binding-accumulator.js';
+import { type SymbolDefinition } from '../../src/core/ingestion/model/symbol-table.js';
 import {
-  createSymbolTable,
-  type SymbolDefinition,
-  type SymbolTable,
-} from '../../src/core/ingestion/symbol-table.js';
+  createSemanticModel,
+  type SemanticModel,
+} from '../../src/core/ingestion/model/semantic-model.js';
 import {
   stripNullable,
   extractSimpleTypeName,
@@ -77,25 +77,6 @@ function flatSize(typeEnv: TypeEnvironment): number {
   for (const [, scopeMap] of typeEnv.allScopes()) count += scopeMap.size;
   return count;
 }
-
-const createMockSymbolTable = (overrides: Partial<SymbolTable> = {}): SymbolTable => ({
-  add: () => {},
-  lookupExact: () => undefined,
-  lookupExactFull: () => undefined,
-  lookupExactAll: () => [],
-  lookupCallableByName: () => [],
-  lookupFieldByOwner: () => undefined,
-  lookupMethodByOwner: () => undefined,
-  lookupClassByName: () => [],
-  lookupClassByQualifiedName: () => [],
-  lookupImplByName: () => [],
-  getFiles: () => [][Symbol.iterator](),
-  getStats: () => ({
-    fileCount: 0,
-  }),
-  clear: () => {},
-  ...overrides,
-});
 
 const createClassDef = (
   name: string,
@@ -1191,29 +1172,44 @@ class RepoService {
   });
 
   describe('destructured call results', () => {
-    // Minimal mock SymbolTable for call-result return type lookup
+    // Minimal mock SemanticModel for call-result return type lookup
+    // (SM-21 inversion — buildTypeEnv takes a SemanticModel via `model:`).
     const makeSymbolTable = (callables: Array<{ name: string; returnType?: string }>) => ({
-      lookupCallableByName: (name: string) =>
-        callables
-          .filter((c) => c.name === name)
-          .map((c) => ({
-            nodeId: 'n1',
-            filePath: 'src.ts',
-            type: 'Function' as const,
-            returnType: c.returnType,
-          })),
-      lookupClassByName: () => [],
-      lookupExact: () => undefined,
-      lookupExactFull: () => undefined,
-      add: () => {},
-      getStats: () => ({ fileCount: 0 }),
-      clear: () => {},
+      types: {
+        lookupClassByName: () => [],
+        lookupClassByQualifiedName: () => [],
+        lookupImplByName: () => [],
+      },
+      methods: {
+        lookupMethodByOwner: () => undefined,
+        lookupMethodByName: () => [],
+      },
+      fields: {
+        lookupFieldByOwner: () => undefined,
+      },
+      symbols: {
+        add: () => {},
+        lookupExact: () => undefined,
+        lookupExactFull: () => undefined,
+        lookupExactAll: () => [],
+        lookupCallableByName: (name: string) =>
+          callables
+            .filter((c) => c.name === name)
+            .map((c) => ({
+              nodeId: 'n1',
+              filePath: 'src.ts',
+              type: 'Function' as const,
+              returnType: c.returnType,
+            })),
+        getFiles: () => [][Symbol.iterator](),
+        getStats: () => ({ fileCount: 0 }),
+      },
     });
 
     it('emits callResult + fieldAccess items for const { x } = fn()', () => {
       const symbolTable = makeSymbolTable([{ name: 'getUser', returnType: 'User' }]);
       const tree = parse('const { name } = getUser();', TypeScript.typescript);
-      const typeEnv = buildTypeEnv(tree, 'typescript', { symbolTable: symbolTable as any });
+      const typeEnv = buildTypeEnv(tree, 'typescript', { model: symbolTable });
       // callResult resolves __destr_getUser_N → User
       // fieldAccess resolves name via User's properties (no Property nodes in mock → undefined)
       // But the callResult itself IS emitted — verify constructorBindings is still empty
@@ -1226,14 +1222,14 @@ class RepoService {
         'async function f() { const { data } = await fetchData(); }',
         TypeScript.typescript,
       );
-      const typeEnv = buildTypeEnv(tree, 'typescript', { symbolTable: symbolTable as any });
+      const typeEnv = buildTypeEnv(tree, 'typescript', { model: symbolTable });
       expect(typeEnv.constructorBindings).toEqual([]);
     });
 
     it('gracefully handles no return type (composable without annotation)', () => {
       const symbolTable = makeSymbolTable([{ name: 'useUserRole' }]); // no returnType
       const tree = parse('const { isMaker } = useUserRole();', TypeScript.typescript);
-      const typeEnv = buildTypeEnv(tree, 'typescript', { symbolTable: symbolTable as any });
+      const typeEnv = buildTypeEnv(tree, 'typescript', { model: symbolTable });
       // No return type → callResult unresolved → fieldAccess unresolved
       expect(flatGet(typeEnv, 'isMaker')).toBeUndefined();
     });
@@ -2045,17 +2041,10 @@ class RepoService {
         `,
           Kotlin,
         );
-        // User is NOT defined in this file, but SymbolTable knows it's a Class
-        const mockSymbolTable = {
-          lookupClassByName: (name: string) =>
-            name === 'User' ? [{ nodeId: 'n1', filePath: 'models.kt', type: 'Class' }] : [],
-          lookupExact: () => undefined,
-          lookupExactFull: () => undefined,
-          add: () => {},
-          getStats: () => ({ fileCount: 0 }),
-          clear: () => {},
-        };
-        const typeEnv = buildTypeEnv(tree, 'kotlin', { symbolTable: mockSymbolTable as any });
+        // User is NOT defined in this file, but SemanticModel knows it's a Class
+        const model = createSemanticModel();
+        model.symbols.add('models.kt', 'User', 'n1', 'Class');
+        const typeEnv = buildTypeEnv(tree, 'kotlin', { model });
         expect(flatGet(typeEnv, 'user')).toBe('User');
       });
 
@@ -2068,17 +2057,8 @@ class RepoService {
         `,
           Kotlin,
         );
-        const mockSymbolTable = {
-          lookupClassByName: () => [],
-          lookupCallableByName: () => [],
-          lookupFieldByOwner: () => undefined,
-          lookupExact: () => undefined,
-          lookupExactFull: () => undefined,
-          add: () => {},
-          getStats: () => ({ fileCount: 0 }),
-          clear: () => {},
-        };
-        const typeEnv = buildTypeEnv(tree, 'kotlin', { symbolTable: mockSymbolTable as any });
+        const model = createSemanticModel();
+        const typeEnv = buildTypeEnv(tree, 'kotlin', { model });
         expect(flatGet(typeEnv, 'result')).toBeUndefined();
       });
 
@@ -2144,10 +2124,15 @@ def main():
     });
 
     describe('lookupClassByName regression coverage', () => {
-      const makeClassLookupTable = (classDefs: Record<string, SymbolDefinition[]>) =>
-        createMockSymbolTable({
-          lookupClassByName: (name: string) => classDefs[name] ?? [],
-        });
+      const makeClassLookupTable = (
+        classDefs: Record<string, SymbolDefinition[]>,
+      ): SemanticModel => {
+        const model = createSemanticModel();
+        vi.spyOn(model.types, 'lookupClassByName').mockImplementation(
+          (name: string) => classDefs[name] ?? [],
+        );
+        return model;
+      };
 
       it('Python cross-file constructor inference uses lookupClassByName', () => {
         const tree = parse(
@@ -2158,7 +2143,7 @@ def main():
           Python,
         );
         const typeEnv = buildTypeEnv(tree, 'python', {
-          symbolTable: makeClassLookupTable({
+          model: makeClassLookupTable({
             User: [createClassDef('User', 'Class', 'models.py')],
           }),
         });
@@ -2174,7 +2159,7 @@ def main():
           Python,
         );
         const typeEnv = buildTypeEnv(tree, 'python', {
-          symbolTable: makeClassLookupTable({}),
+          model: makeClassLookupTable({}),
         });
         expect(flatGet(typeEnv, 'result')).toBeUndefined();
       });
@@ -2188,7 +2173,7 @@ def main():
           Python,
         );
         const typeEnv = buildTypeEnv(tree, 'python', {
-          symbolTable: makeClassLookupTable({
+          model: makeClassLookupTable({
             User: [createClassDef('User', 'Class', 'models.py')],
           }),
         });
@@ -2205,7 +2190,7 @@ void run() {
           CPP,
         );
         const typeEnv = buildTypeEnv(tree, 'cpp', {
-          symbolTable: makeClassLookupTable({
+          model: makeClassLookupTable({
             User: [createClassDef('User', 'Class', 'models.h')],
           }),
         });
@@ -2222,7 +2207,7 @@ void run() {
           CPP,
         );
         const typeEnv = buildTypeEnv(tree, 'cpp', {
-          symbolTable: makeClassLookupTable({}),
+          model: makeClassLookupTable({}),
         });
         expect(flatGet(typeEnv, 'result')).toBeUndefined();
       });
@@ -2237,7 +2222,7 @@ end
           Ruby,
         );
         const typeEnv = buildTypeEnv(tree, 'ruby', {
-          symbolTable: makeClassLookupTable({
+          model: makeClassLookupTable({
             User: [createClassDef('User', 'Class', 'models/user.rb')],
           }),
         });
@@ -2254,7 +2239,7 @@ end
           Ruby,
         );
         const typeEnv = buildTypeEnv(tree, 'ruby', {
-          symbolTable: makeClassLookupTable({
+          model: makeClassLookupTable({
             UserService: [createClassDef('UserService', 'Class', 'models/user_service.rb')],
           }),
         });
@@ -2271,7 +2256,7 @@ end
           Ruby,
         );
         const typeEnv = buildTypeEnv(tree, 'ruby', {
-          symbolTable: makeClassLookupTable({}),
+          model: makeClassLookupTable({}),
         });
         expect(flatGet(typeEnv, 'result')).toBeUndefined();
       });
@@ -2286,7 +2271,7 @@ void run() {
 `,
           );
           const typeEnv = buildTypeEnv(tree, 'dart', {
-            symbolTable: makeClassLookupTable({
+            model: makeClassLookupTable({
               User: [createClassDef('User', 'Class', 'models.dart')],
             }),
           });
@@ -2302,7 +2287,7 @@ void run() {
 `,
           );
           const typeEnv = buildTypeEnv(tree, 'dart', {
-            symbolTable: makeClassLookupTable({
+            model: makeClassLookupTable({
               User: [createClassDef('User', 'Class', 'models.dart')],
             }),
           });
@@ -2318,7 +2303,7 @@ void run() {
 `,
           );
           const typeEnv = buildTypeEnv(tree, 'dart', {
-            symbolTable: makeClassLookupTable({}),
+            model: makeClassLookupTable({}),
           });
           expect(flatGet(typeEnv, 'result')).toBeUndefined();
         });
@@ -2334,7 +2319,7 @@ fn run() {
           Rust,
         );
         const typeEnv = buildTypeEnv(tree, 'rust', {
-          symbolTable: makeClassLookupTable({
+          model: makeClassLookupTable({
             UserService: [createClassDef('UserService', 'Struct', 'models.rs')],
           }),
         });
@@ -2351,7 +2336,7 @@ fn run() {
           Rust,
         );
         const typeEnv = buildTypeEnv(tree, 'rust', {
-          symbolTable: makeClassLookupTable({}),
+          model: makeClassLookupTable({}),
         });
         expect(flatGet(typeEnv, 'value')).toBeUndefined();
       });
@@ -2366,7 +2351,7 @@ func run() {
 `,
           );
           const typeEnv = buildTypeEnv(tree, 'swift', {
-            symbolTable: makeClassLookupTable({
+            model: makeClassLookupTable({
               User: [createClassDef('User', 'Class', 'Models/User.swift')],
             }),
           });
@@ -2382,7 +2367,7 @@ func run() {
 `,
           );
           const typeEnv = buildTypeEnv(tree, 'swift', {
-            symbolTable: makeClassLookupTable({
+            model: makeClassLookupTable({
               User: [createClassDef('User', 'Class', 'Models/User.swift')],
             }),
           });
@@ -2398,7 +2383,7 @@ func run() {
 `,
           );
           const typeEnv = buildTypeEnv(tree, 'swift', {
-            symbolTable: makeClassLookupTable({}),
+            model: makeClassLookupTable({}),
           });
           expect(flatGet(typeEnv, 'result')).toBeUndefined();
         });
@@ -2413,20 +2398,13 @@ function process(user: User) {
 `,
           TypeScript.typescript,
         );
-        const symbolTable = createMockSymbolTable({
-          lookupClassByName: (name: string) =>
-            name === 'User' ? [createClassDef('User', 'Class', 'models.ts')] : [],
-          lookupFieldByOwner: (ownerNodeId: string, fieldName: string) =>
-            ownerNodeId === 'class:User' && fieldName === 'address'
-              ? {
-                  nodeId: 'prop:User:address',
-                  filePath: 'models.ts',
-                  type: 'Property' as const,
-                  declaredType: 'Address',
-                }
-              : undefined,
+        const model = createSemanticModel();
+        model.symbols.add('models.ts', 'User', 'class:User', 'Class');
+        model.symbols.add('models.ts', 'address', 'prop:User:address', 'Property', {
+          ownerId: 'class:User',
+          declaredType: 'Address',
         });
-        const typeEnv = buildTypeEnv(tree, 'typescript', { symbolTable });
+        const typeEnv = buildTypeEnv(tree, 'typescript', { model });
         expect(flatGet(typeEnv, 'addr')).toBe('Address');
       });
 
@@ -2439,10 +2417,8 @@ function process(user: User) {
 `,
           TypeScript.typescript,
         );
-        const symbolTable = createMockSymbolTable({
-          lookupClassByName: () => [],
-        });
-        const typeEnv = buildTypeEnv(tree, 'typescript', { symbolTable });
+        const model = createSemanticModel();
+        const typeEnv = buildTypeEnv(tree, 'typescript', { model });
         expect(flatGet(typeEnv, 'addr')).toBeUndefined();
       });
 
@@ -2455,23 +2431,14 @@ function process(repo: Repo) {
 `,
           TypeScript.typescript,
         );
-        const lookupCallableByName = vi.fn(() => []);
-        const symbolTable = createMockSymbolTable({
-          lookupClassByName: (name: string) =>
-            name === 'Repo' ? [createClassDef('Repo', 'Class', 'models.ts')] : [],
-          lookupMethodByOwner: (ownerNodeId: string, methodName: string) =>
-            ownerNodeId === 'class:Repo' && methodName === 'getProfile'
-              ? {
-                  nodeId: 'method:Repo:getProfile',
-                  filePath: 'models.ts',
-                  type: 'Method',
-                  ownerId: 'class:Repo',
-                  returnType: 'Profile',
-                }
-              : undefined,
-          lookupCallableByName,
+        const model = createSemanticModel();
+        model.symbols.add('models.ts', 'Repo', 'class:Repo', 'Class');
+        model.symbols.add('models.ts', 'getProfile', 'method:Repo:getProfile', 'Method', {
+          ownerId: 'class:Repo',
+          returnType: 'Profile',
         });
-        const typeEnv = buildTypeEnv(tree, 'typescript', { symbolTable });
+        const lookupCallableByName = vi.spyOn(model.symbols, 'lookupCallableByName');
+        const typeEnv = buildTypeEnv(tree, 'typescript', { model });
         expect(flatGet(typeEnv, 'profile')).toBe('Profile');
         expect(lookupCallableByName).not.toHaveBeenCalledWith('getProfile');
       });
@@ -2485,27 +2452,16 @@ function process(repo: Repo) {
 `,
           TypeScript.typescript,
         );
-        const lookupCallableByName = vi.fn(() => []);
-        const symbolTable = createMockSymbolTable({
-          lookupClassByName: (name: string) => {
-            if (name === 'Repo') return [createClassDef('Repo', 'Class', 'models.ts')];
-            if (name === 'BaseRepo') return [createClassDef('BaseRepo', 'Class', 'base.ts')];
-            return [];
-          },
-          lookupMethodByOwner: (ownerNodeId: string, methodName: string) =>
-            ownerNodeId === 'class:BaseRepo' && methodName === 'getProfile'
-              ? {
-                  nodeId: 'method:BaseRepo:getProfile',
-                  filePath: 'base.ts',
-                  type: 'Method',
-                  ownerId: 'class:BaseRepo',
-                  returnType: 'Profile',
-                }
-              : undefined,
-          lookupCallableByName,
+        const model = createSemanticModel();
+        model.symbols.add('models.ts', 'Repo', 'class:Repo', 'Class');
+        model.symbols.add('base.ts', 'BaseRepo', 'class:BaseRepo', 'Class');
+        model.symbols.add('base.ts', 'getProfile', 'method:BaseRepo:getProfile', 'Method', {
+          ownerId: 'class:BaseRepo',
+          returnType: 'Profile',
         });
+        const lookupCallableByName = vi.spyOn(model.symbols, 'lookupCallableByName');
         const typeEnv = buildTypeEnv(tree, 'typescript', {
-          symbolTable,
+          model,
           parentMap: new Map([['Repo', ['BaseRepo']]]),
         });
         expect(flatGet(typeEnv, 'profile')).toBe('Profile');
@@ -2521,32 +2477,15 @@ function process(repo: Repo) {
 `,
           TypeScript.typescript,
         );
-        const lookupCallableByName = vi.fn(() => []);
-        const symbolTable = createMockSymbolTable({
-          lookupClassByName: (name: string) =>
-            name === 'Repo'
-              ? [
-                  createClassDef('Repo', 'Class', 'models-a.ts'),
-                  {
-                    ...createClassDef('Repo', 'Class', 'models-b.ts'),
-                    nodeId: 'class:Repo:partial',
-                  },
-                ]
-              : [],
-          lookupMethodByOwner: (ownerNodeId: string, methodName: string) =>
-            ownerNodeId === 'class:Repo:partial' && methodName === 'getProfile'
-              ? {
-                  nodeId: 'method:Repo:getProfile',
-                  filePath: 'models-b.ts',
-                  type: 'Method',
-                  ownerId: 'class:Repo:partial',
-                  returnType: 'Profile',
-                }
-              : undefined,
-          lookupExactAll: () => [],
-          lookupCallableByName,
+        const model = createSemanticModel();
+        model.symbols.add('models-a.ts', 'Repo', 'class:Repo', 'Class');
+        model.symbols.add('models-b.ts', 'Repo', 'class:Repo:partial', 'Class');
+        model.symbols.add('models-b.ts', 'getProfile', 'method:Repo:getProfile', 'Method', {
+          ownerId: 'class:Repo:partial',
+          returnType: 'Profile',
         });
-        const typeEnv = buildTypeEnv(tree, 'typescript', { symbolTable });
+        const lookupCallableByName = vi.spyOn(model.symbols, 'lookupCallableByName');
+        const typeEnv = buildTypeEnv(tree, 'typescript', { model });
         expect(flatGet(typeEnv, 'profile')).toBe('Profile');
         expect(lookupCallableByName).not.toHaveBeenCalledWith('getProfile');
       });
@@ -2560,33 +2499,17 @@ function process(repo: Repo) {
 `,
           TypeScript.typescript,
         );
-        const lookupCallableByName = vi.fn(() => []);
-        const symbolTable = createMockSymbolTable({
-          lookupClassByName: (name: string) => {
-            if (name === 'Repo') {
-              return [
-                createClassDef('Repo', 'Class', 'models-a.ts'),
-                { ...createClassDef('Repo', 'Class', 'models-b.ts'), nodeId: 'class:Repo:partial' },
-              ];
-            }
-            if (name === 'BaseRepo') return [createClassDef('BaseRepo', 'Class', 'base.ts')];
-            return [];
-          },
-          lookupMethodByOwner: (ownerNodeId: string, methodName: string) =>
-            ownerNodeId === 'class:BaseRepo' && methodName === 'getProfile'
-              ? {
-                  nodeId: 'method:BaseRepo:getProfile',
-                  filePath: 'base.ts',
-                  type: 'Method',
-                  ownerId: 'class:BaseRepo',
-                  returnType: 'Profile',
-                }
-              : undefined,
-          lookupExactAll: () => [],
-          lookupCallableByName,
+        const model = createSemanticModel();
+        model.symbols.add('models-a.ts', 'Repo', 'class:Repo', 'Class');
+        model.symbols.add('models-b.ts', 'Repo', 'class:Repo:partial', 'Class');
+        model.symbols.add('base.ts', 'BaseRepo', 'class:BaseRepo', 'Class');
+        model.symbols.add('base.ts', 'getProfile', 'method:BaseRepo:getProfile', 'Method', {
+          ownerId: 'class:BaseRepo',
+          returnType: 'Profile',
         });
+        const lookupCallableByName = vi.spyOn(model.symbols, 'lookupCallableByName');
         const typeEnv = buildTypeEnv(tree, 'typescript', {
-          symbolTable,
+          model,
           parentMap: new Map([['Repo', ['BaseRepo']]]),
         });
         expect(flatGet(typeEnv, 'profile')).toBe('Profile');
@@ -2602,44 +2525,19 @@ function process(repo: Repo) {
 `,
           TypeScript.typescript,
         );
-        const lookupCallableByName = vi.fn(() => []);
-        const symbolTable = createMockSymbolTable({
-          lookupClassByName: (name: string) =>
-            name === 'Repo'
-              ? [
-                  createClassDef('Repo', 'Class', 'models-a.ts'),
-                  {
-                    ...createClassDef('Repo', 'Class', 'models-b.ts'),
-                    nodeId: 'class:Repo:partial',
-                  },
-                ]
-              : [],
-          lookupMethodByOwner: (ownerNodeId: string, methodName: string) => {
-            if (methodName !== 'getProfile') return undefined;
-            if (ownerNodeId === 'class:Repo') {
-              return {
-                nodeId: 'method:Repo:getProfile#a',
-                filePath: 'models-a.ts',
-                type: 'Method',
-                ownerId: 'class:Repo',
-                returnType: 'Profile',
-              };
-            }
-            if (ownerNodeId === 'class:Repo:partial') {
-              return {
-                nodeId: 'method:Repo:getProfile#b',
-                filePath: 'models-b.ts',
-                type: 'Method',
-                ownerId: 'class:Repo:partial',
-                returnType: 'Profile',
-              };
-            }
-            return undefined;
-          },
-          lookupExactAll: () => [],
-          lookupCallableByName,
+        const model = createSemanticModel();
+        model.symbols.add('models-a.ts', 'Repo', 'class:Repo', 'Class');
+        model.symbols.add('models-b.ts', 'Repo', 'class:Repo:partial', 'Class');
+        model.symbols.add('models-a.ts', 'getProfile', 'method:Repo:getProfile#a', 'Method', {
+          ownerId: 'class:Repo',
+          returnType: 'Profile',
         });
-        const typeEnv = buildTypeEnv(tree, 'typescript', { symbolTable });
+        model.symbols.add('models-b.ts', 'getProfile', 'method:Repo:getProfile#b', 'Method', {
+          ownerId: 'class:Repo:partial',
+          returnType: 'Profile',
+        });
+        const lookupCallableByName = vi.spyOn(model.symbols, 'lookupCallableByName');
+        const typeEnv = buildTypeEnv(tree, 'typescript', { model });
         expect(flatGet(typeEnv, 'profile')).toBeUndefined();
         expect(lookupCallableByName).not.toHaveBeenCalledWith('getProfile');
       });
@@ -2653,42 +2551,18 @@ function process(repo: Repo) {
 `,
           TypeScript.typescript,
         );
-        const lookupCallableByName = vi.fn(() => []);
-        const symbolTable = createMockSymbolTable({
-          lookupClassByName: (name: string) =>
-            name === 'Repo' ? [createClassDef('Repo', 'Class', 'models.ts')] : [],
-          lookupMethodByOwner: (ownerNodeId: string, methodName: string) =>
-            ownerNodeId === 'class:Repo' && methodName === 'getProfile'
-              ? {
-                  nodeId: 'method:Repo:getProfile#1',
-                  filePath: 'models.ts',
-                  type: 'Method',
-                  ownerId: 'class:Repo',
-                  returnType: 'Profile',
-                }
-              : undefined,
-          lookupExactAll: (filePath: string, name: string) =>
-            filePath === 'models.ts' && name === 'getProfile'
-              ? [
-                  {
-                    nodeId: 'method:Repo:getProfile#1',
-                    filePath: 'models.ts',
-                    type: 'Method',
-                    ownerId: 'class:Repo',
-                    returnType: 'Profile',
-                  },
-                  {
-                    nodeId: 'method:Repo:getProfile#2',
-                    filePath: 'models.ts',
-                    type: 'Method',
-                    ownerId: 'class:Repo',
-                    returnType: 'Profile',
-                  },
-                ]
-              : [],
-          lookupCallableByName,
+        const model = createSemanticModel();
+        model.symbols.add('models.ts', 'Repo', 'class:Repo', 'Class');
+        model.symbols.add('models.ts', 'getProfile', 'method:Repo:getProfile#1', 'Method', {
+          ownerId: 'class:Repo',
+          returnType: 'Profile',
         });
-        const typeEnv = buildTypeEnv(tree, 'typescript', { symbolTable });
+        model.symbols.add('models.ts', 'getProfile', 'method:Repo:getProfile#2', 'Method', {
+          ownerId: 'class:Repo',
+          returnType: 'Profile',
+        });
+        const lookupCallableByName = vi.spyOn(model.symbols, 'lookupCallableByName');
+        const typeEnv = buildTypeEnv(tree, 'typescript', { model });
         expect(flatGet(typeEnv, 'profile')).toBe('Profile');
         expect(lookupCallableByName).not.toHaveBeenCalledWith('getProfile');
       });
@@ -2702,46 +2576,24 @@ function process(repo: Repo) {
 `,
           TypeScript.typescript,
         );
-        const lookupCallableByName = vi.fn(() => []);
-        const symbolTable = createMockSymbolTable({
-          lookupClassByName: (name: string) => {
-            if (name === 'Repo') return [createClassDef('Repo', 'Class', 'models.ts')];
-            if (name === 'BaseRepo') return [createClassDef('BaseRepo', 'Class', 'base.ts')];
-            return [];
-          },
-          lookupMethodByOwner: (ownerNodeId: string, methodName: string) =>
-            ownerNodeId === 'class:BaseRepo' && methodName === 'getProfile'
-              ? {
-                  nodeId: 'method:BaseRepo:getProfile',
-                  filePath: 'base.ts',
-                  type: 'Method',
-                  ownerId: 'class:BaseRepo',
-                  returnType: 'Profile',
-                }
-              : undefined,
-          lookupExactAll: (filePath: string, name: string) =>
-            filePath === 'models.ts' && name === 'getProfile'
-              ? [
-                  {
-                    nodeId: 'method:Repo:getProfile#1',
-                    filePath: 'models.ts',
-                    type: 'Method',
-                    ownerId: 'class:Repo',
-                    returnType: 'User',
-                  },
-                  {
-                    nodeId: 'method:Repo:getProfile#2',
-                    filePath: 'models.ts',
-                    type: 'Method',
-                    ownerId: 'class:Repo',
-                    returnType: 'Admin',
-                  },
-                ]
-              : [],
-          lookupCallableByName,
+        const model = createSemanticModel();
+        model.symbols.add('models.ts', 'Repo', 'class:Repo', 'Class');
+        model.symbols.add('base.ts', 'BaseRepo', 'class:BaseRepo', 'Class');
+        model.symbols.add('base.ts', 'getProfile', 'method:BaseRepo:getProfile', 'Method', {
+          ownerId: 'class:BaseRepo',
+          returnType: 'Profile',
         });
+        model.symbols.add('models.ts', 'getProfile', 'method:Repo:getProfile#1', 'Method', {
+          ownerId: 'class:Repo',
+          returnType: 'User',
+        });
+        model.symbols.add('models.ts', 'getProfile', 'method:Repo:getProfile#2', 'Method', {
+          ownerId: 'class:Repo',
+          returnType: 'Admin',
+        });
+        const lookupCallableByName = vi.spyOn(model.symbols, 'lookupCallableByName');
         const typeEnv = buildTypeEnv(tree, 'typescript', {
-          symbolTable,
+          model,
           parentMap: new Map([['Repo', ['BaseRepo']]]),
         });
         expect(flatGet(typeEnv, 'profile')).toBeUndefined();
@@ -2757,46 +2609,20 @@ function process(repo: Repo) {
 `,
           TypeScript.typescript,
         );
-        const lookupCallableByName = vi.fn(() => []);
-        const symbolTable = createMockSymbolTable({
-          lookupClassByName: (name: string) => {
-            if (name === 'Repo') return [createClassDef('Repo', 'Class', 'models.ts')];
-            if (name === 'BaseRepo') return [createClassDef('BaseRepo', 'Class', 'base.ts')];
-            return [];
-          },
-          lookupMethodByOwner: (ownerNodeId: string, methodName: string) =>
-            ownerNodeId === 'class:BaseRepo' && methodName === 'getProfile'
-              ? {
-                  nodeId: 'method:BaseRepo:getProfile#1',
-                  filePath: 'base.ts',
-                  type: 'Method',
-                  ownerId: 'class:BaseRepo',
-                  returnType: 'Profile',
-                }
-              : undefined,
-          lookupExactAll: (filePath: string, name: string) =>
-            filePath === 'base.ts' && name === 'getProfile'
-              ? [
-                  {
-                    nodeId: 'method:BaseRepo:getProfile#1',
-                    filePath: 'base.ts',
-                    type: 'Method',
-                    ownerId: 'class:BaseRepo',
-                    returnType: 'Profile',
-                  },
-                  {
-                    nodeId: 'method:BaseRepo:getProfile#2',
-                    filePath: 'base.ts',
-                    type: 'Method',
-                    ownerId: 'class:BaseRepo',
-                    returnType: 'Profile',
-                  },
-                ]
-              : [],
-          lookupCallableByName,
+        const model = createSemanticModel();
+        model.symbols.add('models.ts', 'Repo', 'class:Repo', 'Class');
+        model.symbols.add('base.ts', 'BaseRepo', 'class:BaseRepo', 'Class');
+        model.symbols.add('base.ts', 'getProfile', 'method:BaseRepo:getProfile#1', 'Method', {
+          ownerId: 'class:BaseRepo',
+          returnType: 'Profile',
         });
+        model.symbols.add('base.ts', 'getProfile', 'method:BaseRepo:getProfile#2', 'Method', {
+          ownerId: 'class:BaseRepo',
+          returnType: 'Profile',
+        });
+        const lookupCallableByName = vi.spyOn(model.symbols, 'lookupCallableByName');
         const typeEnv = buildTypeEnv(tree, 'typescript', {
-          symbolTable,
+          model,
           parentMap: new Map([['Repo', ['BaseRepo']]]),
         });
         expect(flatGet(typeEnv, 'profile')).toBe('Profile');
@@ -2812,22 +2638,24 @@ function process(repo: Repo) {
 `,
           TypeScript.typescript,
         );
-        const symbolTable = createSymbolTable();
-        symbolTable.add('models.ts', 'Repo', 'class:Repo', 'Class');
-        symbolTable.add('base.ts', 'BaseRepo', 'class:BaseRepo', 'Class');
-        symbolTable.add('base.ts', 'getProfile', 'method:BaseRepo:getProfile#1', 'Method', {
+        // SM-21: construct a real SemanticModel and feed it via
+        // model.symbols.add so the nested registries are populated.
+        const model = createSemanticModel();
+        model.symbols.add('models.ts', 'Repo', 'class:Repo', 'Class');
+        model.symbols.add('base.ts', 'BaseRepo', 'class:BaseRepo', 'Class');
+        model.symbols.add('base.ts', 'getProfile', 'method:BaseRepo:getProfile#1', 'Method', {
           ownerId: 'class:BaseRepo',
           parameterCount: 1,
           returnType: 'User',
         });
-        symbolTable.add('base.ts', 'getProfile', 'method:BaseRepo:getProfile#2', 'Method', {
+        model.symbols.add('base.ts', 'getProfile', 'method:BaseRepo:getProfile#2', 'Method', {
           ownerId: 'class:BaseRepo',
           parameterCount: 2,
           returnType: 'Admin',
         });
-        const lookupCallableByName = vi.spyOn(symbolTable, 'lookupCallableByName');
+        const lookupCallableByName = vi.spyOn(model.symbols, 'lookupCallableByName');
         const typeEnv = buildTypeEnv(tree, 'typescript', {
-          symbolTable,
+          model,
           parentMap: new Map([['Repo', ['BaseRepo']]]),
         });
         expect(flatGet(typeEnv, 'profile')).toBeUndefined();
@@ -5740,24 +5568,20 @@ function process() {
   });
 
   describe('importedReturnTypes (Phase 14 E3)', () => {
-    // Minimal mock SymbolTable that returns a known callable
-    const makeSymbolTable = (callables: Array<{ name: string; returnType?: string }>) => ({
-      lookupCallableByName: (name: string) =>
-        callables
-          .filter((c) => c.name === name)
-          .map((c) => ({
-            nodeId: 'n1',
-            filePath: 'src.ts',
-            type: 'Function' as const,
-            returnType: c.returnType,
-          })),
-      lookupClassByName: () => [],
-      lookupExact: () => undefined,
-      lookupExactFull: () => undefined,
-      add: () => {},
-      getStats: () => ({ fileCount: 0 }),
-      clear: () => {},
-    });
+    // Minimal real SemanticModel populated via model.symbols.add so that
+    // lookupCallableByName returns Function symbols with the requested
+    // return types.
+    const makeSymbolTable = (
+      callables: Array<{ name: string; returnType?: string }>,
+    ): SemanticModel => {
+      const model = createSemanticModel();
+      callables.forEach((c, idx) => {
+        model.symbols.add('src.ts', c.name, `n${idx}`, 'Function', {
+          returnType: c.returnType,
+        });
+      });
+      return model;
+    };
 
     it('SymbolTable has unambiguous match → uses it, ignores cross-file', () => {
       // SymbolTable knows getConfig() returns Config (SymbolType)
@@ -5765,7 +5589,7 @@ function process() {
       const symbolTable = makeSymbolTable([{ name: 'getConfig', returnType: 'Config' }]);
       const tree = parse('const c = getConfig();', TypeScript.typescript);
       const typeEnv = buildTypeEnv(tree, 'typescript', {
-        symbolTable: symbolTable as any,
+        model: symbolTable,
         importedReturnTypes: new Map([['getConfig', 'WrongType']]),
       });
       // SymbolTable result (Config) wins over cross-file fallback (WrongType)
@@ -5777,7 +5601,7 @@ function process() {
       const symbolTable = makeSymbolTable([]);
       const tree = parse('const c = getConfig();', TypeScript.typescript);
       const typeEnv = buildTypeEnv(tree, 'typescript', {
-        symbolTable: symbolTable as any,
+        model: symbolTable,
         importedReturnTypes: new Map([['getConfig', 'Config']]),
       });
       // Cross-file fallback provides Config
@@ -5792,7 +5616,7 @@ function process() {
       ]);
       const tree = parse('const r = process();', TypeScript.typescript);
       const typeEnv = buildTypeEnv(tree, 'typescript', {
-        symbolTable: symbolTable as any,
+        model: symbolTable,
         importedReturnTypes: new Map([['process', 'User']]),
       });
       // Ambiguous → conservative → no binding produced
@@ -5812,7 +5636,7 @@ function process() {
       const symbolTable = makeSymbolTable([{ name: 'getUser', returnType: 'User' }]);
       const tree = parse('const u = getUser();', TypeScript.typescript);
       const typeEnv = buildTypeEnv(tree, 'typescript', {
-        symbolTable: symbolTable as any,
+        model: symbolTable,
         importedReturnTypes: new Map([['getUser', 'CrossFileUser']]),
       });
       // SymbolTable result (User) wins

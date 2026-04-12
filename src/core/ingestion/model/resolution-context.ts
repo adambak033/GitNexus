@@ -1,9 +1,7 @@
 /**
  * Resolution Context
  *
- * Single implementation of tiered name resolution. Replaces the duplicated
- * tier-selection logic previously split between symbol-resolver.ts and
- * call-processor.ts.
+ * Single implementation of tiered name resolution.
  *
  * Resolution tiers (highest confidence first):
  * 1. Same file (lookupExactAll — authoritative)
@@ -20,11 +18,112 @@
  *   (three O(1) index lookups with a narrow, type-specific result set).
  */
 
-import type { SymbolTable, SymbolDefinition } from './symbol-table.js';
-import { createSymbolTable } from './symbol-table.js';
-import type { NamedImportMap } from './import-processor.js';
-import { isFileInPackageDir } from './import-processor.js';
-import { walkBindingChain } from './named-binding-processor.js';
+import type { SymbolDefinition, SymbolTableReader } from './symbol-table.js';
+import type { MutableSemanticModel } from './semantic-model.js';
+import { createSemanticModel } from './semantic-model.js';
+
+// ---------------------------------------------------------------------------
+// Named-import types — describe how a file imports specific names from a
+// source file. Consumed by the Tier 2a-named binding-chain walker below.
+// ---------------------------------------------------------------------------
+
+/**
+ * A single named binding in a source file (e.g. `import { User as U }`).
+ * Stores both the resolved source path and the original exported name so
+ * that aliased imports can resolve U → User in the source file.
+ */
+export interface NamedImportBinding {
+  sourcePath: string;
+  exportedName: string;
+}
+
+/**
+ * Map<ImportingFilePath, Map<LocalName, NamedImportBinding>>.
+ *
+ * Tracks which specific names a file imports from which sources (TS / Python
+ * / Rust / Java-static / ...). Used to tighten Tier 2a resolution:
+ * `import { User } from './models'` means only `User` (not `Repo`) is
+ * visible from models.ts via this import.
+ */
+export type NamedImportMap = Map<string, Map<string, NamedImportBinding>>;
+
+/**
+ * Check if a file path is directly inside a package directory identified by
+ * its suffix. Used by Tier 2b package-scoped resolution (Go / C#).
+ */
+export function isFileInPackageDir(filePath: string, dirSuffix: string): boolean {
+  // Prepend '/' so paths like "internal/auth/service.go" match suffix "/internal/auth/"
+  const normalized = '/' + filePath.replace(/\\/g, '/');
+  if (!normalized.includes(dirSuffix)) return false;
+  const afterDir = normalized.substring(normalized.indexOf(dirSuffix) + dirSuffix.length);
+  return !afterDir.includes('/');
+}
+
+/** Maximum re-export hops walkBindingChain will follow before giving up.
+ *  A hard cap is needed to defend against pathological cycles that slip
+ *  past the `visited` Set (e.g. a binding chain whose key is equal by
+ *  string value but visits distinct modules). Five hops covers the
+ *  common TypeScript monorepo pattern (component → pkg/index →
+ *  packages/index → root/index → types/index). Chains longer than this
+ *  fall through to Tier 2a-import / Tier 2b / Tier 3 resolution, which
+ *  is a silent false-negative that the caller may or may not recover
+ *  from. If a real repo hits this limit, raise it — there is no
+ *  correctness reason to keep it at exactly 5. */
+const MAX_BINDING_CHAIN_DEPTH = 5;
+
+/**
+ * Walk a named-binding re-export chain through NamedImportMap.
+ *
+ * When file A imports { User } from B, and B re-exports { User } from C,
+ * the NamedImportMap for A points to B, but B has no User definition.
+ * This function follows the chain: A → B → C until a definition is found.
+ *
+ * Returns the definitions found at the end of the chain, or null if the
+ * chain breaks (missing binding, circular reference, or
+ * {@link MAX_BINDING_CHAIN_DEPTH} exceeded). Internal to
+ * resolution-context — not exported from the model barrel.
+ */
+function walkBindingChain(
+  name: string,
+  currentFilePath: string,
+  symbolTable: SymbolTableReader,
+  namedImportMap: NamedImportMap,
+): readonly SymbolDefinition[] | null {
+  // Fast exit: most files have no named imports at all. Skip the Set
+  // allocation + loop entry on the common empty-binding path so resolve()
+  // stays allocation-free for the typical call site.
+  const firstBindings = namedImportMap.get(currentFilePath);
+  if (!firstBindings) return null;
+  const firstBinding = firstBindings.get(name);
+  if (!firstBinding) return null;
+
+  let lookupFile = currentFilePath;
+  let lookupName = name;
+  const visited = new Set<string>();
+
+  for (let depth = 0; depth < MAX_BINDING_CHAIN_DEPTH; depth++) {
+    const bindings = depth === 0 ? firstBindings : namedImportMap.get(lookupFile);
+    if (!bindings) return null;
+
+    const binding = depth === 0 ? firstBinding : bindings.get(lookupName);
+    if (!binding) return null;
+
+    const key = `${binding.sourcePath}:${binding.exportedName}`;
+    if (visited.has(key)) return null; // circular
+    visited.add(key);
+
+    const targetName = binding.exportedName;
+    const resolvedDefs = symbolTable.lookupExactAll(binding.sourcePath, targetName);
+
+    if (resolvedDefs.length > 0) return resolvedDefs;
+
+    // No definition in source file → follow re-export chain
+    lookupFile = binding.sourcePath;
+    lookupName = targetName;
+  }
+
+  return null;
+}
 
 /** Resolution tier for tracking, logging, and test assertions. */
 export type ResolutionTier = 'same-file' | 'import-scoped' | 'global';
@@ -59,8 +158,13 @@ export interface ResolutionContext {
   resolve(name: string, fromFile: string): TieredCandidates | null;
 
   // --- Data access (for pipeline wiring, not resolution) ---
-  /** Symbol table — used by parsing-processor to populate symbols. */
-  readonly symbols: SymbolTable;
+  /** Semantic model — the top-level container for types, methods, fields,
+   *  and the nested file/callable SymbolTable. Typed as
+   *  {@link MutableSemanticModel} because `ResolutionContext` is the
+   *  lifecycle owner — the pipeline registers symbols through it during
+   *  the fan-out phase. Resolvers that only query should annotate their
+   *  own fields as {@link SemanticModel} to drop write access. */
+  readonly model: MutableSemanticModel;
   /** Raw maps — used by import-processor to populate import data. */
   readonly importMap: ImportMap;
   readonly packageMap: PackageMap;
@@ -86,7 +190,8 @@ export interface ResolutionContext {
 }
 
 export const createResolutionContext = (): ResolutionContext => {
-  const symbols = createSymbolTable();
+  const model = createSemanticModel();
+  const symbols = model.symbols;
   const importMap: ImportMap = new Map();
   const packageMap: PackageMap = new Map();
   const namedImportMap: NamedImportMap = new Map();
@@ -194,27 +299,75 @@ export const createResolutionContext = (): ResolutionContext => {
     // Tier 3: Global — targeted O(1) index lookups for each symbol category.
     // Class-like symbols (Class, Struct, Interface, Enum, Record, Trait) are
     // covered by lookupClassByName; Rust impl blocks by lookupImplByName
-    // (separate to avoid polluting heritage resolution); callables (Function,
-    // Method, Constructor, Macro, Delegate) by lookupCallableByName.
-    // The three indexes cover disjoint symbol types so no dedup is needed.
-    // Consumers must check candidates.length and refuse ambiguous matches.
+    // (separate to avoid polluting heritage resolution); free callables
+    // (Function, Macro, Delegate) by lookupCallableByName; owner-scoped
+    // methods and constructors by `model.methods.lookupMethodByName`.
+    //
+    // FREE_CALLABLE_TYPES excludes Method/Constructor, so strictly-labeled
+    // methods are disjoint between the two indexes.
+    //
+    // Partial-state caveat: Python/Rust/Kotlin class methods are emitted
+    // as Function + ownerId — `rawSymbols.add` routes them through both
+    // the Function callable index AND, via the dispatch-key normalization
+    // in `wrappedAdd`, the method registry. The same `SymbolDefinition`
+    // reference lands in both `callableDefs` and `methodDefs`, so the
+    // Set-based dedup below is required.
     //
     // Known exclusion: TypeAlias, Const, and Variable are NOT reachable at
-    // Tier 3 — they don't belong to any of the three indexes. In practice
-    // they were never useful as Tier 3 candidates: TypeAlias is not a call
-    // target, Const/Variable are resolved via import or same-file tiers.
-    // If a future language needs them at Tier 3, add a dedicated index.
-    // Macro (C/C++) and Delegate (C#) ARE included in the callable index
+    // Tier 3 — they don't belong to any of the indexes. TypeAlias is not
+    // a call target; Const/Variable are resolved via import or same-file
+    // tiers. Macro (C/C++) and Delegate (C#) stay in the callable index
     // since call-processor.ts treats them as callable targets.
-    const classDefs = symbols.lookupClassByName(name);
-    const implDefs = symbols.lookupImplByName(name);
+    const classDefs = model.types.lookupClassByName(name);
+    const implDefs = model.types.lookupImplByName(name);
     const callableDefs = symbols.lookupCallableByName(name);
+    const methodDefs = model.methods.lookupMethodByName(name);
 
-    if (classDefs.length === 0 && implDefs.length === 0 && callableDefs.length === 0) {
+    if (
+      classDefs.length === 0 &&
+      implDefs.length === 0 &&
+      callableDefs.length === 0 &&
+      methodDefs.length === 0
+    ) {
       tierMiss++;
       return null;
     }
-    const globalDefs = [...classDefs, ...implDefs, ...callableDefs];
+
+    // Fast path: if no `Function + ownerId` class method was ever
+    // registered into the method registry (the only source of
+    // cross-index duplication), the callable and method indexes are
+    // guaranteed disjoint and we can concat without dedup.
+    if (!model.methods.hasFunctionMethods) {
+      const globalDefs: SymbolDefinition[] = [
+        ...classDefs,
+        ...implDefs,
+        ...callableDefs,
+        ...methodDefs,
+      ];
+      tierGlobal++;
+      return { candidates: globalDefs, tier: 'global' };
+    }
+
+    // Slow path: dedup by nodeId because the same SymbolDefinition
+    // reference can land in both `callableDefs` (via the Function
+    // callable-index gate) and `methodDefs` (via the dispatch-key
+    // normalization routing Function+ownerId into MethodRegistry).
+    // Dedup covers all four index reads so any nodeId overlap (even
+    // theoretical ones between classDefs/implDefs) is caught.
+    const globalDefs: SymbolDefinition[] = [];
+    const seen = new Set<string>();
+    const pushUnique = (pool: readonly SymbolDefinition[]): void => {
+      for (const def of pool) {
+        if (seen.has(def.nodeId)) continue;
+        seen.add(def.nodeId);
+        globalDefs.push(def);
+      }
+    };
+    pushUnique(classDefs);
+    pushUnique(implDefs);
+    pushUnique(callableDefs);
+    pushUnique(methodDefs);
+
     tierGlobal++;
     return { candidates: globalDefs, tier: 'global' };
   };
@@ -271,7 +424,7 @@ export const createResolutionContext = (): ResolutionContext => {
   });
 
   const clear = (): void => {
-    symbols.clear();
+    model.clear();
     importMap.clear();
     packageMap.clear();
     namedImportMap.clear();
@@ -288,7 +441,7 @@ export const createResolutionContext = (): ResolutionContext => {
 
   return {
     resolve,
-    symbols,
+    model,
     importMap,
     packageMap,
     namedImportMap,
