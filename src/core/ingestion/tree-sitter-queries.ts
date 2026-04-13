@@ -1158,6 +1158,58 @@ export const DART_QUERIES = `
       (identifier) @call.name))
   (selector (argument_part))) @call
 
+; ── Calls: await direct (await doSomething()) ────────────────────────────────
+(await_expression
+  (identifier) @call.name
+  .
+  (selector (argument_part))) @call
+
+; ── Calls: await method chain (await obj.method()) ───────────────────────────
+; Requires argument_part to distinguish method calls from field access (await obj.field)
+(await_expression
+  (selector
+    (unconditional_assignable_selector
+      (identifier) @call.name))
+  (selector (argument_part))) @call
+
+; ── Calls: named argument (foo(child: buildX())) ─────────────────────────────
+(named_argument
+  (identifier) @call.name
+  .
+  (selector (argument_part))) @call
+
+; ── Calls: inside list literals ([buildA(), buildB()]) ───────────────────────
+(list_literal
+  (identifier) @call.name
+  .
+  (selector (argument_part))) @call
+
+; ── Calls: cascade (obj..add(x)..sort()) ─────────────────────────────────────
+; Note: cascade_selector contains identifier directly (no unconditional_assignable_selector
+; wrapper in Dart grammar), so inferCallForm() classifies these as free calls rather than
+; member calls. Cross-file resolution still benefits from the call being recorded.
+(cascade_section
+  (cascade_selector (identifier) @call.name)
+  (argument_part)) @call
+
+; ── Calls: static final field initializers (static final _svc = MyService()) ──
+(static_final_declaration
+  (identifier) @call.name
+  .
+  (selector (argument_part))) @call
+
+; ── Calls: arrow function body (=> buildWidget()) ────────────────────────────
+(function_body "=>"
+  (identifier) @call.name
+  .
+  (selector (argument_part))) @call
+
+; ── Calls: lambda body (() => doSomething()) ─────────────────────────────────
+(function_expression_body
+  (identifier) @call.name
+  .
+  (selector (argument_part))) @call
+
 ; ── Re-exports (export 'foo.dart') ───────────────────────────────────────────
 (import_or_export
   (library_export
