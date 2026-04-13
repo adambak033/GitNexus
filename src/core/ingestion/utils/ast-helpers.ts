@@ -209,13 +209,39 @@ export interface EnclosingClassInfo {
 }
 
 /** Walk up AST to find enclosing class/struct/interface/impl, return its ID and name.
- *  For Go method_declaration nodes, extracts receiver type (e.g. `func (u *User) Save()` → User struct). */
+ *  For Go method_declaration nodes, extracts receiver type (e.g. `func (u *User) Save()` → User struct).
+ *
+ *  @param resolveEnclosingOwner  Optional language-specific hook for container remapping.
+ *    When provided and a CLASS_CONTAINER_TYPES node is found, this hook is called:
+ *    - Return a different SyntaxNode to remap the container (e.g., Ruby singleton_class → class).
+ *    - Return `null` to skip this container and keep walking up.
+ *    - Return the input node (identity) to use the container as-is.
+ *    When omitted, the container node is used as-is.
+ *
+ *    INVARIANT: Implementers SHOULD return either `null`, the input node, or
+ *    another CLASS_CONTAINER_TYPES node. Returning a non-container node is
+ *    permitted but discouraged — it will cause the walk to skip the current
+ *    container and continue from the redirected node's parent. The
+ *    `MAX_ENCLOSING_WALK_ITERATIONS` defense-in-depth guard below prevents
+ *    pathological hooks from creating an infinite loop. */
+const MAX_ENCLOSING_WALK_ITERATIONS = 4096;
+
 export const findEnclosingClassInfo = (
   node: SyntaxNode,
   filePath: string,
+  resolveEnclosingOwner?: (node: SyntaxNode) => SyntaxNode | null,
 ): EnclosingClassInfo | null => {
   let current = node.parent;
+  let iterations = 0;
+  // Tracks container nodes already visited via the hook so a misbehaving hook
+  // that keeps redirecting back to the same container cannot loop forever.
+  const visitedContainers = new Set<SyntaxNode>();
   while (current) {
+    if (++iterations > MAX_ENCLOSING_WALK_ITERATIONS) {
+      // Defense-in-depth: a real source tree has nowhere near this many ancestors.
+      // Bail out rather than hang ingestion.
+      return null;
+    }
     // Go: method_declaration has a receiver parameter with the struct type
     if (current.type === 'method_declaration') {
       const receiver = current.childForFieldName?.('receiver');
@@ -255,6 +281,29 @@ export const findEnclosingClassInfo = (
       }
     }
     if (CLASS_CONTAINER_TYPES.has(current.type)) {
+      // Delegate language-specific container remapping to the provider hook.
+      if (resolveEnclosingOwner) {
+        if (visitedContainers.has(current)) {
+          // We've already asked the hook about this container once — a loop
+          // would form (e.g., hook redirects to a child node whose parent is
+          // this same container). Skip and walk up.
+          current = current.parent;
+          continue;
+        }
+        visitedContainers.add(current);
+        const resolved = resolveEnclosingOwner(current);
+        if (resolved === null) {
+          // Provider says skip this container — keep walking up.
+          current = current.parent;
+          continue;
+        }
+        if (resolved !== current) {
+          // Provider remapped to a different node — re-evaluate from there.
+          current = resolved;
+          continue;
+        }
+      }
+
       // Rust impl_item: for `impl Trait for Struct {}`, pick the type after `for`
       // NOTE: This impl_item ownership logic is duplicated in rust.ts:extractOwnerName.
       // If modifying this block, update the other location too.
@@ -284,26 +333,6 @@ export const findEnclosingClassInfo = (
             className: firstType.text,
           };
         }
-      }
-
-      // Ruby singleton_class (class << self): walk up to the enclosing class/module
-      // to inherit its name. singleton_class has no name field — its receiver is
-      // `self` (node type 'self'), not 'identifier' or 'constant'.
-      if (current.type === 'singleton_class') {
-        let ancestor = current.parent;
-        while (ancestor) {
-          if (ancestor.type === 'class' || ancestor.type === 'module') {
-            const classNameNode = ancestor.childForFieldName?.('name');
-            if (classNameNode) {
-              return {
-                classId: generateId('Class', `${filePath}:${classNameNode.text}`),
-                className: classNameNode.text,
-              };
-            }
-          }
-          ancestor = ancestor.parent;
-        }
-        // No enclosing class/module — skip singleton_class and keep walking up
       }
 
       const nameNode =
