@@ -2,6 +2,22 @@
 
 All notable changes to GitNexus will be documented in this file.
 
+## [1.6.1] - 2026-04-13
+
+### Added
+- **Service group extractor expansion** — manifest extractor and broader extractor coverage (2/4 of #606 split) (#796)
+- **Dart call patterns** for `await`, cascade, lambda, and widget-tree contexts (#801)
+
+### Fixed
+- **Stack overflow and memory exhaustion** on large repository analysis (#814)
+- **`tree-sitter-dart` install crash** — switched from git URL to npm tarball (#811)
+- **Generic TypeScript awaited function calls** missing from the call graph (#804)
+- **Runtime dependency on `file:../gitnexus-shared`** removed from the published package (#803)
+- **Ruby `singleton_class` context** preserved during sequential parsing (#774)
+
+### Changed
+- **DAG-based ingestion pipeline architecture** — pipeline phases now declare typed dependencies and run via a topologically sorted DAG; container-node logic extracted to `LanguageProvider`. Includes hardened lifecycle (try/finally cleanup, error wrapping, cycle reporting), tightened `ParseOutput.exportedTypeMap` immutability, and corrected phase dependencies (#809)
+
 ## [1.6.0] - 2026-04-12
 
 ### Added
