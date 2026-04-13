@@ -1262,6 +1262,33 @@ describe('Ruby method enrichment (visibility, isStatic, parameters)', () => {
   });
 });
 
+describe('Ruby singleton_class handling via sequential path (skipWorkers)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'ruby-method-enrichment'), () => {}, {
+      skipWorkers: true,
+    });
+  }, 60000);
+
+  it('keeps Animal as the owner for class << self methods', () => {
+    const hasMethod = getRelationships(result, 'HAS_METHOD');
+    expect(
+      hasMethod.find((e) => e.source === 'Animal' && e.target === 'from_habitat'),
+    ).toBeDefined();
+  });
+
+  it('marks from_habitat as static in the sequential path', () => {
+    const methods = getNodesByLabelFull(result, 'Method');
+    const fromHabitat = methods.find(
+      (m) => m.name === 'from_habitat' && m.properties.filePath?.includes('animal'),
+    );
+    expect(fromHabitat).toBeDefined();
+    expect(fromHabitat!.properties.isStatic).toBe(true);
+    expect(fromHabitat!.properties.parameterCount).toBe(1);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Overload Dispatch: methods with different arity resolve via receiver type
 // ---------------------------------------------------------------------------
