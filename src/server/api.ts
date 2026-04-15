@@ -1449,27 +1449,14 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           await withLbugDb(lbugPath, async () => {
             const { runEmbeddingPipeline } =
               await import('../core/embeddings/embedding-pipeline.js');
-            // Skip nodes that already have embeddings — Kuzu forbids SET on vector-indexed properties.
-            let skipNodeIds: Set<string> | undefined;
-            try {
-              const rows = await executeQuery('MATCH (e:CodeEmbedding) RETURN e.nodeId AS nodeId');
-              if (rows && rows.length > 0) {
-                skipNodeIds = new Set(rows.map((r: any) => r.nodeId ?? r[0]).filter(Boolean));
-                console.log(
-                  `[embed] ${skipNodeIds.size} nodes already embedded — skipping in incremental run`,
-                );
-              }
-            } catch (err: any) {
-              // Swallow only "table does not exist" — let real connection errors propagate.
-              // Log so ops can see this path fire if Kuzu ever changes error wording.
-              const msg = err?.message ?? '';
-              if (msg.includes('does not exist') || msg.includes('not found')) {
-                console.log(
-                  `[embed] CodeEmbedding table not yet present — full embedding run (${msg})`,
-                );
-              } else {
-                throw err;
-              }
+            // Fetch existing content hashes for incremental embedding.
+            // Delegated to lbug-adapter which owns the DB query logic and legacy-fallback handling.
+            const { fetchExistingEmbeddingHashes } = await import('../core/lbug/lbug-adapter.js');
+            const existingEmbeddings = await fetchExistingEmbeddingHashes(executeQuery);
+            if (existingEmbeddings && existingEmbeddings.size > 0) {
+              console.log(
+                `[embed] ${existingEmbeddings.size} nodes already embedded — incremental run with content-hash comparison`,
+              );
             }
             await runEmbeddingPipeline(
               executeQuery,
@@ -1493,8 +1480,8 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                   },
                 });
               },
-              {}, // config: use defaults (runEmbeddingPipeline signature: executeQuery, executeWithReusedStatement, onProgress, config, skipNodeIds)
-              skipNodeIds,
+              {}, // config: use defaults
+              existingEmbeddings,
             );
           });
 

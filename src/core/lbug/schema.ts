@@ -436,10 +436,20 @@ if (Number.isNaN(_rawDims) || _rawDims <= 0) {
 }
 export const EMBEDDING_DIMS = _rawDims;
 
+/** HNSW vector index name for the CodeEmbedding table. */
+export const EMBEDDING_INDEX_NAME = 'code_embedding_idx';
+
+/**
+ * Sentinel value for "no content hash available" — used in legacy DBs and null rows.
+ * Nodes with this hash are always treated as stale and re-embedded.
+ */
+export const STALE_HASH_SENTINEL = '';
+
 export const EMBEDDING_SCHEMA = `
 CREATE NODE TABLE ${EMBEDDING_TABLE_NAME} (
   nodeId STRING,
   embedding FLOAT[${EMBEDDING_DIMS}],
+  contentHash STRING,
   PRIMARY KEY (nodeId)
 )`;
 
@@ -448,7 +458,7 @@ CREATE NODE TABLE ${EMBEDDING_TABLE_NAME} (
  * Uses HNSW (Hierarchical Navigable Small World) algorithm with cosine similarity
  */
 export const CREATE_VECTOR_INDEX_QUERY = `
-CALL CREATE_VECTOR_INDEX('${EMBEDDING_TABLE_NAME}', 'code_embedding_idx', 'embedding', metric := 'cosine')
+CALL CREATE_VECTOR_INDEX('${EMBEDDING_TABLE_NAME}', '${EMBEDDING_INDEX_NAME}', 'embedding', metric := 'cosine')
 `;
 
 // ============================================================================
