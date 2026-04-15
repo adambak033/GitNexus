@@ -87,7 +87,12 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  fs.rmSync(tmpDir, { recursive: true, force: true });
+  // fs.rmSync's built-in retry loop handles Windows EBUSY/ENOTEMPTY/EPERM
+  // when a just-closed fd hasn't been released yet (Node added this exactly
+  // for cross-platform tmpdir cleanup — see Node.js fs docs). The production
+  // function also waits for the input stream's 'close' event, so this is
+  // defense-in-depth.
+  fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 });
 
 function writeCsv(lines: string[]): string {
@@ -242,8 +247,13 @@ describe('splitRelCsvByLabelPair', () => {
       mockFactory(streams, { blocked: true }),
     );
 
-    // Wait for readline to process and create streams
-    await new Promise((r) => setTimeout(r, 50));
+    // The first pair stream is created immediately and blocks on its header
+    // write. Unblock it once so the loop advances and creates the second
+    // pair stream (also blocked). Now both streams exist — trigger the error.
+    await new Promise((r) => setTimeout(r, 20));
+    expect(streams.length).toBe(1);
+    streams[0].unblock();
+    await new Promise((r) => setTimeout(r, 20));
     expect(streams.length).toBeGreaterThanOrEqual(2);
     streams[0].triggerError(new Error('EMFILE'));
 
