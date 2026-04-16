@@ -25,6 +25,8 @@ import { createFieldExtractor } from '../field-extractors/generic.js';
 import { swiftConfig as swiftFieldConfig } from '../field-extractors/configs/swift.js';
 import { createMethodExtractor } from '../method-extractors/generic.js';
 import { swiftMethodConfig } from '../method-extractors/configs/swift.js';
+import { createCallExtractor } from '../call-extractors/generic.js';
+import { swiftCallConfig } from '../call-extractors/configs/swift.js';
 
 /**
  * Group Swift files by SPM target for implicit module visibility.
@@ -241,6 +243,7 @@ export const swiftProvider = defineLanguage({
   importResolver: resolveSwiftImport,
   importSemantics: 'wildcard-leaf',
   heritageDefaultEdge: 'IMPLEMENTS',
+  callExtractor: createCallExtractor(swiftCallConfig),
   fieldExtractor: createFieldExtractor(swiftFieldConfig),
   methodExtractor: createMethodExtractor({
     ...swiftMethodConfig,
