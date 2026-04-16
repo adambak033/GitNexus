@@ -68,6 +68,7 @@ import type { NamedBinding } from '../named-bindings/types.js';
 import type { NodeLabel } from 'gitnexus-shared';
 import type { FieldInfo, FieldExtractorContext } from '../field-types.js';
 import type { MethodInfo, MethodExtractorContext } from '../method-types.js';
+import type { VariableExtractorContext } from '../variable-types.js';
 import {
   buildMethodProps,
   arityForIdFromInfo,
@@ -1462,6 +1463,11 @@ const processFileGroup = (
     // Per-file map: decorator end-line → decorator info, for associating with definitions
     const fileDecorators = new Map<number, { name: string; arg?: string; isTool?: boolean }>();
 
+    // Track start indices of definition nodes already processed by higher-priority captures
+    // (e.g. @definition.function) to avoid duplicate nodes when @definition.const/@definition.variable
+    // patterns overlap with the same source range.
+    const processedDefinitionNodes = new Set<number>();
+
     for (const match of matches) {
       const captureMap: Record<string, SyntaxNode> = {};
       for (const c of match.captures) {
@@ -1929,6 +1935,21 @@ const processFileGroup = (
             })
           : null;
       const nodeLabel = extractedClassSymbol?.type ?? defaultNodeLabel;
+
+      // Dedup: variable captures (Const/Static/Variable) may overlap with higher-priority
+      // captures (e.g. `const fn = () => {}` matches both @definition.function and @definition.const).
+      // Skip variable captures whose definition node was already processed.
+      if (
+        (nodeLabel === 'Const' || nodeLabel === 'Static' || nodeLabel === 'Variable') &&
+        definitionNode &&
+        processedDefinitionNodes.has(definitionNode.startIndex)
+      ) {
+        continue;
+      }
+      if (definitionNode) {
+        processedDefinitionNodes.add(definitionNode.startIndex);
+      }
+
       // Synthesize name for constructors without explicit @name capture (e.g. Swift init)
       if (!nameNode && nodeLabel !== 'Constructor' && !extractedClassSymbol) continue;
       const nodeName = extractedClassSymbol?.name ?? (nameNode ? nameNode.text : 'init');
@@ -2108,6 +2129,27 @@ const processFileGroup = (
               methodProps.isReadonly = info.isReadonly;
             }
           }
+        }
+      }
+
+      // Variable/Const/Static metadata extraction via VariableExtractor
+      if (
+        (nodeLabel === 'Const' || nodeLabel === 'Static' || nodeLabel === 'Variable') &&
+        definitionNode &&
+        provider.variableExtractor
+      ) {
+        const varCtx: VariableExtractorContext = {
+          filePath: file.path,
+          language,
+        };
+        const varInfo = provider.variableExtractor.extract(definitionNode, varCtx);
+        if (varInfo) {
+          if (varInfo.type) declaredType = varInfo.type;
+          methodProps.visibility = varInfo.visibility;
+          methodProps.isStatic = varInfo.isStatic;
+          methodProps.isConst = varInfo.isConst;
+          methodProps.isMutable = varInfo.isMutable;
+          methodProps.scope = varInfo.scope;
         }
       }
 

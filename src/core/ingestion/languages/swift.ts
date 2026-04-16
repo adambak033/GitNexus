@@ -25,6 +25,8 @@ import { createFieldExtractor } from '../field-extractors/generic.js';
 import { swiftConfig as swiftFieldConfig } from '../field-extractors/configs/swift.js';
 import { createMethodExtractor } from '../method-extractors/generic.js';
 import { swiftMethodConfig } from '../method-extractors/configs/swift.js';
+import { createVariableExtractor } from '../variable-extractors/generic.js';
+import { swiftVariableConfig } from '../variable-extractors/configs/swift.js';
 import { createCallExtractor } from '../call-extractors/generic.js';
 import { swiftCallConfig } from '../call-extractors/configs/swift.js';
 
@@ -249,6 +251,7 @@ export const swiftProvider = defineLanguage({
     ...swiftMethodConfig,
     extractFunctionName: swiftExtractFunctionName,
   }),
+  variableExtractor: createVariableExtractor(swiftVariableConfig),
   classExtractor: createClassExtractor(swiftClassConfig),
   implicitImportWirer: wireSwiftImplicitImports,
   builtInNames: BUILT_INS,

@@ -25,6 +25,8 @@ import { createFieldExtractor } from '../field-extractors/generic.js';
 import { rustConfig as rustFieldConfig } from '../field-extractors/configs/rust.js';
 import { createMethodExtractor } from '../method-extractors/generic.js';
 import { rustMethodConfig } from '../method-extractors/configs/rust.js';
+import { createVariableExtractor } from '../variable-extractors/generic.js';
+import { rustVariableConfig } from '../variable-extractors/configs/rust.js';
 import { createCallExtractor } from '../call-extractors/generic.js';
 import { rustCallConfig } from '../call-extractors/configs/rust.js';
 
@@ -129,6 +131,7 @@ export const rustProvider = defineLanguage({
     ...rustMethodConfig,
     extractFunctionName: rustExtractFunctionName,
   }),
+  variableExtractor: createVariableExtractor(rustVariableConfig),
   classExtractor: createClassExtractor(rustClassConfig),
   builtInNames: BUILT_INS,
 });

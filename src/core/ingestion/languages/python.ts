@@ -23,6 +23,8 @@ import { createFieldExtractor } from '../field-extractors/generic.js';
 import { pythonConfig as pythonFieldConfig } from '../field-extractors/configs/python.js';
 import { createMethodExtractor } from '../method-extractors/generic.js';
 import { pythonMethodConfig } from '../method-extractors/configs/python.js';
+import { createVariableExtractor } from '../variable-extractors/generic.js';
+import { pythonVariableConfig } from '../variable-extractors/configs/python.js';
 import { createCallExtractor } from '../call-extractors/generic.js';
 import { pythonCallConfig } from '../call-extractors/configs/python.js';
 
@@ -69,6 +71,7 @@ export const pythonProvider = defineLanguage({
   callExtractor: createCallExtractor(pythonCallConfig),
   fieldExtractor: createFieldExtractor(pythonFieldConfig),
   methodExtractor: createMethodExtractor(pythonMethodConfig),
+  variableExtractor: createVariableExtractor(pythonVariableConfig),
   classExtractor: createClassExtractor(pythonClassConfig),
   builtInNames: BUILT_INS,
 });

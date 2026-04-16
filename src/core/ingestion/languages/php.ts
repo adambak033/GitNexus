@@ -21,6 +21,8 @@ import { createFieldExtractor } from '../field-extractors/generic.js';
 import { phpConfig as phpFieldConfig } from '../field-extractors/configs/php.js';
 import { createMethodExtractor } from '../method-extractors/generic.js';
 import { phpMethodConfig } from '../method-extractors/configs/php.js';
+import { createVariableExtractor } from '../variable-extractors/generic.js';
+import { phpVariableConfig } from '../variable-extractors/configs/php.js';
 import { createCallExtractor } from '../call-extractors/generic.js';
 import { phpCallConfig } from '../call-extractors/configs/php.js';
 
@@ -243,6 +245,7 @@ export const phpProvider = defineLanguage({
   callExtractor: createCallExtractor(phpCallConfig),
   fieldExtractor: createFieldExtractor(phpFieldConfig),
   methodExtractor: createMethodExtractor(phpMethodConfig),
+  variableExtractor: createVariableExtractor(phpVariableConfig),
   classExtractor: createClassExtractor(phpClassConfig),
   descriptionExtractor: phpDescriptionExtractor,
   isRouteFile: isPhpRouteFile,

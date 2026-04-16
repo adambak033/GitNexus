@@ -21,6 +21,8 @@ import { createFieldExtractor } from '../field-extractors/generic.js';
 import { csharpConfig as csharpFieldConfig } from '../field-extractors/configs/csharp.js';
 import { createMethodExtractor } from '../method-extractors/generic.js';
 import { csharpMethodConfig } from '../method-extractors/configs/csharp.js';
+import { createVariableExtractor } from '../variable-extractors/generic.js';
+import { csharpVariableConfig } from '../variable-extractors/configs/csharp.js';
 
 const BUILT_INS: ReadonlySet<string> = new Set([
   'Console',
@@ -130,6 +132,7 @@ export const csharpProvider = defineLanguage({
   callExtractor: createCallExtractor(csharpCallConfig),
   fieldExtractor: createFieldExtractor(csharpFieldConfig),
   methodExtractor: createMethodExtractor(csharpMethodConfig),
+  variableExtractor: createVariableExtractor(csharpVariableConfig),
   classExtractor: createClassExtractor(csharpClassConfig),
   builtInNames: BUILT_INS,
 });

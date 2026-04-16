@@ -22,6 +22,8 @@ import { createFieldExtractor } from '../field-extractors/generic.js';
 import { rubyConfig as rubyFieldConfig } from '../field-extractors/configs/ruby.js';
 import { createMethodExtractor } from '../method-extractors/generic.js';
 import { rubyMethodConfig } from '../method-extractors/configs/ruby.js';
+import { createVariableExtractor } from '../variable-extractors/generic.js';
+import { rubyVariableConfig } from '../variable-extractors/configs/ruby.js';
 import { createCallExtractor } from '../call-extractors/generic.js';
 import { rubyCallConfig } from '../call-extractors/configs/ruby.js';
 
@@ -132,6 +134,7 @@ export const rubyProvider = defineLanguage({
     ...rubyMethodConfig,
     extractFunctionName: rubyExtractFunctionName,
   }),
+  variableExtractor: createVariableExtractor(rubyVariableConfig),
   classExtractor: createClassExtractor(rubyClassConfig),
   builtInNames: BUILT_INS,
 });

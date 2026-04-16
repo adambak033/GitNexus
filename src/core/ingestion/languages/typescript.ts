@@ -29,6 +29,11 @@ import {
   typescriptMethodConfig,
   javascriptMethodConfig,
 } from '../method-extractors/configs/typescript-javascript.js';
+import { createVariableExtractor } from '../variable-extractors/generic.js';
+import {
+  typescriptVariableConfig,
+  javascriptVariableConfig,
+} from '../variable-extractors/configs/typescript-javascript.js';
 import { createCallExtractor } from '../call-extractors/generic.js';
 import {
   typescriptCallConfig,
@@ -171,6 +176,7 @@ export const typescriptProvider = defineLanguage({
     ...typescriptMethodConfig,
     extractFunctionName: tsExtractFunctionName,
   }),
+  variableExtractor: createVariableExtractor(typescriptVariableConfig),
   classExtractor: createClassExtractor(typescriptClassConfig),
   builtInNames: BUILT_INS,
 });
@@ -189,6 +195,7 @@ export const javascriptProvider = defineLanguage({
     ...javascriptMethodConfig,
     extractFunctionName: tsExtractFunctionName,
   }),
+  variableExtractor: createVariableExtractor(javascriptVariableConfig),
   classExtractor: createClassExtractor(javascriptClassConfig),
   builtInNames: BUILT_INS,
 });
