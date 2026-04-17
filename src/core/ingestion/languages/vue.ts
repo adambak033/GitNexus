@@ -27,6 +27,7 @@ import { createVariableExtractor } from '../variable-extractors/generic.js';
 import { typescriptVariableConfig } from '../variable-extractors/configs/typescript-javascript.js';
 import { createCallExtractor } from '../call-extractors/generic.js';
 import { typescriptCallConfig } from '../call-extractors/configs/typescript-javascript.js';
+import { createHeritageExtractor } from '../heritage-extractors/generic.js';
 
 const VUE_SPECIFIC_BUILT_INS = [
   'ref',
@@ -76,5 +77,6 @@ export const vueProvider = defineLanguage({
   fieldExtractor: typescriptFieldExtractor,
   variableExtractor: createVariableExtractor(typescriptVariableConfig),
   classExtractor: vueClassExtractor,
+  heritageExtractor: createHeritageExtractor(SupportedLanguages.TypeScript),
   builtInNames: VUE_BUILT_INS,
 });

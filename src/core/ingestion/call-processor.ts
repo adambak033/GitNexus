@@ -7,6 +7,32 @@ import type {
   ExtractedHeritage,
 } from './model/index.js';
 import { CLASS_TYPES, CALL_TARGET_TYPES, lookupMethodByOwnerWithMRO } from './model/index.js';
+import type { DispatchDecision, ReceiverEnriched } from './call-types.js';
+
+/** Shorthand for the receiver-source discriminant shared across the DAG. */
+type ReceiverSource = ReceiverEnriched['receiverSource'];
+
+/**
+ * DAG stage 4 fallback: used when `selectDispatch` is absent or returns null.
+ * Preserves pre-DAG dispatch semantics:
+ *   - 'constructor'         → constructor branch
+ *   - 'free'                → free branch (admits Swift/Kotlin class-target fast path)
+ *   - 'member' or undefined → owner-scoped branch
+ *
+ * `undefined` callForm MUST route through owner-scoped (not free) so bare
+ * identifiers without a classified shape do NOT trigger `resolveFreeCall`'s
+ * class-target fast path. Without a `receiverTypeName`, the owner-scoped
+ * branch falls through to `resolveModuleAliasedCall` + `singleCandidate`,
+ * matching legacy behavior where non-callable symbols (Class, Interface)
+ * null-route instead of producing spurious Constructor edges.
+ */
+const defaultDispatchDecision = (
+  callForm: 'free' | 'member' | 'constructor' | undefined,
+): DispatchDecision => {
+  if (callForm === 'constructor') return { primary: 'constructor' };
+  if (callForm === 'free') return { primary: 'free' };
+  return { primary: 'owner-scoped' };
+};
 import Parser from 'tree-sitter';
 import type { ResolutionContext } from './model/resolution-context.js';
 import { TIER_CONFIDENCE, type ResolutionTier } from './model/resolution-context.js';
@@ -766,22 +792,26 @@ export const processCalls = async (
     // Extract heritage from query matches to build parentMap for buildTypeEnv.
     // Heritage-processor runs in PARALLEL, so graph edges don't exist when buildTypeEnv runs.
     const fileParentMap = new Map<string, string[]>();
-    for (const match of matches) {
-      const captureMap: Record<string, any> = {};
-      match.captures.forEach((c) => (captureMap[c.name] = c.node));
-      if (captureMap['heritage.class'] && captureMap['heritage.extends']) {
-        const className: string = captureMap['heritage.class'].text;
-        const parentName: string = captureMap['heritage.extends'].text;
-        const extendsNode = captureMap['heritage.extends'];
-        const fieldDecl = extendsNode.parent;
-        if (fieldDecl?.type === 'field_declaration' && fieldDecl.childForFieldName('name'))
-          continue;
-        let parents = fileParentMap.get(className);
-        if (!parents) {
-          parents = [];
-          fileParentMap.set(className, parents);
+    if (provider.heritageExtractor) {
+      for (const match of matches) {
+        const captureMap: Record<string, any> = {};
+        match.captures.forEach((c) => (captureMap[c.name] = c.node));
+        if (captureMap['heritage.class']) {
+          const heritageItems = provider.heritageExtractor.extract(captureMap, {
+            filePath: file.path,
+            language,
+          });
+          for (const item of heritageItems) {
+            if (item.kind === 'extends') {
+              let parents = fileParentMap.get(item.className);
+              if (!parents) {
+                parents = [];
+                fileParentMap.set(item.className, parents);
+              }
+              if (!parents.includes(item.parentName)) parents.push(item.parentName);
+            }
+          }
         }
-        if (!parents.includes(parentName)) parents.push(parentName);
       }
     }
     const parentMap: ReadonlyMap<string, readonly string[]> = fileParentMap;
@@ -991,22 +1021,33 @@ export const processCalls = async (
 
       const calledName = nameNode.text;
 
+      // Check heritage extractor for call-based heritage (e.g., Ruby include/extend/prepend)
+      if (provider.heritageExtractor?.extractFromCall) {
+        const heritageItems = provider.heritageExtractor.extractFromCall(
+          calledName,
+          captureMap['call'],
+          { filePath: file.path, language },
+        );
+        if (heritageItems !== null) {
+          for (const item of heritageItems) {
+            collectedHeritage.push({
+              filePath: file.path,
+              className: item.className,
+              parentName: item.parentName,
+              kind: item.kind,
+            });
+          }
+          return;
+        }
+      }
+
+      // Dispatch: route language-specific calls (properties, imports)
+      // Heritage routing is handled by heritageExtractor.extractFromCall above.
       const routed = callRouter?.(calledName, captureMap['call']);
       if (routed) {
         switch (routed.kind) {
           case 'skip':
           case 'import':
-            return;
-
-          case 'heritage':
-            for (const item of routed.items) {
-              collectedHeritage.push({
-                filePath: file.path,
-                className: item.enclosingClass,
-                parentName: item.mixinName,
-                kind: item.heritageKind,
-              });
-            }
             return;
 
           case 'properties': {
@@ -1061,10 +1102,17 @@ export const processCalls = async (
 
       if (provider.isBuiltInName(calledName)) return;
 
-      const callForm = inferCallForm(callNode, nameNode);
-      const receiverName = callForm === 'member' ? extractReceiverName(nameNode) : undefined;
+      // --- DAG stage 2-3: classify-form + infer-receiver (shared defaults) ---
+      // These stages run the shared inference chain. Language providers can
+      // customize infer-receiver (stage 3) via the inferImplicitReceiver hook
+      // which runs AFTER this default chain (typed-binding → constructor-map →
+      // module-alias → class-as-receiver → mixed-chain), and selectDispatch
+      // (stage 4) which picks the resolver branch.
+      let callForm = inferCallForm(callNode, nameNode);
+      let receiverName = callForm === 'member' ? extractReceiverName(nameNode) : undefined;
       let receiverTypeName =
         receiverName && typeEnv ? typeEnv.lookup(receiverName, callNode) : undefined;
+      let receiverSource: ReceiverSource = receiverTypeName ? 'typed-binding' : 'none';
       // Phase P: virtual dispatch override — when the declared type is a base class but
       // the constructor created a known subclass, prefer the more specific type.
       // Checks per-file parentMap first, then falls back to globalParentMap for
@@ -1103,6 +1151,7 @@ export const processCalls = async (
               ctx.model.types.lookupClassByName(receiverTypeName).length > 0)
           ) {
             receiverTypeName = ctorType;
+            receiverSource = 'constructor-map';
           }
         }
       }
@@ -1111,10 +1160,14 @@ export const processCalls = async (
         const enclosingFunc = findEnclosingFunction(callNode, file.path, ctx, provider);
         const funcName = enclosingFunc ? extractFuncNameFromSourceId(enclosingFunc) : '';
         receiverTypeName = lookupReceiverType(receiverIndex, funcName, receiverName);
+        if (receiverTypeName) receiverSource = 'constructor-map';
       }
-      // Fall back to class-as-receiver for static method calls (e.g. UserService.find_user()).
-      // When the receiver name is not a variable in TypeEnv but resolves to a Class/Struct/Interface
-      // through the standard tiered resolution, use it directly as the receiver type.
+      // Fall back to class-as-receiver for static method calls (e.g. UserService.find_user(),
+      // Greetable.format()). When the receiver name is not a variable in TypeEnv but
+      // resolves to a class-like symbol (Class / Interface / Struct / Enum / Trait) via
+      // tiered resolution, use it directly as the receiver type. `Trait` is included so
+      // Ruby module class-method calls flow through the class-as-receiver path and reach
+      // the `selectDispatch` hook's singleton branch.
       if (!receiverTypeName && receiverName && callForm === 'member') {
         const typeResolved = ctx.resolve(receiverName, file.path);
         if (
@@ -1124,10 +1177,12 @@ export const processCalls = async (
               d.type === 'Class' ||
               d.type === 'Interface' ||
               d.type === 'Struct' ||
-              d.type === 'Enum',
+              d.type === 'Enum' ||
+              d.type === 'Trait',
           )
         ) {
           receiverTypeName = receiverName;
+          receiverSource = 'class-as-receiver';
         }
       }
       // Hoist sourceId so it's available for ACCESSES edge emission during chain walk.
@@ -1173,10 +1228,50 @@ export const processCalls = async (
                 makeAccessEmitter(graph, sourceId),
                 heritageMap,
               );
+              if (receiverTypeName) receiverSource = 'mixed-chain';
             }
           }
         }
       }
+
+      // --- DAG stage 3: infer-receiver (provider hook) ---
+      // Synthesize implicit receivers for languages that omit them (e.g., Ruby bare-call).
+      // This hook runs AFTER the shared inference chain so explicit receivers /
+      // typed bindings always take precedence. Output (if non-null) overlays onto
+      // the ReceiverEnriched for the next stage.
+      let dispatchHint: string | undefined;
+      if (provider.inferImplicitReceiver) {
+        const override = provider.inferImplicitReceiver({
+          calledName,
+          callForm,
+          receiverName,
+          receiverTypeName,
+          callNode,
+          filePath: file.path,
+        });
+        if (override) {
+          callForm = override.callForm;
+          receiverName = override.receiverName;
+          receiverTypeName = override.receiverTypeName;
+          receiverSource = override.receiverSource;
+          dispatchHint = override.hint;
+        }
+      }
+
+      // --- DAG stage 4: select-dispatch (provider hook + default fallback) ---
+      // Decide which resolver path to try first (primary) and fallback strategy.
+      // Language providers can customize dispatch via selectDispatch hook; all
+      // others use the shared defaultDispatchDecision. Always non-null after this
+      // block so downstream resolvers are table-driven.
+      const dispatchDecision: DispatchDecision =
+        provider.selectDispatch?.({
+          calledName,
+          callForm,
+          receiverName,
+          receiverTypeName,
+          receiverSource,
+          hint: dispatchHint,
+        }) ?? defaultDispatchDecision(callForm);
 
       // Build overload hints for languages with inferLiteralType (Java/Kotlin/C#/C++).
       // Only used when multiple candidates survive arity filtering — ~1-3% of calls.
@@ -1199,6 +1294,7 @@ export const processCalls = async (
         widenCache,
         undefined,
         heritageMap,
+        dispatchDecision,
       );
 
       if (!resolved) return;
@@ -1737,11 +1833,20 @@ const resolveCallTarget = (
   widenCache?: WidenCache,
   preComputedArgTypes?: (string | undefined)[],
   heritageMap?: HeritageMap,
+  dispatchDecision?: DispatchDecision,
 ): ResolveResult | null => {
   const tiered = ctx.resolve(call.calledName, currentFile);
   if (!tiered) return null;
 
-  if (call.callForm === 'free') {
+  // DAG dispatch: use decision.primary to pick the resolver branch.
+  // Callers that own the DAG (processCalls + crossFile deferred paths)
+  // pass a decision; other callers use the shared default ladder.
+  // Language-specific primary / fallback / ancestryView overrides come from
+  // the provider's `selectDispatch` hook.
+  const decision = dispatchDecision ?? defaultDispatchDecision(call.callForm);
+  const primary = decision.primary;
+
+  if (primary === 'free') {
     return resolveFreeCall(
       call.calledName,
       currentFile,
@@ -1752,7 +1857,7 @@ const resolveCallTarget = (
       preComputedArgTypes,
     );
   }
-  if (call.callForm === 'constructor') {
+  if (primary === 'constructor') {
     return (
       resolveStaticCall(
         call.calledName,
@@ -1765,6 +1870,7 @@ const resolveCallTarget = (
       ) ?? singleCandidate(tiered, call.argCount, 'constructor')
     );
   }
+  // primary === 'owner-scoped'
   if (call.receiverTypeName) {
     // Skip the owner-scoped MRO path when the tiered pool has genuine
     // overload ambiguity that needs D1-D4+E handling, not D0.
@@ -1772,6 +1878,15 @@ const resolveCallTarget = (
       (!!overloadHints || !!preComputedArgTypes) &&
       countCallableCandidates(tiered.candidates, call.argCount, call.callForm) > 1;
     // Try owner-scoped (resolveMemberCall) then file-scoped (resolveMemberCallByFile).
+    // DAG: dispatchDecision.ancestryView selects instance vs singleton ancestry
+    // for kind-aware MRO strategies. Ruby `Account.log` flows via 'singleton'.
+    //
+    // Singleton-ancestry miss MUST NOT degrade to the file-scoped fallback:
+    // resolveMemberCallByFile matches by ownerId and would happily pick an
+    // instance method defined on the same class, leaking instance dispatch
+    // onto what was declared a class-method call. For singleton dispatch,
+    // a miss either null-routes or falls through to `decision.fallback`.
+    const singletonDispatch = decision.ancestryView === 'singleton';
     const memberResult =
       (!skipMember
         ? resolveMemberCall(
@@ -1781,18 +1896,21 @@ const resolveCallTarget = (
             ctx,
             heritageMap,
             call.argCount,
+            decision.ancestryView,
           )
         : null) ??
-      resolveMemberCallByFile(
-        call.calledName,
-        call.receiverTypeName,
-        currentFile,
-        ctx,
-        call.argCount,
-        call.callForm,
-        overloadHints,
-        preComputedArgTypes,
-      );
+      (singletonDispatch
+        ? null
+        : resolveMemberCallByFile(
+            call.calledName,
+            call.receiverTypeName,
+            currentFile,
+            ctx,
+            call.argCount,
+            call.callForm,
+            overloadHints,
+            preComputedArgTypes,
+          ));
     if (memberResult) return memberResult;
 
     // Module-alias narrowing runs as a FALLBACK, after owner/file-scoped
@@ -1828,7 +1946,26 @@ const resolveCallTarget = (
     // hierarchy. When the type is NOT in the index (PHP `mixed`, dynamic
     // types, unresolvable aliases), the scoped resolvers had nothing to
     // work with and singleCandidate is the correct last resort.
+    //
+    // DAG fallback override: when `select-dispatch` returned
+    // `fallback: 'free-arity-narrowed'` (today: Ruby implicit-self bare
+    // calls whose enclosing class doesn't define the method), fall through
+    // to free-call resolution instead of null-routing. This preserves
+    // existing free-call arity-narrowing heuristics for bare calls that
+    // happen to target methods on unrelated classes.
     if (typeResolves && typeResolves.candidates.length > 0) {
+      if (decision.fallback === 'free-arity-narrowed') {
+        const free = resolveFreeCall(
+          call.calledName,
+          currentFile,
+          ctx,
+          call.argCount,
+          tiered,
+          overloadHints,
+          preComputedArgTypes,
+        );
+        if (free) return free;
+      }
       return null; // null-route: type resolved, no candidate matched
     }
     return singleCandidate(tiered, call.argCount, call.callForm);
@@ -2024,6 +2161,13 @@ const resolveMethodByOwner = (
   ctx: ResolutionContext,
   heritageMap?: HeritageMap,
   argCount?: number,
+  /**
+   * DAG-sourced ancestry selector. `'singleton'` routes through
+   * `heritageMap.getSingletonAncestry(owner)` for class-method dispatch
+   * (Ruby `Account.log` via `extend LoggerMixin`). Default / undefined
+   * uses the walker's instance-dispatch behavior.
+   */
+  ancestryView?: 'instance' | 'singleton',
 ): { def: SymbolDefinition; tier: ResolutionTier } | undefined => {
   const typeResolved = ctx.resolve(receiverTypeName, filePath);
   if (!typeResolved) return undefined;
@@ -2052,6 +2196,14 @@ const resolveMethodByOwner = (
   let ambiguous = false;
   for (const candidate of typeResolved.candidates) {
     if (!CLASS_LIKE_TYPES.has(candidate.type)) continue;
+    // Singleton dispatch: when the DAG decision requested the singleton
+    // ancestry view, pass `heritageMap.getSingletonAncestry` as the walker's
+    // ancestry override. Kind-aware strategies (e.g. MroStrategy 'ruby-mixin')
+    // honor the override by scanning it linearly in place of their default walk.
+    const singletonOverride =
+      ancestryView === 'singleton' && canWalkMRO && heritageMap
+        ? heritageMap.getSingletonAncestry(candidate.nodeId).map((e) => e.parentId)
+        : undefined;
     const def = canWalkMRO
       ? lookupMethodByOwnerWithMRO(
           candidate.nodeId,
@@ -2060,6 +2212,7 @@ const resolveMethodByOwner = (
           ctx.model,
           mroStrategy,
           argCount,
+          singletonOverride,
         )
       : ctx.model.methods.lookupMethodByOwner(candidate.nodeId, methodName, argCount);
     if (!def) continue;
@@ -2114,6 +2267,7 @@ export const resolveMemberCall = (
   ctx: ResolutionContext,
   heritageMap?: HeritageMap,
   argCount?: number,
+  ancestryView?: 'instance' | 'singleton',
 ): ResolveResult | null => {
   const resolved = resolveMethodByOwner(
     ownerType,
@@ -2122,6 +2276,7 @@ export const resolveMemberCall = (
     ctx,
     heritageMap,
     argCount,
+    ancestryView,
   );
   if (!resolved) return null;
   return toResolveResult(resolved.def, resolved.tier);

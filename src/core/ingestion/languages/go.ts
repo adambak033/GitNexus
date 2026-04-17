@@ -26,6 +26,8 @@ import { createVariableExtractor } from '../variable-extractors/generic.js';
 import { goVariableConfig } from '../variable-extractors/configs/go.js';
 import { createCallExtractor } from '../call-extractors/generic.js';
 import { goCallConfig } from '../call-extractors/configs/go.js';
+import { createHeritageExtractor } from '../heritage-extractors/generic.js';
+import { goHeritageConfig } from '../heritage-extractors/configs/go.js';
 
 export const goProvider = defineLanguage({
   id: SupportedLanguages.Go,
@@ -40,4 +42,5 @@ export const goProvider = defineLanguage({
   methodExtractor: createMethodExtractor(goMethodConfig),
   variableExtractor: createVariableExtractor(goVariableConfig),
   classExtractor: createClassExtractor(goClassConfig),
+  heritageExtractor: createHeritageExtractor(goHeritageConfig),
 });

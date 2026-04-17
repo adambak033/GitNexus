@@ -12,10 +12,16 @@
 import type { SupportedLanguages, MroStrategy } from 'gitnexus-shared';
 import type { LanguageTypeConfig } from './type-extractors/types.js';
 import type { CallRouter } from './call-routing.js';
-import type { CallExtractor } from './call-types.js';
+import type {
+  CallExtractor,
+  DispatchDecision,
+  ImplicitReceiverOverride,
+  ReceiverEnriched,
+} from './call-types.js';
 import type { ClassExtractor } from './class-types.js';
 import type { ExportChecker } from './export-detection.js';
 import type { FieldExtractor } from './field-extractor.js';
+import type { HeritageExtractor } from './heritage-types.js';
 import type { MethodExtractor } from './method-types.js';
 import type { VariableExtractor } from './variable-types.js';
 import type { ImportResolverFn } from './import-resolvers/types.js';
@@ -179,6 +185,13 @@ interface LanguageProviderConfig {
    *  Uses the same provider-driven strategy pattern as method/field extraction so
    *  namespace/package/module rules stay language-specific. */
   readonly classExtractor?: ClassExtractor;
+  /** Heritage extractor for extracting extends/implements/trait-impl relationships
+   *  from tree-sitter @heritage.* captures and call-based heritage (e.g., Ruby
+   *  include/extend/prepend). Produced by createHeritageExtractor() — pass a
+   *  SupportedLanguages value for default behaviour or a full
+   *  HeritageExtractionConfig for languages with custom hooks (Go, Ruby).
+   *  All tree-sitter providers MUST supply this. */
+  readonly heritageExtractor?: HeritageExtractor;
   /** Extract a semantic description for a definition node (e.g., PHP Eloquent
    *  property arrays, relation method descriptions).
    *  Default: undefined (no description extraction). */
@@ -191,6 +204,69 @@ interface LanguageProviderConfig {
    *  When true, the worker extracts routes via the language's route extraction logic.
    *  Default: undefined (no route files). */
   readonly isRouteFile?: (filePath: string) => boolean;
+
+  // ── Call-resolution DAG hooks ─────────────────────────────────────
+  /**
+   * DAG stage 3 hook: synthesize an implicit receiver when the call site omits one.
+   *
+   * Runs after shared inference (TypeEnv → constructor-map → class-as-receiver →
+   * mixed-chain). Return an `ImplicitReceiverOverride` to overlay all fields onto
+   * `ReceiverEnriched`; return null to keep current state and proceed to stage 4.
+   *
+   * Constraints: MUST return null when an explicit receiver is already set, at
+   * top-level scope, or for built-in methods. Do not mutate input params.
+   * `hint` is opaque to shared stages; consumed by this language's `selectDispatch`.
+   *
+   * Ruby example: bare `serialize` in `Account#call_serialize` →
+   * `{ callForm: 'member', receiverName: 'self', receiverTypeName: 'Account',
+   *    receiverSource: 'implicit-self', hint: 'instance' }`
+   *
+   * @see call-types.ts § ImplicitReceiverOverride
+   * @see selectDispatch (stage 4, reads the hint)
+   *
+   * Default: undefined (no implicit-receiver inference).
+   */
+  readonly inferImplicitReceiver?: (params: {
+    readonly calledName: string;
+    readonly callForm: 'free' | 'member' | 'constructor' | undefined;
+    readonly receiverName: string | undefined;
+    readonly receiverTypeName: string | undefined;
+    readonly callNode: SyntaxNode;
+    readonly filePath: string;
+  }) => ImplicitReceiverOverride | null;
+
+  /**
+   * DAG stage 4 hook: decide dispatch strategy (primary path, fallback, MRO view).
+   *
+   * Runs after stage 3. Return a `DispatchDecision` to override shared defaults;
+   * return null to use `defaultDispatchDecision` (constructor→`'constructor'`,
+   * member→`'owner-scoped'`, free→`'free'`). Most languages return null.
+   *
+   * The hook is responsible for its own gating. `ancestryView` only affects
+   * `'ruby-mixin'` strategy. Singleton-ancestry miss NEVER falls through to
+   * file-scoped fallback in stage 5 (enforced in resolveCallTarget).
+   *
+   * Ruby examples:
+   * - `receiverSource='implicit-self', hint='instance'` →
+   *   `{primary: 'owner-scoped', fallback: 'free-arity-narrowed', ancestryView: 'instance'}`
+   * - `receiverSource='class-as-receiver'` →
+   *   `{primary: 'owner-scoped', ancestryView: 'singleton'}` (miss null-routes)
+   * - `receiverSource='implicit-self', hint='singleton'` →
+   *   `{primary: 'owner-scoped', fallback: 'free-arity-narrowed', ancestryView: 'singleton'}`
+   *
+   * @see call-types.ts § DispatchDecision
+   * @see call-processor.ts § defaultDispatchDecision, resolveCallTarget
+   *
+   * Default: undefined (use `defaultDispatchDecision`).
+   */
+  readonly selectDispatch?: (params: {
+    readonly calledName: string;
+    readonly callForm: 'free' | 'member' | 'constructor' | undefined;
+    readonly receiverName: string | undefined;
+    readonly receiverTypeName: string | undefined;
+    readonly receiverSource: ReceiverEnriched['receiverSource'];
+    readonly hint: string | undefined;
+  }) => DispatchDecision | null;
 
   // ── Noise filtering ────────────────────────────────────────────────
   /** Built-in/stdlib names that should be filtered from the call graph for this language.

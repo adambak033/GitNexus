@@ -25,6 +25,7 @@ import { createMethodExtractor } from '../method-extractors/generic.js';
 import { javaMethodConfig } from '../method-extractors/configs/jvm.js';
 import { createVariableExtractor } from '../variable-extractors/generic.js';
 import { javaVariableConfig } from '../variable-extractors/configs/jvm.js';
+import { createHeritageExtractor } from '../heritage-extractors/generic.js';
 
 export const javaProvider = defineLanguage({
   id: SupportedLanguages.Java,
@@ -41,4 +42,5 @@ export const javaProvider = defineLanguage({
   methodExtractor: createMethodExtractor(javaMethodConfig),
   variableExtractor: createVariableExtractor(javaVariableConfig),
   classExtractor: createClassExtractor(javaClassConfig),
+  heritageExtractor: createHeritageExtractor(SupportedLanguages.Java),
 });
