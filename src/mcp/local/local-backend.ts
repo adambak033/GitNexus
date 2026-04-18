@@ -1080,8 +1080,295 @@ export class LocalBackend {
   }
 
   /**
+   * Patch the `type` field on candidates whose `labels(n)[0]` projection
+   * came back empty — a known LadybugDB behaviour for several node types.
+   *
+   * Uses one scoped UNION query across the five priority labels rather
+   * than per-candidate round-trips, so cost is a single DB call regardless
+   * of how many candidates need enrichment. No-op when every candidate
+   * already has a non-empty type.
+   *
+   * Failures are swallowed: label enrichment is an optimisation for
+   * downstream scoring and #480 Class/Interface BFS seeding; if it fails
+   * the symbol still resolves, just without the kind-priority bonus.
+   */
+  private async enrichCandidateLabels(
+    repo: RepoHandle,
+    candidates: Array<{ id: string; type: string }>,
+  ): Promise<void> {
+    const ids = candidates.filter((c) => c.type === '' && c.id).map((c) => c.id);
+    if (ids.length === 0) return;
+    try {
+      const rows = await executeParameterized(
+        repo.id,
+        `
+        MATCH (n:\`Class\`) WHERE n.id IN $ids RETURN n.id AS id, 'Class' AS label
+        UNION ALL
+        MATCH (n:\`Interface\`) WHERE n.id IN $ids RETURN n.id AS id, 'Interface' AS label
+        UNION ALL
+        MATCH (n:\`Function\`) WHERE n.id IN $ids RETURN n.id AS id, 'Function' AS label
+        UNION ALL
+        MATCH (n:\`Method\`) WHERE n.id IN $ids RETURN n.id AS id, 'Method' AS label
+        UNION ALL
+        MATCH (n:\`Constructor\`) WHERE n.id IN $ids RETURN n.id AS id, 'Constructor' AS label
+        `,
+        { ids },
+      );
+      const labelById = new Map<string, string>();
+      for (const r of rows as any[]) {
+        const id = (r.id ?? r[0]) as string;
+        const label = (r.label ?? r[1]) as string;
+        if (id && label && !labelById.has(id)) labelById.set(id, label);
+      }
+      for (const c of candidates) {
+        if (c.type === '' && labelById.has(c.id)) c.type = labelById.get(c.id) as string;
+      }
+    } catch {
+      /* best-effort — downstream resolvers still work without the label */
+    }
+  }
+
+  /**
+   * Score a symbol candidate for disambiguation ranking.
+   *
+   * Deterministic, no DB round-trip:
+   *   - base 0.50
+   *   - +0.40 when file_path hint matches (substring, case-insensitive)
+   *   - +0.20 when kind hint exactly matches the candidate's kind
+   *   - when no kind hint, a small priority bonus (Class > Interface >
+   *     Function > Method > Constructor) to preserve the intuition that
+   *     class-level names are usually what the user wanted.
+   *
+   * Capped at 1.0. Intentionally simple and inspectable — a future v2 can
+   * plug in BM25/embedding signals here without changing the surrounding
+   * resolver shape.
+   */
+  private scoreCandidate(
+    c: { kind: string; filePath: string },
+    hints: { file_path?: string; kind?: string },
+  ): number {
+    let s = 0.5;
+    if (hints.file_path && c.filePath && typeof c.filePath === 'string') {
+      if (c.filePath.toLowerCase().includes(hints.file_path.toLowerCase())) {
+        s += 0.4;
+      }
+    }
+    if (hints.kind && c.kind === hints.kind) {
+      s += 0.2;
+    }
+    if (!hints.kind) {
+      const priority: Record<string, number> = {
+        Class: 5,
+        Interface: 4,
+        Function: 3,
+        Method: 2,
+        Constructor: 1,
+      };
+      s += (priority[c.kind] ?? 0) * 0.02;
+    }
+    return Math.min(1.0, s);
+  }
+
+  /**
+   * Shared symbol resolver used by `context` and `impact`.
+   *
+   * Returns one of:
+   *   - `{ kind: 'ok', symbol, resolvedLabel }` — single confident match
+   *     (either direct UID, only one candidate after filtering, Class/
+   *     Constructor collapse, or a top-scoring candidate with a clear gap
+   *     to the runner-up).
+   *   - `{ kind: 'ambiguous', candidates }` — multiple viable matches,
+   *     sorted by score desc. Each candidate carries a relevance score.
+   *   - `{ kind: 'not_found' }` — no matches at all.
+   *
+   * Preserves the #480 Class/Constructor preference: when the only
+   * ambiguity is between a Class and its own Constructor (same name,
+   * same filePath), the Class wins silently.
+   */
+  private async resolveSymbolCandidates(
+    repo: RepoHandle,
+    query: { uid?: string; name?: string; include_content?: boolean },
+    hints: { file_path?: string; kind?: string },
+  ): Promise<
+    | {
+        kind: 'ok';
+        symbol: {
+          id: string;
+          name: string;
+          type: string;
+          filePath: string;
+          startLine: number;
+          endLine: number;
+          content?: string;
+        };
+        resolvedLabel: string;
+      }
+    | {
+        kind: 'ambiguous';
+        candidates: Array<{
+          id: string;
+          name: string;
+          type: string;
+          filePath: string;
+          startLine: number;
+          endLine: number;
+          score: number;
+        }>;
+      }
+    | { kind: 'not_found' }
+  > {
+    const { uid, name, include_content } = query;
+    const selectClause = `n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine${include_content ? ', n.content AS content' : ''}`;
+
+    // Direct UID — zero-ambiguity path.
+    if (uid) {
+      const rows = await executeParameterized(
+        repo.id,
+        `MATCH (n {id: $uid}) RETURN ${selectClause} LIMIT 1`,
+        { uid },
+      );
+      if (rows.length === 0) return { kind: 'not_found' };
+      const r = rows[0] as any;
+      const symbol = {
+        id: (r.id ?? r[0]) as string,
+        name: (r.name ?? r[1]) as string,
+        type: (r.type ?? r[2] ?? '') as string,
+        filePath: (r.filePath ?? r[3]) as string,
+        startLine: (r.startLine ?? r[4]) as number,
+        endLine: (r.endLine ?? r[5]) as number,
+        ...(include_content ? { content: (r.content ?? r[6]) as string | undefined } : {}),
+      };
+      // Same LadybugDB label-enrichment as the name-based path: a UID
+      // pointing at a Class must still surface `type: 'Class'` so impact's
+      // Class/Interface BFS seed fires. No-op when type is already set.
+      await this.enrichCandidateLabels(repo, [symbol]);
+      return { kind: 'ok', symbol, resolvedLabel: symbol.type };
+    }
+
+    if (!name) return { kind: 'not_found' };
+
+    const isQualified = name.includes('/') || name.includes(':');
+    let whereClause: string;
+    const queryParams: Record<string, any> = { symName: name };
+    if (hints.file_path) {
+      whereClause = `WHERE n.name = $symName AND n.filePath CONTAINS $filePath`;
+      queryParams.filePath = hints.file_path;
+    } else if (isQualified) {
+      whereClause = `WHERE n.id = $symName OR n.name = $symName`;
+    } else {
+      whereClause = `WHERE n.name = $symName`;
+    }
+
+    // LIMIT 20 (was 10) — scoring is the point now, so give the ranker
+    // headroom instead of arbitrary truncation.
+    const rows = await executeParameterized(
+      repo.id,
+      `MATCH (n) ${whereClause} RETURN ${selectClause} LIMIT 20`,
+      queryParams,
+    );
+
+    if (rows.length === 0) return { kind: 'not_found' };
+
+    // Normalise row shape across object / tuple returns from LadybugDB.
+    const normalized = rows.map((r: any) => ({
+      id: (r.id ?? r[0]) as string,
+      name: (r.name ?? r[1]) as string,
+      type: (r.type ?? r[2] ?? '') as string,
+      filePath: (r.filePath ?? r[3]) as string,
+      startLine: (r.startLine ?? r[4]) as number,
+      endLine: (r.endLine ?? r[5]) as number,
+      ...(include_content ? { content: (r.content ?? r[6]) as string | undefined } : {}),
+    }));
+
+    // Enrich labels for any candidates where `labels(n)[0]` came back empty.
+    // LadybugDB returns an empty string for that projection on certain node
+    // types (notably Class), which left downstream consumers (impact's
+    // Class/Interface BFS seed, the kind-priority scoring bonus) unable to
+    // distinguish a Class target from "unknown kind". One scoped UNION
+    // across the five priority labels patches the type in-place without
+    // per-candidate round-trips.
+    await this.enrichCandidateLabels(repo, normalized);
+
+    // Preserve #480 Class/Constructor collapse: if we have exactly one
+    // Class (or Interface) candidate and one Constructor sharing name +
+    // filePath, fold into the Class. This used to require a follow-up
+    // label query because LadybugDB sometimes returns an empty labels()[0]
+    // for Class nodes — enrichment above handles the empty-type case, but
+    // the `type === 'Constructor'` gate still correctly triggers when a
+    // Class and its Constructor share the name.
+    if (!hints.kind && normalized.length > 1) {
+      const ambiguousType = normalized.some((s) => s.type === '' || s.type === 'Constructor');
+      if (ambiguousType) {
+        const candidateIds = normalized.map((s) => s.id).filter(Boolean);
+        for (const label of ['Class', 'Interface']) {
+          const labelRows = await executeParameterized(
+            repo.id,
+            `MATCH (n:\`${label}\`) WHERE n.id IN $candidateIds RETURN n.id AS id LIMIT 1`,
+            { candidateIds },
+          ).catch(() => []);
+          if (labelRows.length > 0) {
+            const preferredId = (labelRows[0] as any).id ?? (labelRows[0] as any)[0];
+            const preferred = normalized.find((s) => s.id === preferredId);
+            if (preferred) {
+              return {
+                kind: 'ok',
+                symbol: preferred,
+                resolvedLabel: label,
+              };
+            }
+          }
+        }
+      }
+    }
+
+    if (normalized.length === 1) {
+      return {
+        kind: 'ok',
+        symbol: normalized[0],
+        resolvedLabel: '',
+      };
+    }
+
+    // Score, sort desc, stable tiebreak on shorter filePath then lex uid.
+    const scored = normalized.map((s) => ({
+      ...s,
+      score: this.scoreCandidate({ kind: s.type, filePath: s.filePath || '' }, hints),
+    }));
+    scored.sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      const fpA = (a.filePath || '').length;
+      const fpB = (b.filePath || '').length;
+      if (fpA !== fpB) return fpA - fpB;
+      return String(a.id).localeCompare(String(b.id));
+    });
+
+    // Confident single-result: top score ≥ 0.95 AND beats runner-up by a
+    // clear margin. This lets a very strong file_path/kind hint resolve
+    // cleanly instead of forcing the caller through a disambiguation
+    // round-trip.
+    //
+    // The gap threshold uses `> 0.09` rather than `>= 0.10` on purpose:
+    // IEEE754 addition of the scoring terms (0.50 + 0.40 + 0.20 - 0.90
+    // yields 0.09999999999999998, not exactly 0.10) would otherwise break
+    // the comparison for legitimate "top is 1.00, runner is 0.90" cases.
+    // The intent is a clearly-dominant winner; 0.09 is a large enough
+    // margin to mean that unambiguously.
+    //
+    // The `scored.length >= 2` guard is defensive. The `normalized.length === 1`
+    // early return above already handles the single-candidate path, so in
+    // practice `scored` always has at least two elements by the time we get
+    // here — keeping the guard means changes to the upstream early-return
+    // logic cannot accidentally index out of bounds at `scored[1]`.
+    if (scored.length >= 2 && scored[0].score >= 0.95 && scored[0].score - scored[1].score > 0.09) {
+      return { kind: 'ok', symbol: scored[0], resolvedLabel: scored[0].type };
+    }
+
+    return { kind: 'ambiguous', candidates: scored };
+  }
+
+  /**
    * Context tool — 360-degree symbol view with categorized refs.
-   * Disambiguation when multiple symbols share a name.
+   * Disambiguation (ranked) when multiple symbols share a name.
    * UID-based direct lookup. No cluster in output.
    */
   private async context(
@@ -1090,124 +1377,47 @@ export class LocalBackend {
       name?: string;
       uid?: string;
       file_path?: string;
+      kind?: string;
       include_content?: boolean;
     },
   ): Promise<any> {
     await this.ensureInitialized(repo.id);
 
-    const { name, uid, file_path, include_content } = params;
+    const { name, uid, file_path, kind, include_content } = params;
 
     if (!name && !uid) {
       return { error: 'Either "name" or "uid" parameter is required.' };
     }
 
-    // Step 1: Find the symbol
-    let symbols: any[];
+    const outcome = await this.resolveSymbolCandidates(
+      repo,
+      { uid, name, include_content },
+      { file_path, kind },
+    );
 
-    if (uid) {
-      symbols = await executeParameterized(
-        repo.id,
-        `
-        MATCH (n {id: $uid})
-        RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine${include_content ? ', n.content AS content' : ''}
-        LIMIT 1
-      `,
-        { uid },
-      );
-    } else {
-      const isQualified = name!.includes('/') || name!.includes(':');
-
-      let whereClause: string;
-      let queryParams: Record<string, any>;
-      if (file_path) {
-        whereClause = `WHERE n.name = $symName AND n.filePath CONTAINS $filePath`;
-        queryParams = { symName: name!, filePath: file_path };
-      } else if (isQualified) {
-        whereClause = `WHERE n.id = $symName OR n.name = $symName`;
-        queryParams = { symName: name! };
-      } else {
-        whereClause = `WHERE n.name = $symName`;
-        queryParams = { symName: name! };
-      }
-
-      symbols = await executeParameterized(
-        repo.id,
-        `
-        MATCH (n) ${whereClause}
-        RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine${include_content ? ', n.content AS content' : ''}
-        LIMIT 10
-      `,
-        queryParams,
-      );
-    }
-
-    if (symbols.length === 0) {
+    if (outcome.kind === 'not_found') {
       return { error: `Symbol '${name || uid}' not found` };
     }
 
-    // Step 2: Disambiguation
-    // When multiple nodes share the same name (e.g. a Java Class and its
-    // Constructor both named 'SessionTracker'), prefer the Class node so
-    // context() returns the semantically meaningful result rather than
-    // triggering ambiguous disambiguation (#480).
-    // labels(n)[0] returns empty string in LadybugDB, so we resolve the
-    // preferred node by re-querying with explicit label filters, scoped to
-    // the candidate IDs already in symbols.
-    //
-    // Guard: only attempt Class-preference when at least one candidate has an
-    // empty/unknown type (LadybugDB limitation) or is a Constructor — meaning
-    // the ambiguity may be a Class/Constructor name collision rather than two
-    // genuinely distinct symbols (e.g. two Functions in different files).
-    //
-    // resolvedLabel is set here and threaded to Step 3 to avoid a redundant
-    // classCheck round-trip later.
-    let resolvedLabel = '';
-    if (symbols.length > 1 && !uid) {
-      const hasAmbiguousType = symbols.some((s: any) => {
-        const t = s.type || s[2] || '';
-        return t === '' || t === 'Constructor';
-      });
-      if (hasAmbiguousType) {
-        const candidateIds = symbols.map((s: any) => s.id || s[0]).filter(Boolean);
-        const PREFER_LABELS = ['Class', 'Interface'];
-        let preferred: any = null;
-        for (const label of PREFER_LABELS) {
-          const match = await executeParameterized(
-            repo.id,
-            `
-            MATCH (n:\`${label}\`) WHERE n.id IN $candidateIds RETURN n.id AS id LIMIT 1
-          `,
-            { candidateIds },
-          ).catch(() => []);
-          if (match.length > 0) {
-            preferred = symbols.find((s: any) => (s.id || s[0]) === (match[0].id || match[0][0]));
-            if (preferred) {
-              resolvedLabel = label;
-              break;
-            }
-          }
-        }
-        if (preferred) symbols = [preferred];
-      }
-    }
-
-    if (symbols.length > 1 && !uid) {
+    if (outcome.kind === 'ambiguous') {
       return {
         status: 'ambiguous',
-        message: `Found ${symbols.length} symbols matching '${name}'. Use uid or file_path to disambiguate.`,
-        candidates: symbols.map((s: any) => ({
-          uid: s.id || s[0],
-          name: s.name || s[1],
-          kind: s.type || s[2],
-          filePath: s.filePath || s[3],
-          line: s.startLine || s[4],
+        message: `Found ${outcome.candidates.length} symbols matching '${name}'. Use uid, file_path, or kind to disambiguate.`,
+        candidates: outcome.candidates.map((c) => ({
+          uid: c.id,
+          name: c.name,
+          kind: c.type,
+          filePath: c.filePath,
+          line: c.startLine,
+          score: Number(c.score.toFixed(2)),
         })),
       };
     }
 
     // Step 3: Build full context
-    const sym = symbols[0];
-    const symId = sym.id || sym[0];
+    const sym = outcome.symbol;
+    const resolvedLabel = outcome.resolvedLabel;
+    const symId = sym.id;
 
     // Categorized incoming refs
     const incomingRows = await executeParameterized(
@@ -1901,6 +2111,9 @@ export class LocalBackend {
     repo: RepoHandle,
     params: {
       target: string;
+      target_uid?: string;
+      file_path?: string;
+      kind?: string;
       direction: 'upstream' | 'downstream';
       maxDepth?: number;
       relationTypes?: string[];
@@ -1927,6 +2140,9 @@ export class LocalBackend {
     repo: RepoHandle,
     params: {
       target: string;
+      target_uid?: string;
+      file_path?: string;
+      kind?: string;
       direction: 'upstream' | 'downstream';
       maxDepth?: number;
       relationTypes?: string[];
@@ -1969,65 +2185,57 @@ export class LocalBackend {
     const includeTests = params.includeTests ?? false;
     const minConfidence = params.minConfidence ?? 0;
 
-    // Resolve target by name, preferring Class/Interface over Constructor
-    // (fix #480: Java class and constructor share the same name).
-    // labels(n)[0] returns empty string in LadybugDB, so we use explicit
-    // label-typed sub-queries in a single UNION ordered by priority to avoid
-    // up to 6 serial round-trips for non-Class targets.
-    let sym: any = null;
-    let symType = '';
+    // Resolve target via the shared symbol resolver. When the caller passes
+    // target_uid we skip the name lookup entirely (zero-ambiguity). Otherwise
+    // we rank candidates (#470) and either proceed with a confident single
+    // match, or return a structured ambiguous response instead of silently
+    // picking the wrong symbol.
+    //
+    // The resolver preserves the #480 Class/Constructor preference heuristic:
+    // when a Class and its Constructor share name + filePath, the Class is
+    // selected silently.
+    const outcome = await this.resolveSymbolCandidates(
+      repo,
+      { uid: params.target_uid, name: target },
+      { file_path: params.file_path, kind: params.kind },
+    );
 
-    try {
-      const rows = await executeParameterized(
-        repo.id,
-        `
-        MATCH (n:\`Class\`) WHERE n.name = $targetName
-        RETURN n.id AS id, n.name AS name, n.filePath AS filePath, 0 AS priority LIMIT 1
-        UNION ALL
-        MATCH (n:\`Interface\`) WHERE n.name = $targetName
-        RETURN n.id AS id, n.name AS name, n.filePath AS filePath, 1 AS priority LIMIT 1
-        UNION ALL
-        MATCH (n:\`Function\`) WHERE n.name = $targetName
-        RETURN n.id AS id, n.name AS name, n.filePath AS filePath, 2 AS priority LIMIT 1
-        UNION ALL
-        MATCH (n:\`Method\`) WHERE n.name = $targetName
-        RETURN n.id AS id, n.name AS name, n.filePath AS filePath, 3 AS priority LIMIT 1
-        UNION ALL
-        MATCH (n:\`Constructor\`) WHERE n.name = $targetName
-        RETURN n.id AS id, n.name AS name, n.filePath AS filePath, 4 AS priority LIMIT 1
-      `,
-        { targetName: target },
-      ).catch(() => []);
-
-      if (rows.length > 0) {
-        // Pick the row with the lowest priority value (Class wins over Constructor)
-        const best = rows.reduce((a: any, b: any) =>
-          (a.priority ?? a[3] ?? 99) <= (b.priority ?? b[3] ?? 99) ? a : b,
-        );
-        sym = best;
-        const priorityToLabel = ['Class', 'Interface', 'Function', 'Method', 'Constructor'];
-        symType = priorityToLabel[best.priority ?? best[3]] ?? '';
-      }
-    } catch {
-      /* fall through to unlabeled match */
+    if (outcome.kind === 'not_found') {
+      const missing = params.target_uid ?? target;
+      return {
+        error: `Target '${missing}' not found`,
+        target: { name: target },
+        direction,
+        impactedCount: 0,
+        risk: 'UNKNOWN',
+      };
     }
 
-    // Fall back to unlabeled match for any other node type
-    if (!sym) {
-      const rows = await executeParameterized(
-        repo.id,
-        `
-        MATCH (n)
-        WHERE n.name = $targetName
-        RETURN n.id AS id, n.name AS name, n.filePath AS filePath
-        LIMIT 1
-      `,
-        { targetName: target },
-      );
-      if (rows.length > 0) sym = rows[0];
+    if (outcome.kind === 'ambiguous') {
+      return {
+        status: 'ambiguous',
+        message: `Found ${outcome.candidates.length} symbols matching '${target}'. Use target_uid, file_path, or kind to disambiguate.`,
+        target: { name: target },
+        direction,
+        impactedCount: 0,
+        risk: 'UNKNOWN',
+        candidates: outcome.candidates.map((c) => ({
+          uid: c.id,
+          name: c.name,
+          kind: c.type,
+          filePath: c.filePath,
+          line: c.startLine,
+          score: Number(c.score.toFixed(2)),
+        })),
+      };
     }
 
-    if (!sym) return { error: `Target '${target}' not found` };
+    const sym = {
+      id: outcome.symbol.id,
+      name: outcome.symbol.name,
+      filePath: outcome.symbol.filePath,
+    };
+    const symType = outcome.resolvedLabel || outcome.symbol.type || '';
 
     return this._runImpactBFS(repo, sym, symType, direction, {
       maxDepth,
