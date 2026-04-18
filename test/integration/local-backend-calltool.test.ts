@@ -104,6 +104,14 @@ withTestLbugDB(
           (result.process_symbols?.length || 0) +
           (result.definitions?.length || 0);
         expect(totalResults).toBeGreaterThanOrEqual(1);
+
+        // #553: query response carries per-phase timing metadata.
+        expect(result.timing).toBeDefined();
+        expect(typeof result.timing.wall).toBe('number');
+        expect(result.timing.wall).toBeGreaterThanOrEqual(0);
+        // At least one of the search phases must have fired for any
+        // non-error response — bm25 and/or vector always runs.
+        expect(result.timing.bm25 ?? result.timing.vector).toBeGreaterThanOrEqual(0);
       });
 
       it('unknown tool throws', async () => {

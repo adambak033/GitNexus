@@ -30,6 +30,7 @@ import {
 import { GroupService, type GroupToolPort } from '../../core/group/service.js';
 import { collectBestChunks } from '../../core/embeddings/types.js';
 import { EMBEDDING_TABLE_NAME, EMBEDDING_INDEX_NAME } from '../../core/lbug/schema.js';
+import { PhaseTimer } from '../../core/search/phase-timer.js';
 // AI context generation is CLI-only (gitnexus analyze)
 // import { generateAIContextFiles } from '../../cli/ai-context.js';
 
@@ -154,6 +155,28 @@ const confidenceForRelType = (relType: string | undefined): number =>
 function logQueryError(context: string, err: unknown): void {
   const msg = err instanceof Error ? err.message : String(err);
   console.error(`GitNexus [${context}]: ${msg}`);
+}
+
+/**
+ * Structured per-query latency log for production aggregation (#553).
+ *
+ * Emitted on stderr — NOT stdout — because the MCP stdio transport uses
+ * stdout exclusively for JSON-RPC responses (#324), and the CLI e2e test
+ * `tool output goes to stdout via fd 1` asserts that stdout parses cleanly
+ * as JSON. Any `console.log` from inside a tool handler would corrupt the
+ * protocol. Matches the existing `logQueryError` convention above, which
+ * uses stderr for the same reason.
+ *
+ * The `GitNexus [query:timing] …` prefix keeps lines greppable; the
+ * `phases` payload is JSON so log-scraping pipelines can parse it
+ * without custom format knowledge.
+ */
+function logQueryTiming(query: string, phases: Record<string, number>): void {
+  const totalMs = phases.wall ?? Object.values(phases).reduce((a, b) => a + b, 0);
+  const truncated = query.length > 80 ? `${query.slice(0, 80)}…` : query;
+  console.error(
+    `GitNexus [query:timing] query=${JSON.stringify(truncated)} totalMs=${totalMs} phases=${JSON.stringify(phases)}`,
+  );
 }
 
 export interface CodebaseContext {
@@ -534,17 +557,29 @@ export class LocalBackend {
     const includeContent = params.include_content ?? false;
     const searchQuery = params.query.trim();
 
-    // Step 1: Run hybrid search to get matching symbols
+    // Per-phase timing instrumentation (#553). Records wall time for each
+    // observable sub-step of the search pipeline so production latency can
+    // be aggregated offline for Pareto analysis and bottleneck detection.
+    // Overhead is <0.1 ms per phase; the timer is passive and never alters
+    // query behaviour.
+    const timer = new PhaseTimer();
+    const wallStart = performance.now();
+
+    // Step 1: Run hybrid search to get matching symbols. BM25 and vector
+    // search run concurrently via Promise.all — use `timer.time()` for
+    // each so both get independent wall-time records without fighting
+    // over a single `current` phase slot.
     const searchLimit = processLimit * maxSymbolsPerProcess; // fetch enough raw results
     const [bm25SearchResult, semanticResults] = await Promise.all([
-      this.bm25Search(repo, searchQuery, searchLimit),
-      this.semanticSearch(repo, searchQuery, searchLimit),
+      timer.time('bm25', this.bm25Search(repo, searchQuery, searchLimit)),
+      timer.time('vector', this.semanticSearch(repo, searchQuery, searchLimit)),
     ]);
 
     const bm25Results = bm25SearchResult.results;
     const ftsUsed = bm25SearchResult.ftsUsed;
 
     // Merge via reciprocal rank fusion
+    timer.start('merge');
     const scoreMap = new Map<string, { score: number; data: any }>();
 
     for (let i = 0; i < bm25Results.length; i++) {
@@ -574,8 +609,10 @@ export class LocalBackend {
     const merged = Array.from(scoreMap.entries())
       .sort((a, b) => b[1].score - a[1].score)
       .slice(0, searchLimit);
+    timer.stop(); // merge
 
     // Step 2: For each match with a nodeId, trace to process(es)
+    timer.start('symbol_lookup');
     const processMap = new Map<
       string,
       {
@@ -708,7 +745,10 @@ export class LocalBackend {
       }
     }
 
+    timer.stop(); // symbol_lookup
+
     // Step 3: Rank processes by aggregate score + internal cohesion boost
+    timer.start('ranking');
     const rankedProcesses = Array.from(processMap.values())
       .map((p) => ({
         ...p,
@@ -716,8 +756,10 @@ export class LocalBackend {
       }))
       .sort((a, b) => b.priority - a.priority)
       .slice(0, processLimit);
+    timer.stop(); // ranking
 
     // Step 4: Build response
+    timer.start('formatting');
     const processes = rankedProcesses.map((p) => ({
       id: p.id,
       summary: p.heuristicLabel || p.label,
@@ -741,11 +783,20 @@ export class LocalBackend {
       seen.add(s.id);
       return true;
     });
+    timer.stop(); // formatting
+
+    // End-to-end wall time — deliberately a separate mark so callers can
+    // compare sum(phases) vs wall to see how much Promise.all concurrency
+    // saved. Must come before summary() so it's included.
+    timer.mark('wall', performance.now() - wallStart);
+    const timing = timer.summary();
+    logQueryTiming(searchQuery, timing);
 
     return {
       processes,
       process_symbols: dedupedSymbols,
       definitions: definitions.slice(0, 20), // cap standalone definitions
+      timing,
       ...(!ftsUsed && {
         warning:
           'FTS extension unavailable - keyword search degraded. Run: gitnexus analyze --force to rebuild indexes.',
