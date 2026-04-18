@@ -337,7 +337,11 @@ describe('Step 6: global-qualified fallback', () => {
 // ─── §4.2 Step 7 — tie-breaks ──────────────────────────────────────────────
 
 describe('Step 7: tie-break cascade', () => {
-  it('confidence DESC is the primary key', () => {
+  it('inner scope shadows outer, yielding single result (hard-shadow baseline)', () => {
+    // Baseline: the hard-shadow rule in Step 1 means a near binding fully
+    // replaces the far one. No "confidence DESC" ordering to observe here
+    // because there is only one candidate — the far class never enters
+    // the result set. See the next test for true multi-candidate ranking.
     const nearClass = mkDef({ nodeId: 'def:near', type: 'Class' });
     const farClass = mkDef({ nodeId: 'def:far', type: 'Class' });
     const mod = mkScope({
@@ -355,9 +359,29 @@ describe('Step 7: tie-break cascade', () => {
     const ctx = makeCtx([mod, fn], [nearClass, farClass]);
     const results = buildClassRegistry(ctx).lookup('User', 'scope:f');
 
-    // Inner binding shadows; only the near class should appear.
     expect(results).toHaveLength(1);
     expect(results[0]!.def).toBe(nearClass);
+  });
+
+  it('orders multiple same-scope candidates by confidence DESC', () => {
+    // Two candidates co-exist at the same scope, one with origin=local
+    // (weight 0.55) and one with origin=wildcard (weight 0.30). Both pass
+    // the Class kind filter; confidence DESC should sort local first.
+    const localClass = mkDef({ nodeId: 'def:local', type: 'Class' });
+    const wildcardClass = mkDef({ nodeId: 'def:wildcard', type: 'Class' });
+    const mod = mkScope({
+      id: 'scope:m',
+      parent: null,
+      bindings: {
+        User: [mkBinding(wildcardClass, 'wildcard'), mkBinding(localClass, 'local')],
+      },
+    });
+    const ctx = makeCtx([mod], [localClass, wildcardClass]);
+    const results = buildClassRegistry(ctx).lookup('User', 'scope:m');
+    expect(results).toHaveLength(2);
+    expect(results[0]!.def).toBe(localClass); // local (0.55) > wildcard (0.30)
+    expect(results[1]!.def).toBe(wildcardClass);
+    expect(results[0]!.confidence).toBeGreaterThan(results[1]!.confidence);
   });
 
   it('breaks ties by DefId.localeCompare when all secondary keys are equal', () => {
@@ -531,6 +555,59 @@ describe('Step 2: type-binding + MRO walk', () => {
     expect(results[0]!.def).toBe(saveMethod);
     const typeBinding = evidenceOfKind(results[0]!, 'type-binding');
     expect(typeBinding?.weight).toBe(EvidenceWeights.typeBindingByMroDepth[0]);
+  });
+
+  it('demotes Step-2-only candidates to tieBreakKey.origin=import (pins rank vs same-origin siblings)', () => {
+    // Two method defs named `impl`, both owned by the same interface and
+    // both reached ONLY via the Step 2 type-binding MRO walk (no lexical
+    // binding). Each candidate's `recordTypeBindingHit` path demotes its
+    // `tieBreakKey.origin` from the `ensureCandidate` default `'local'`
+    // to `'import'`. With both at equal confidence (owner-match + type-
+    // binding at depth 0), the tie-break cascade must fall through
+    // scope-depth / MRO-depth / origin (all equal) to DefId.localeCompare.
+    //
+    // If the demotion regressed (e.g., tieBreakKey.origin left as `'local'`),
+    // both candidates would still share the same origin and this test would
+    // pass by coincidence — so the test ALSO asserts `signals.origin` is
+    // absent from the evidence list (no false where-found weight emitted),
+    // which is the strongest observable invariant the demotion guarantees.
+    const iface = mkDef({
+      nodeId: 'def:Iface',
+      type: 'Interface',
+      qualifiedName: 'Iface',
+    });
+    const implA = mkDef({
+      nodeId: 'def:aaa.impl',
+      type: 'Method',
+      qualifiedName: 'Iface.impl',
+      ownerId: 'def:Iface',
+    });
+    const implB = mkDef({
+      nodeId: 'def:bbb.impl',
+      type: 'Method',
+      qualifiedName: 'Iface.impl',
+      ownerId: 'def:Iface',
+    });
+    const scope = mkScope({
+      id: 'scope:call',
+      parent: null,
+      typeBindings: { x: typeRef('Iface', 'scope:call') },
+    });
+    const ctx = makeCtx([scope], [iface, implA, implB]);
+    const results = buildMethodRegistry(ctx).lookup('impl', 'scope:call', {
+      explicitReceiver: { name: 'x' },
+    });
+    expect(results).toHaveLength(2);
+    // DefId.localeCompare: 'def:aaa.impl' < 'def:bbb.impl'.
+    expect(results[0]!.def).toBe(implA);
+    expect(results[1]!.def).toBe(implB);
+    // Demotion invariant: Step-2-only candidates have no `signals.origin`,
+    // so composeEvidence never emits a where-found signal for them.
+    for (const res of results) {
+      expect(evidenceOfKind(res, 'local')).toBeUndefined();
+      expect(evidenceOfKind(res, 'import')).toBeUndefined();
+      expect(evidenceOfKind(res, 'type-binding')).toBeDefined();
+    }
   });
 
   it('walks up the MRO when the method is declared on an ancestor', () => {
