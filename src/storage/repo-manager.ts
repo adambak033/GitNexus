@@ -245,20 +245,126 @@ const writeRegistry = async (entries: RegistryEntry[]): Promise<void> => {
 };
 
 /**
+ * Options for {@link registerRepo}. All optional — callers without any
+ * disambiguation requirement can keep calling `registerRepo(path, meta)`
+ * unchanged.
+ */
+export interface RegisterRepoOptions {
+  /**
+   * User-provided alias from `analyze --name <alias>` (#829). Overrides
+   * the default basename-derived registry `name`. Persisted — subsequent
+   * re-analyses of the same path without `--name` preserve the alias.
+   */
+  name?: string;
+  /**
+   * Allow two DIFFERENT repo paths to register under the same alias
+   * (#829). Mapped from the `--allow-duplicate-name` CLI flag.
+   *
+   * Scope: this flag governs cross-path alias sharing only — one repo
+   * path always has exactly one registry entry (and therefore exactly
+   * one alias). Re-analyzing the same path with `--name Y` overwrites
+   * a previous `--name X`; it does NOT create a second entry or a
+   * second alias for the same path (see the upsert-by-resolved-path
+   * logic in {@link registerRepo} and the
+   * `re-registerRepo with a different name overrides the previous
+   * alias` test in `test/unit/repo-manager.test.ts`).
+   *
+   * Distinct from `--force` (which only triggers pipeline re-index);
+   * a user accepting a duplicate alias should not be forced to also
+   * re-run the full pipeline.
+   */
+  allowDuplicateName?: boolean;
+}
+
+/**
+ * Thrown by {@link registerRepo} when a requested name is already in
+ * use by a DIFFERENT path. The CLI layer surfaces this as an actionable
+ * error instead of relying on `.message` string-matching.
+ *
+ * The colliding alias is exposed as `err.registryName` (not `err.name`).
+ * `err.name` keeps its inherited `Error.prototype.name` semantics (the
+ * class name) so downstream code can do the usual `err.name ===
+ * 'RegistryNameCollisionError'` checks; use the `kind` discriminant or
+ * `instanceof RegistryNameCollisionError` for type-safe narrowing.
+ */
+export class RegistryNameCollisionError extends Error {
+  readonly kind = 'RegistryNameCollisionError' as const;
+  constructor(
+    public readonly registryName: string,
+    public readonly existingPath: string,
+    public readonly requestedPath: string,
+  ) {
+    super(
+      `Registry name "${registryName}" is already used by "${existingPath}".\n` +
+        `Pass --name <alias> to register "${requestedPath}" under a different name, ` +
+        `or --allow-duplicate-name to allow both paths under the same name (leaves -r <name> ambiguous for these two).`,
+    );
+    this.name = 'RegistryNameCollisionError';
+  }
+}
+
+/** Returns true when a previously-registered entry's `name` differs from
+ *  `path.basename(entry.path)` — i.e. a user explicitly aliased it via
+ *  `analyze --name <alias>` on a prior run. Used to preserve the alias
+ *  across re-analyses that omit `--name`. */
+const hasCustomAlias = (entry: RegistryEntry): boolean => {
+  return entry.name !== path.basename(path.resolve(entry.path));
+};
+
+/**
  * Register (add or update) a repo in the global registry.
  * Called after `gitnexus analyze` completes.
+ *
+ * Name resolution precedence (#829):
+ *   1. explicit `opts.name` (from `analyze --name <alias>`)
+ *   2. preserved alias on an existing entry for this path
+ *   3. `path.basename(repoPath)` (the original default)
+ *
+ * Duplicate-name guard: if another path already uses the resolved
+ * `name`, throw {@link RegistryNameCollisionError} unless
+ * `opts.allowDuplicateName` is set. The guard ONLY fires when the user explicitly passed a
+ * `name`; un-aliased basename collisions continue to register silently
+ * so existing users who don't know about `--name` see no behaviour
+ * change.
  */
-export const registerRepo = async (repoPath: string, meta: RepoMeta): Promise<void> => {
+export const registerRepo = async (
+  repoPath: string,
+  meta: RepoMeta,
+  opts?: RegisterRepoOptions,
+): Promise<void> => {
   const resolved = path.resolve(repoPath);
-  const name = path.basename(resolved);
   const { storagePath } = getStoragePaths(resolved);
 
   const entries = await readRegistry();
-  const existing = entries.findIndex((e) => {
+  const existingIdx = entries.findIndex((e) => {
     const a = path.resolve(e.path);
     const b = resolved;
     return process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
   });
+  const existing = existingIdx >= 0 ? entries[existingIdx] : null;
+
+  // Precedence: explicit --name > preserved alias > basename.
+  const name =
+    opts?.name ?? (existing && hasCustomAlias(existing) ? existing.name : path.basename(resolved));
+
+  // Duplicate-name guard: only fire when the user EXPLICITLY asked for
+  // this name (via opts.name or a preserved alias). Unqualified basename
+  // collisions are preserved for backward-compat — they still register,
+  // and the user sees the ambiguity at `-r` / `list` resolution time
+  // (which is already improved by the disambiguated error messages and
+  // list output this PR also ships).
+  const explicitName = opts?.name !== undefined || (existing && hasCustomAlias(existing));
+  if (explicitName && !opts?.allowDuplicateName) {
+    const collidingEntry = entries.find(
+      (e, i) =>
+        i !== existingIdx &&
+        e.name.toLowerCase() === name.toLowerCase() &&
+        path.resolve(e.path) !== resolved,
+    );
+    if (collidingEntry) {
+      throw new RegistryNameCollisionError(name, collidingEntry.path, resolved);
+    }
+  }
 
   const entry: RegistryEntry = {
     name,
@@ -269,8 +375,8 @@ export const registerRepo = async (repoPath: string, meta: RepoMeta): Promise<vo
     stats: meta.stats,
   };
 
-  if (existing >= 0) {
-    entries[existing] = entry;
+  if (existingIdx >= 0) {
+    entries[existingIdx] = entry;
   } else {
     entries.push(entry);
   }

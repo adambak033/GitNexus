@@ -342,13 +342,25 @@ export class LocalBackend {
     if (this.repos.size === 0) {
       throw new Error('No indexed repositories. Run: gitnexus analyze');
     }
-    if (repoParam) {
-      const names = [...this.repos.values()].map((h) => h.name);
-      throw new Error(`Repository "${repoParam}" not found. Available: ${names.join(', ')}`);
+
+    // Build a disambiguated "Available: …" list (#829). When two handles
+    // share a name, annotate each colliding label with its path so the
+    // caller can actually pick the right one. Single-name entries render
+    // identically to pre-#829 output.
+    const nameCounts = new Map<string, number>();
+    for (const h of this.repos.values()) {
+      const key = h.name.toLowerCase();
+      nameCounts.set(key, (nameCounts.get(key) ?? 0) + 1);
     }
-    const names = [...this.repos.values()].map((h) => h.name);
+    const labels = [...this.repos.values()].map((h) =>
+      (nameCounts.get(h.name.toLowerCase()) ?? 0) > 1 ? `${h.name} (${h.repoPath})` : h.name,
+    );
+
+    if (repoParam) {
+      throw new Error(`Repository "${repoParam}" not found. Available: ${labels.join(', ')}`);
+    }
     throw new Error(
-      `Multiple repositories indexed. Specify which one with the "repo" parameter. Available: ${names.join(', ')}`,
+      `Multiple repositories indexed. Specify which one with the "repo" parameter. Available: ${labels.join(', ')}`,
     );
   }
 

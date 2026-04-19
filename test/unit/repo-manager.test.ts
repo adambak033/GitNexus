@@ -13,6 +13,10 @@ import {
   getStoragePaths,
   readRegistry,
   loadCLIConfig,
+  registerRepo,
+  listRegisteredRepos,
+  RegistryNameCollisionError,
+  type RepoMeta,
 } from '../../src/storage/repo-manager.js';
 import { createTempDir } from '../helpers/test-db.js';
 
@@ -131,5 +135,139 @@ describe('API key file permissions', () => {
     );
     expect(source).toContain('chmod(configPath, 0o600)');
     expect(source).toContain("process.platform !== 'win32'");
+  });
+});
+
+// ─── analyze --name <alias> + duplicate-name guard (#829) ────────────
+//
+// Each test isolates the global registry by pointing GITNEXUS_HOME at a
+// per-test tmpdir. `getGlobalDir()` honors that env var, so registerRepo
+// writes/reads a sandboxed registry.json without touching the user's
+// real ~/.gitnexus.
+
+describe('registerRepo name override + collision guard (#829)', () => {
+  let tmpHome: Awaited<ReturnType<typeof createTempDir>>;
+  let tmpRepoA: Awaited<ReturnType<typeof createTempDir>>;
+  let tmpRepoB: Awaited<ReturnType<typeof createTempDir>>;
+  let savedGitnexusHome: string | undefined;
+
+  const meta: RepoMeta = {
+    repoPath: '',
+    lastCommit: 'abc1234',
+    indexedAt: '2026-04-18T12:00:00.000Z',
+    stats: { files: 1, nodes: 1 },
+  };
+
+  beforeEach(async () => {
+    tmpHome = await createTempDir('gitnexus-registry-home-');
+    tmpRepoA = await createTempDir('gitnexus-repo-a-');
+    tmpRepoB = await createTempDir('gitnexus-repo-b-');
+    savedGitnexusHome = process.env.GITNEXUS_HOME;
+    process.env.GITNEXUS_HOME = tmpHome.dbPath;
+  });
+
+  afterEach(async () => {
+    if (savedGitnexusHome === undefined) delete process.env.GITNEXUS_HOME;
+    else process.env.GITNEXUS_HOME = savedGitnexusHome;
+    await tmpHome.cleanup();
+    await tmpRepoA.cleanup();
+    await tmpRepoB.cleanup();
+  });
+
+  it('registerRepo({ name: "alias" }) stores the alias instead of basename', async () => {
+    await registerRepo(tmpRepoA.dbPath, meta, { name: 'custom-alias' });
+
+    const entries = await listRegisteredRepos();
+    expect(entries).toHaveLength(1);
+    expect(entries[0].name).toBe('custom-alias');
+    expect(entries[0].name).not.toBe(path.basename(tmpRepoA.dbPath));
+  });
+
+  it('re-registerRepo on same path without name preserves an existing alias', async () => {
+    await registerRepo(tmpRepoA.dbPath, meta, { name: 'custom-alias' });
+    // Second call with no opts should keep the alias, not revert to basename.
+    await registerRepo(tmpRepoA.dbPath, meta);
+
+    const entries = await listRegisteredRepos();
+    expect(entries).toHaveLength(1);
+    expect(entries[0].name).toBe('custom-alias');
+  });
+
+  it('re-registerRepo with a different name overrides the previous alias', async () => {
+    await registerRepo(tmpRepoA.dbPath, meta, { name: 'old-alias' });
+    await registerRepo(tmpRepoA.dbPath, meta, { name: 'new-alias' });
+
+    const entries = await listRegisteredRepos();
+    expect(entries).toHaveLength(1);
+    expect(entries[0].name).toBe('new-alias');
+  });
+
+  it('registerRepo throws RegistryNameCollisionError when another path uses the name', async () => {
+    await registerRepo(tmpRepoA.dbPath, meta, { name: 'shared' });
+
+    await expect(registerRepo(tmpRepoB.dbPath, meta, { name: 'shared' })).rejects.toBeInstanceOf(
+      RegistryNameCollisionError,
+    );
+
+    // And the colliding entry in the error carries enough info for the
+    // CLI layer to surface an actionable message without string-matching.
+    try {
+      await registerRepo(tmpRepoB.dbPath, meta, { name: 'shared' });
+    } catch (e) {
+      expect(e).toBeInstanceOf(RegistryNameCollisionError);
+      const err = e as RegistryNameCollisionError;
+      // err.registryName carries the colliding alias (exposed as its own
+      // field so err.name retains the inherited Error.prototype.name
+      // semantics for downstream `err.name === '…Error'` checks).
+      expect(err.registryName).toBe('shared');
+      expect(err.name).toBe('RegistryNameCollisionError');
+      expect(path.resolve(err.existingPath)).toBe(path.resolve(tmpRepoA.dbPath));
+      expect(path.resolve(err.requestedPath)).toBe(path.resolve(tmpRepoB.dbPath));
+    }
+
+    // Registry still only has the first entry — the failed call didn't
+    // corrupt state.
+    const entries = await listRegisteredRepos();
+    expect(entries).toHaveLength(1);
+    expect(entries[0].name).toBe('shared');
+  });
+
+  it('registerRepo({ name, allowDuplicateName: true }) allows the duplicate to coexist', async () => {
+    await registerRepo(tmpRepoA.dbPath, meta, { name: 'shared' });
+    await registerRepo(tmpRepoB.dbPath, meta, { name: 'shared', allowDuplicateName: true });
+
+    const entries = await listRegisteredRepos();
+    expect(entries).toHaveLength(2);
+    expect(entries.every((e) => e.name === 'shared')).toBe(true);
+    // Both paths are stored distinctly — the collision is surfaced to the
+    // user via resolveRepo / list output, not hidden at the storage layer.
+    const paths = entries.map((e) => path.resolve(e.path)).sort();
+    expect(paths).toEqual([path.resolve(tmpRepoA.dbPath), path.resolve(tmpRepoB.dbPath)].sort());
+  });
+
+  it('basename collisions without an explicit --name still register silently (backward-compat)', async () => {
+    // Create two sibling dirs whose basenames collide. Neither caller
+    // passes { name }, so the guard must NOT fire — this preserves the
+    // pre-#829 behaviour for users who don't know about --name yet.
+    const parentA = await createTempDir('gitnexus-collide-parent-a-');
+    const parentB = await createTempDir('gitnexus-collide-parent-b-');
+    const sharedBasename = 'app';
+    const pathA = path.join(parentA.dbPath, sharedBasename);
+    const pathB = path.join(parentB.dbPath, sharedBasename);
+    await fs.mkdir(pathA, { recursive: true });
+    await fs.mkdir(pathB, { recursive: true });
+
+    try {
+      await registerRepo(pathA, meta);
+      await registerRepo(pathB, meta); // must NOT throw
+
+      const entries = await listRegisteredRepos();
+      expect(entries).toHaveLength(2);
+      expect(entries[0].name).toBe(sharedBasename);
+      expect(entries[1].name).toBe(sharedBasename);
+    } finally {
+      await parentA.cleanup();
+      await parentB.cleanup();
+    }
   });
 });
