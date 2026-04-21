@@ -318,6 +318,7 @@ const processParsingSequential = async (
   files: { path: string; content: string }[],
   symbolTable: SymbolTableWriter,
   astCache: ASTCache,
+  scopeTreeCache: ASTCache | undefined,
   onFileProgress?: FileProgressCallback,
 ) => {
   const parser = await loadParser();
@@ -382,6 +383,13 @@ const processParsingSequential = async (
     astCache.set(file.path, tree);
 
     const provider = getProvider(language);
+    // Mirror into the cross-phase cache only when the language has a
+    // scope-resolution consumer — otherwise we retain Trees no one
+    // reads. parse-impl clears `astCache` between chunks;
+    // `scopeTreeCache` survives until scope-resolution disposes it.
+    if (provider.emitScopeCaptures !== undefined) {
+      scopeTreeCache?.set(file.path, tree);
+    }
     const queryString = provider.treeSitterQueries;
     if (!queryString) {
       continue;
@@ -699,10 +707,27 @@ export const processParsing = async (
   files: { path: string; content: string }[],
   symbolTable: SymbolTableWriter,
   astCache: ASTCache,
+  /**
+   * Persistent tree cache (separate from `astCache`, which the caller
+   * clears between chunks). Sequential parses additionally write the
+   * Tree here so cross-phase consumers (scope-resolution) can read it.
+   * Worker-mode parses skip — Trees can't cross MessageChannels.
+   * Pass `undefined` if no consumer needs cross-phase access.
+   */
+  scopeTreeCache: ASTCache | undefined,
   onFileProgress?: FileProgressCallback,
   workerPool?: WorkerPool,
 ): Promise<WorkerExtractedData | null> => {
   if (workerPool) {
+    if (scopeTreeCache !== undefined && process.env.PROF_SCOPE_RESOLUTION === '1') {
+      // Trees can't cross MessageChannels, so worker-parsed files land
+      // in scope-resolution with an empty cache and get re-parsed.
+      // Surfacing this in PROF mode prevents silent perf cliffs when
+      // a repo crosses the worker-pool threshold.
+      console.warn(
+        `[scope-resolution prof] worker pool engaged for ${files.length} files — cross-phase tree cache will be empty; scope-resolution re-parses.`,
+      );
+    }
     try {
       return await processParsingWithWorkers(
         graph,
@@ -721,6 +746,13 @@ export const processParsing = async (
   }
 
   // Fallback: sequential parsing (no pre-extracted data)
-  await processParsingSequential(graph, files, symbolTable, astCache, onFileProgress);
+  await processParsingSequential(
+    graph,
+    files,
+    symbolTable,
+    astCache,
+    scopeTreeCache,
+    onFileProgress,
+  );
   return null;
 };
