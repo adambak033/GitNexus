@@ -47,7 +47,9 @@ program
     'after',
     '\nEnvironment variables:\n' +
       '  GITNEXUS_NO_GITIGNORE=1   Skip .gitignore parsing (still reads .gitnexusignore)\n' +
-      '  GITNEXUS_MAX_FILE_SIZE=N  Override large-file skip threshold (KB). Default 512, max 32768.',
+      '  GITNEXUS_MAX_FILE_SIZE=N  Override large-file skip threshold (KB). Default 512, max 32768.\n' +
+      '\nTip: `.gitnexusignore` supports `.gitignore`-style negation. Add e.g.\n' +
+      '     `!__tests__/` to index a directory that is auto-filtered by default (#771).',
   )
   .action(createLazyAction(() => import('./analyze.js'), 'analyzeCommand'));
 
