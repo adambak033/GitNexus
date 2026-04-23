@@ -92,13 +92,13 @@ export const pythonProvider = defineLanguage({
   // ── RFC #909 Ring 3: scope-based resolution hooks (RFC §5) ──────────
   // Python is the first migration. See ./python/index.ts for the
   // full per-hook rationale and the canonical capture vocabulary in
-  // ./python/scopes.scm.
+  // ./python/query.ts (PYTHON_SCOPE_QUERY constant).
   emitScopeCaptures: emitPythonScopeCaptures,
   interpretImport: interpretPythonImport,
   interpretTypeBinding: interpretPythonTypeBinding,
   bindingScopeFor: pythonBindingScopeFor,
   importOwningScope: pythonImportOwningScope,
-  mergeBindings: pythonMergeBindings,
+  mergeBindings: (_scope, bindings) => pythonMergeBindings(bindings),
   receiverBinding: pythonReceiverBinding,
   arityCompatibility: pythonArityCompatibility,
   resolveImportTarget: resolvePythonImportTarget,

@@ -25,6 +25,8 @@
 
 import type { ParsedFile, RegistryProviders } from 'gitnexus-shared';
 import type { KnowledgeGraph } from '../../../graph/types.js';
+import type { MutableSemanticModel, SemanticModel } from '../../model/semantic-model.js';
+import { reconcileOwnership, validateOwnershipParity } from './reconcile-ownership.js';
 import { extractParsedFile } from '../../scope-extractor-bridge.js';
 import { finalizeScopeModel } from '../../finalize-orchestrator.js';
 import { resolveReferenceSites, type ResolveStats } from '../../resolve-references.js';
@@ -40,6 +42,16 @@ import { buildWorkspaceResolutionIndex } from '../workspace-index.js';
 
 interface RunScopeResolutionInput {
   readonly graph: KnowledgeGraph;
+  /**
+   * Semantic model populated by the legacy `parse` phase. Scope-
+   * resolution consumes its `TypeRegistry` / `MethodRegistry` /
+   * `SymbolTable` lookups instead of rebuilding parallel indexes from
+   * `ParsedFile[]`. See ARCHITECTURE.md § "Semantic-model source of
+   * truth". Tests that invoke `runScopeResolution` in isolation pass a
+   * freshly-created `MutableSemanticModel` populated from the same
+   * `ParsedFile[]` to mirror the pipeline shape.
+   */
+  readonly model: MutableSemanticModel;
   readonly files: readonly { readonly path: string; readonly content: string }[];
   readonly onWarn?: (message: string) => void;
   /**
@@ -91,6 +103,20 @@ export function runScopeResolution(
     parsedFiles.push(parsed);
   }
 
+  // Reconcile scope-resolution's ownership view into the SemanticModel.
+  // See `reconcile-ownership.ts` for the full rationale (Contract
+  // Invariant I9). Debug-mode validator runs immediately after to
+  // catch drift between `parsed.localDefs` and the registries.
+  //
+  // PHASE BOUNDARY: `input.model` is `MutableSemanticModel` up to this
+  // point (write phase: reconciliation). After this line no further
+  // writes are expected — downstream passes consume `readonlyModel`
+  // (narrowed to `SemanticModel`) so accidental writes would surface
+  // as type errors.
+  reconcileOwnership(parsedFiles, input.model);
+  validateOwnershipParity(parsedFiles, input.model, onWarn);
+  const readonlyModel: SemanticModel = input.model;
+
   if (parsedFiles.length === 0) {
     return {
       filesProcessed: 0,
@@ -129,12 +155,24 @@ export function runScopeResolution(
     methodDispatch: buildPopulatedMethodDispatch(mroByClassDefId),
   };
 
-  // Build the workspace resolution index ONCE — turns every
-  // findOwnedMember / findExportedDef / classScopeByDefId lookup in
-  // the downstream passes from O(N×D) to O(1). Must run AFTER
-  // populateOwners (so memberByOwner is correct) and AFTER
-  // finalize (so module-scope bindings are available).
+  // Build the workspace resolution index ONCE — scope-valued lookups
+  // (`classScopeByDefId`, `moduleScopeByFile`) that `SemanticModel`
+  // cannot carry. Must run AFTER `populateOwners` (so owned defs are
+  // attributed correctly) and AFTER finalize (so module-scope
+  // bindings are available).
   const workspaceIndex = buildWorkspaceResolutionIndex(parsedFiles);
+
+  // Cross-file implicit-namespace visibility (C#). Must run before
+  // propagateImportedReturnTypes so the latter pass sees siblings'
+  // class bindings when chasing return-type chains across files.
+  if (provider.populateNamespaceSiblings !== undefined) {
+    const fileContents = new Map<string, string>();
+    for (const f of files) fileContents.set(f.path, f.content);
+    provider.populateNamespaceSiblings(parsedFiles, indexes, {
+      fileContents,
+      treeCache,
+    });
+  }
 
   // Cross-file return-type propagation (Contract Invariant I3 timing:
   // after finalize, before resolve).
@@ -163,6 +201,7 @@ export function runScopeResolution(
     handledSites,
     provider,
     workspaceIndex,
+    readonlyModel,
   );
   const freeCallExtras = emitFreeCallFallback(
     graph,
@@ -171,6 +210,8 @@ export function runScopeResolution(
     nodeLookup,
     referenceIndex,
     handledSites,
+    readonlyModel,
+    workspaceIndex,
   );
   const { emitted, skipped } = emitReferencesViaLookup(
     graph,

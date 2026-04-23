@@ -39,6 +39,19 @@ interface ResolveCompoundReceiverOptions {
    *  class, walk its fields and try the lookup on each field's class.
    *  Phase-9C "unified fixpoint" — Python-shaped heuristic. */
   readonly fieldFallback?: boolean;
+  /** Language-specific accessor unwrap — `data.Values` on a
+   *  Dictionary<K,V>-typed receiver yields V (C#), etc. Returns the
+   *  element type's simple name, or `undefined` to let the regular
+   *  field-walk handle the access. */
+  readonly unwrapCollectionAccessor?: (
+    receiverType: string,
+    accessor: string,
+  ) => string | undefined;
+  /** Walk up from the class scope to ancestor (Module) scopes when
+   *  looking up a method's return-type typeBinding. Only enable for
+   *  languages that hoist return-type bindings to Module scope (C#);
+   *  otherwise we risk picking up unrelated module-level bindings. */
+  readonly hoistTypeBindingsToModule?: boolean;
 }
 
 export function resolveCompoundReceiverClass(
@@ -107,6 +120,28 @@ export function resolveCompoundReceiverClass(
         retType = candidate;
         break;
       }
+      // Fallback: walk up from the class scope looking for a return-
+      // type binding on an ancestor (Module) scope. Gated on
+      // `hoistTypeBindingsToModule` because only languages that hoist
+      // method return-type bindings to Module scope need this path;
+      // enabling it unconditionally would let other languages pick up
+      // unrelated module-level bindings. See contract doc for the
+      // invariant and `propagateImportedReturnTypes` for how the
+      // hoisted bindings originate.
+      if (cs !== undefined && options.hoistTypeBindingsToModule === true) {
+        let curId: ScopeId | null = cs.parent;
+        while (curId !== null) {
+          const curScope = scopes.scopeTree.getScope(curId);
+          if (curScope === undefined) break;
+          const cand = curScope.typeBindings.get(methodName);
+          if (cand !== undefined) {
+            retType = cand;
+            break;
+          }
+          curId = curScope.parent;
+        }
+        if (retType !== undefined) break;
+      }
     }
 
     if (retType === undefined && fieldFallback) {
@@ -135,6 +170,44 @@ export function resolveCompoundReceiverClass(
 
   // Pure dotted access `obj.field[.field]…` — walk fields.
   const parts = text.split('.');
+
+  // Language-specific collection-accessor suffix (C#'s `data.Values`
+  // on Dictionary<K,V>, etc.). When the provider hook recognizes
+  // the final segment and unwraps the receiver's generic, return
+  // the element class directly. Resolved before the field-walk
+  // because Dictionary-family types aren't local class defs.
+  if (options.unwrapCollectionAccessor !== undefined && parts.length >= 2) {
+    const last = parts[parts.length - 1]!;
+    const prefix = parts.slice(0, -1).join('.');
+    let prefixType: TypeRef | undefined;
+    if (parts.length === 2) {
+      prefixType = findReceiverTypeBinding(inScope, prefix, scopes);
+    } else {
+      // Recursive resolution: walk the prefix as a dotted class chain
+      // to find its typeRef. We need the TypeRef (not the class def)
+      // because the hook inspects the raw generic args (e.g.
+      // `Dictionary<string, User>`).
+      const headInner = parts[0]!;
+      let cur = findReceiverTypeBinding(inScope, headInner, scopes);
+      for (let i = 1; i < parts.length - 1 && cur !== undefined; i++) {
+        const cls = findClassBindingInScope(cur.declaredAtScope, cur.rawName, scopes);
+        if (cls === undefined) {
+          cur = undefined;
+          break;
+        }
+        const cs = classScopeByDefId.get(cls.nodeId);
+        cur = cs?.typeBindings.get(parts[i]!);
+      }
+      prefixType = cur;
+    }
+    if (prefixType !== undefined) {
+      const elemName = options.unwrapCollectionAccessor(prefixType.rawName, last);
+      if (elemName !== undefined) {
+        return findClassBindingInScope(prefixType.declaredAtScope, elemName, scopes);
+      }
+    }
+  }
+
   const head = parts[0]!;
   const headType = findReceiverTypeBinding(inScope, head, scopes);
   let currentClass: SymbolDefinition | undefined = headType

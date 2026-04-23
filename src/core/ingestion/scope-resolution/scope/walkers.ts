@@ -21,7 +21,28 @@
 
 import type { ParsedFile, ScopeId, SymbolDefinition, TypeRef } from 'gitnexus-shared';
 import type { ScopeResolutionIndexes } from '../../model/scope-resolution-indexes.js';
+import type { SemanticModel } from '../../model/semantic-model.js';
 import type { WorkspaceResolutionIndex } from '../workspace-index.js';
+
+/**
+ * True when a def's `type` names a class-like declaration — every kind
+ * that collapses to `@scope.class` in the scope-extractor query contract.
+ *
+ * Semantics widened historically from `'Class' | 'Interface'` to cover
+ * C#-shape languages (struct, record, enum, trait). Languages that emit
+ * only `'Class'` are unaffected — the extra kinds never appear in their
+ * parsed output.
+ */
+export function isClassLike(t: string): boolean {
+  return (
+    t === 'Class' ||
+    t === 'Interface' ||
+    t === 'Struct' ||
+    t === 'Record' ||
+    t === 'Enum' ||
+    t === 'Trait'
+  );
+}
 
 /**
  * Walk the scope chain from `startScope` looking for a typeBinding
@@ -48,7 +69,11 @@ export function findReceiverTypeBinding(
 }
 
 /**
- * Look up a class-kind binding by name in the given scope's chain.
+ * Look up a class-like binding by name in the given scope's chain.
+ *
+ * "Class-like" covers `Class | Interface | Struct | Record | Enum |
+ * Trait` via the shared `isClassLike` predicate — every kind that
+ * collapses to `@scope.class` in the scope-extractor query contract.
  *
  * Walks the scope chain upward and consults TWO sources at each step:
  *   1. `scope.bindings` — populated during scope-extraction Pass 2 with
@@ -74,7 +99,7 @@ export function findClassBindingInScope(
     const localBindings = scope.bindings.get(receiverName);
     if (localBindings !== undefined) {
       for (const b of localBindings) {
-        if (b.def.type === 'Class' || b.def.type === 'Interface') return b.def;
+        if (isClassLike(b.def.type)) return b.def;
       }
     }
 
@@ -82,7 +107,7 @@ export function findClassBindingInScope(
     const importedBindings = finalizedScopeBindings?.get(receiverName);
     if (importedBindings !== undefined) {
       for (const b of importedBindings) {
-        if (b.def.type === 'Class' || b.def.type === 'Interface') return b.def;
+        if (isClassLike(b.def.type)) return b.def;
       }
     }
 
@@ -159,7 +184,7 @@ export function populateClassOwnedMembers(parsed: ParsedFile): void {
   // when the def sits inside a class. Without this, two classes in the
   // same file that share a method name collide at the graph-bridge lookup
   // (`node-lookup.ts` keys by (filePath, qualifiedName) and falls back to
-  // simple name only). Python's `scopes.scm` doesn't emit
+  // simple name only). Python's scope query doesn't emit
   // `@declaration.qualified_name` for nested methods, so the finalized
   // defs arrive here with simple names — we stamp the qualifier while
   // we're already walking class scopes for ownerId.
@@ -185,11 +210,11 @@ export function populateClassOwnedMembers(parsed: ParsedFile): void {
   // extractor ever stops creating scopes for inner defs.
   for (const scope of parsed.scopes) {
     // Methods: function scope whose parent is a Class scope. Owner is
-    // the parent's Class def.
+    // the parent's class-like def.
     if (scope.parent !== null) {
       const parentScope = scopesById.get(scope.parent);
       if (parentScope !== undefined && parentScope.kind === 'Class') {
-        const classDef = parentScope.ownedDefs.find((d) => d.type === 'Class');
+        const classDef = parentScope.ownedDefs.find((d) => isClassLike(d.type));
         if (classDef !== undefined) {
           for (const def of scope.ownedDefs) {
             (def as { ownerId?: string }).ownerId = classDef.nodeId;
@@ -199,9 +224,9 @@ export function populateClassOwnedMembers(parsed: ParsedFile): void {
       }
     }
     // Class-body fields: defs directly owned by a Class scope (the
-    // class def itself excluded).
+    // class-like def itself excluded).
     if (scope.kind === 'Class') {
-      const classDef = scope.ownedDefs.find((d) => d.type === 'Class');
+      const classDef = scope.ownedDefs.find((d) => isClassLike(d.type));
       if (classDef !== undefined) {
         for (const def of scope.ownedDefs) {
           if (def === classDef) continue;
@@ -230,7 +255,7 @@ export function findEnclosingClassDef(
     const scope = scopes.scopeTree.getScope(currentId);
     if (scope === undefined) return undefined;
     if (scope.kind === 'Class') {
-      const cd = scope.ownedDefs.find((d) => d.type === 'Class');
+      const cd = scope.ownedDefs.find((d) => isClassLike(d.type));
       if (cd !== undefined) return cd;
     }
     currentId = scope.parent;
@@ -277,38 +302,72 @@ export function findExportedDefByName(
     }
     currentId = scope.parent;
   }
-  // Workspace-wide fallback: O(1) lookup via the pre-built
-  // `callablesBySimpleName` index. First-seen-by-file wins (matches
-  // the previous nested-loop semantics where the outer iteration is
-  // `parsedFiles`).
-  return index.callablesBySimpleName.get(name)?.[0];
+  // Workspace-wide fallback: iterate every file's Module scope (via
+  // the scope-tied `moduleScopeByFile` lookup) and return the first
+  // locally-declared callable binding matching `name`. First-seen-
+  // by-file wins; bindings filtered to `origin === 'local'` and the
+  // callable types Function/Method/Constructor. We walk scopes here
+  // rather than consult `SemanticModel.symbols.lookupCallableByName`
+  // because the `origin === 'local'` module-export-visibility filter
+  // is a scope concept the raw symbol index doesn't express.
+  for (const [, moduleScope] of index.moduleScopeByFile) {
+    const refs = moduleScope.bindings.get(name);
+    if (refs === undefined) continue;
+    for (const ref of refs) {
+      if (ref.origin !== 'local') continue;
+      const t = ref.def.type;
+      if (t === 'Function' || t === 'Method' || t === 'Constructor') return ref.def;
+    }
+  }
+  return undefined;
 }
 
 /**
- * Find a member of a class by simple name — O(1) lookup via the
- * pre-built `memberByOwner` index from `WorkspaceResolutionIndex`.
+ * Find a member of a class by simple name — delegates to
+ * `SemanticModel.methods` (methods / functions / constructors) with a
+ * fallback to `SemanticModel.fields` (properties / fields /
+ * variables). After `runScopeResolution`'s reconciliation pass
+ * populates both registries from `parsed.localDefs[i].ownerId`
+ * (post-`populateOwners`), this is the single authoritative view of
+ * class membership — no parallel scope-resolution index needed.
  *
- * Pre-index baseline: O(N × D) per call (full parsedFiles scan).
- * Indexed: O(1) `Map.get`. The receiver-bound dispatcher calls this
- * up to (sites × MRO depth) times per workspace.
+ * Returns the first-seen overload for methods without arity or
+ * return-type narrowing. Callers that need arity-aware dispatch use
+ * `lookupMethodByOwner(owner, name, argCount)` directly.
  */
 export function findOwnedMember(
   ownerDefId: string,
   memberName: string,
-  index: WorkspaceResolutionIndex,
+  model: SemanticModel,
 ): SymbolDefinition | undefined {
-  return index.memberByOwner.get(ownerDefId)?.get(memberName);
+  const method = model.methods.lookupAllByOwner(ownerDefId, memberName)[0];
+  if (method !== undefined) return method;
+  return model.fields.lookupFieldByOwner(ownerDefId, memberName);
 }
 
 /**
  * Find a file-level def (top-of-module class / function / variable)
- * by `simpleName` — O(1) lookup via the pre-built
- * `defsByFileAndName` index.
+ * by simple name — consults the target file's Module scope's
+ * finalized bindings. Only defs bound at module-scope with
+ * `origin === 'local'` qualify, matching the historical
+ * "module-export-visible" semantics. Class methods and class-body
+ * fields bind at their containing class scope and are naturally
+ * excluded.
+ *
+ * Reads from `WorkspaceResolutionIndex.moduleScopeByFile` (scope-tied
+ * lookup that doesn't live on `SemanticModel`).
  */
 export function findExportedDef(
   targetFile: string,
   memberName: string,
   index: WorkspaceResolutionIndex,
 ): SymbolDefinition | undefined {
-  return index.defsByFileAndName.get(targetFile)?.get(memberName);
+  const moduleScope = index.moduleScopeByFile.get(targetFile);
+  if (moduleScope === undefined) return undefined;
+  const refs = moduleScope.bindings.get(memberName);
+  if (refs === undefined) return undefined;
+  for (const ref of refs) {
+    if (ref.origin === 'local') return ref.def;
+  }
+  return undefined;
 }
