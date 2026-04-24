@@ -56,6 +56,12 @@ function ensureHeap(): boolean {
 export interface AnalyzeOptions {
   force?: boolean;
   embeddings?: boolean;
+  /**
+   * Explicitly drop existing embeddings on rebuild instead of preserving
+   * them. Without this flag, a routine `analyze` keeps any embeddings
+   * already present in the index even when `--embeddings` is omitted.
+   */
+  dropEmbeddings?: boolean;
   skills?: boolean;
   verbose?: boolean;
   /** Skip AGENTS.md and CLAUDE.md gitnexus block updates. */
@@ -226,6 +232,7 @@ export const analyzeCommand = async (inputPath?: string, options?: AnalyzeOption
         // collision guard (see allowDuplicateName below).
         force: options?.force || options?.skills,
         embeddings: options?.embeddings,
+        dropEmbeddings: options?.dropEmbeddings,
         skipGit: options?.skipGit,
         skipAgentsMd: options?.skipAgentsMd,
         noStats: options?.noStats,
