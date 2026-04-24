@@ -271,3 +271,321 @@ describe('setupOpenCode — JSONC preservation', () => {
     await expect(fs.access(opencodeJsonPath())).rejects.toThrow();
   });
 });
+
+describe('setupCursor — JSONC preservation', () => {
+  let tempHome: string;
+  let originalHome: string | undefined;
+  let originalUserProfile: string | undefined;
+  let platformDescriptor: PropertyDescriptor | undefined;
+
+  const setPlatform = (value: NodeJS.Platform) => {
+    Object.defineProperty(process, 'platform', {
+      value,
+      configurable: true,
+    });
+  };
+
+  const cursorDir = () => path.join(tempHome, '.cursor');
+  const mcpPath = () => path.join(cursorDir(), 'mcp.json');
+
+  beforeEach(async () => {
+    vi.resetModules();
+    vi.clearAllMocks();
+
+    originalHome = process.env.HOME;
+    originalUserProfile = process.env.USERPROFILE;
+    tempHome = await fs.mkdtemp(path.join(os.tmpdir(), 'gn-cursor-jsonc-'));
+    process.env.HOME = tempHome;
+    process.env.USERPROFILE = tempHome;
+
+    await fs.mkdir(cursorDir(), { recursive: true });
+
+    platformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform');
+    setPlatform('linux');
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+
+    if (platformDescriptor) {
+      Object.defineProperty(process, 'platform', platformDescriptor);
+    }
+
+    process.env.HOME = originalHome;
+    process.env.USERPROFILE = originalUserProfile;
+    await fs.rm(tempHome, { recursive: true, force: true });
+  });
+
+  it('creates fresh mcp.json when missing', async () => {
+    const { setupCommand } = await import('../../src/cli/setup.js');
+    await setupCommand();
+
+    const raw = await fs.readFile(mcpPath(), 'utf-8');
+    const config = JSON.parse(raw);
+    expect(config.mcpServers.gitnexus).toBeDefined();
+  });
+
+  it('preserves existing mcpServers and comments', async () => {
+    const jsonc = `{
+  // my cursor config
+  "mcpServers": {
+    "other": { "command": "keep" }
+  }
+}`;
+    await fs.writeFile(mcpPath(), jsonc, 'utf-8');
+
+    const { setupCommand } = await import('../../src/cli/setup.js');
+    await setupCommand();
+
+    const raw = await fs.readFile(mcpPath(), 'utf-8');
+    expect(raw).toContain('my cursor config');
+    const config = parseJsonc(raw);
+    expect(config.mcpServers.other).toEqual({ command: 'keep' });
+    expect(config.mcpServers.gitnexus).toBeDefined();
+  });
+
+  it('does not wipe corrupt file', async () => {
+    const corrupt = '{ "mcpServers": broken';
+    await fs.writeFile(mcpPath(), corrupt, 'utf-8');
+
+    const { setupCommand } = await import('../../src/cli/setup.js');
+    await setupCommand();
+
+    const raw = await fs.readFile(mcpPath(), 'utf-8');
+    expect(raw).toBe(corrupt);
+  });
+});
+
+describe('setupClaudeCode — JSONC preservation', () => {
+  let tempHome: string;
+  let originalHome: string | undefined;
+  let originalUserProfile: string | undefined;
+  let platformDescriptor: PropertyDescriptor | undefined;
+
+  const setPlatform = (value: NodeJS.Platform) => {
+    Object.defineProperty(process, 'platform', {
+      value,
+      configurable: true,
+    });
+  };
+
+  const claudeDir = () => path.join(tempHome, '.claude');
+  const mcpPath = () => path.join(tempHome, '.claude.json');
+
+  beforeEach(async () => {
+    vi.resetModules();
+    vi.clearAllMocks();
+
+    originalHome = process.env.HOME;
+    originalUserProfile = process.env.USERPROFILE;
+    tempHome = await fs.mkdtemp(path.join(os.tmpdir(), 'gn-claude-jsonc-'));
+    process.env.HOME = tempHome;
+    process.env.USERPROFILE = tempHome;
+
+    await fs.mkdir(claudeDir(), { recursive: true });
+
+    platformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform');
+    setPlatform('linux');
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+
+    if (platformDescriptor) {
+      Object.defineProperty(process, 'platform', platformDescriptor);
+    }
+
+    process.env.HOME = originalHome;
+    process.env.USERPROFILE = originalUserProfile;
+    await fs.rm(tempHome, { recursive: true, force: true });
+  });
+
+  it('creates fresh .claude.json when missing', async () => {
+    const { setupCommand } = await import('../../src/cli/setup.js');
+    await setupCommand();
+
+    const raw = await fs.readFile(mcpPath(), 'utf-8');
+    const config = JSON.parse(raw);
+    expect(config.mcpServers.gitnexus).toBeDefined();
+  });
+
+  it('preserves existing keys and comments', async () => {
+    const jsonc = `{
+  // my claude config
+  "permissions": ["read"],
+  "mcpServers": {
+    "other": { "command": "keep" }
+  }
+}`;
+    await fs.writeFile(mcpPath(), jsonc, 'utf-8');
+
+    const { setupCommand } = await import('../../src/cli/setup.js');
+    await setupCommand();
+
+    const raw = await fs.readFile(mcpPath(), 'utf-8');
+    expect(raw).toContain('my claude config');
+    const config = parseJsonc(raw);
+    expect(config.permissions).toEqual(['read']);
+    expect(config.mcpServers.other).toEqual({ command: 'keep' });
+    expect(config.mcpServers.gitnexus).toBeDefined();
+  });
+
+  it('does not wipe corrupt file', async () => {
+    const corrupt = '{ "permissions": broken';
+    await fs.writeFile(mcpPath(), corrupt, 'utf-8');
+
+    const { setupCommand } = await import('../../src/cli/setup.js');
+    await setupCommand();
+
+    const raw = await fs.readFile(mcpPath(), 'utf-8');
+    expect(raw).toBe(corrupt);
+  });
+});
+
+describe('installClaudeCodeHooks — JSONC preservation', () => {
+  let tempHome: string;
+  let originalHome: string | undefined;
+  let originalUserProfile: string | undefined;
+  let platformDescriptor: PropertyDescriptor | undefined;
+
+  const setPlatform = (value: NodeJS.Platform) => {
+    Object.defineProperty(process, 'platform', {
+      value,
+      configurable: true,
+    });
+  };
+
+  const claudeDir = () => path.join(tempHome, '.claude');
+  const settingsPath = () => path.join(claudeDir(), 'settings.json');
+
+  beforeEach(async () => {
+    vi.resetModules();
+    vi.clearAllMocks();
+
+    originalHome = process.env.HOME;
+    originalUserProfile = process.env.USERPROFILE;
+    tempHome = await fs.mkdtemp(path.join(os.tmpdir(), 'gn-hooks-jsonc-'));
+    process.env.HOME = tempHome;
+    process.env.USERPROFILE = tempHome;
+
+    await fs.mkdir(claudeDir(), { recursive: true });
+
+    platformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform');
+    setPlatform('linux');
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+
+    if (platformDescriptor) {
+      Object.defineProperty(process, 'platform', platformDescriptor);
+    }
+
+    process.env.HOME = originalHome;
+    process.env.USERPROFILE = originalUserProfile;
+    await fs.rm(tempHome, { recursive: true, force: true });
+  });
+
+  it('creates fresh settings.json with hooks when missing', async () => {
+    const { setupCommand } = await import('../../src/cli/setup.js');
+    await setupCommand();
+
+    const raw = await fs.readFile(settingsPath(), 'utf-8');
+    const config = JSON.parse(raw);
+    expect(config.hooks.PreToolUse).toBeDefined();
+    expect(config.hooks.PostToolUse).toBeDefined();
+    expect(config.hooks.PreToolUse[0].matcher).toBe('Grep|Glob|Bash');
+  });
+
+  it('appends hooks to existing settings preserving comments', async () => {
+    const jsonc = `{
+  // my settings
+  "permissions": ["read"],
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "Write", "hooks": [{ "type": "command", "command": "other-hook" }] }
+    ]
+  }
+}`;
+    await fs.writeFile(settingsPath(), jsonc, 'utf-8');
+
+    const { setupCommand } = await import('../../src/cli/setup.js');
+    await setupCommand();
+
+    const raw = await fs.readFile(settingsPath(), 'utf-8');
+    expect(raw).toContain('my settings');
+    const config = parseJsonc(raw);
+    expect(config.permissions).toEqual(['read']);
+    expect(config.hooks.PreToolUse.length).toBe(2);
+    expect(config.hooks.PreToolUse[0].matcher).toBe('Write');
+    expect(config.hooks.PreToolUse[1].hooks[0].command).toContain('gitnexus-hook');
+    expect(config.hooks.PostToolUse).toBeDefined();
+  });
+
+  it('does not add duplicate gitnexus-hook entries', async () => {
+    const jsonc = JSON.stringify(
+      {
+        hooks: {
+          PreToolUse: [
+            {
+              matcher: 'Grep|Glob|Bash',
+              hooks: [{ type: 'command', command: 'node "gitnexus-hook.cjs"', timeout: 10 }],
+            },
+          ],
+          PostToolUse: [
+            {
+              matcher: 'Bash',
+              hooks: [{ type: 'command', command: 'node "gitnexus-hook.cjs"', timeout: 10 }],
+            },
+          ],
+        },
+      },
+      null,
+      2,
+    );
+    await fs.writeFile(settingsPath(), jsonc, 'utf-8');
+
+    const { setupCommand } = await import('../../src/cli/setup.js');
+    await setupCommand();
+
+    const raw = await fs.readFile(settingsPath(), 'utf-8');
+    const config = JSON.parse(raw);
+    expect(config.hooks.PreToolUse.length).toBe(1);
+    expect(config.hooks.PostToolUse.length).toBe(1);
+  });
+
+  it('does not wipe corrupt file', async () => {
+    const corrupt = '{ "hooks": broken';
+    await fs.writeFile(settingsPath(), corrupt, 'utf-8');
+
+    const { setupCommand } = await import('../../src/cli/setup.js');
+    await setupCommand();
+
+    const raw = await fs.readFile(settingsPath(), 'utf-8');
+    expect(raw).toBe(corrupt);
+  });
+
+  it('handles idempotency check with JSONC comments in settings', async () => {
+    const jsonc = `{
+  // settings comment
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "Grep|Glob|Bash", "hooks": [{ "type": "command", "command": "other-hook" }] }
+    ]
+  }
+}`;
+    await fs.writeFile(settingsPath(), jsonc, 'utf-8');
+
+    const { setupCommand } = await import('../../src/cli/setup.js');
+    await setupCommand();
+
+    const raw = await fs.readFile(settingsPath(), 'utf-8');
+    expect(raw).toContain('settings comment');
+    const config = parseJsonc(raw);
+    expect(config.hooks.PreToolUse.length).toBe(2);
+    expect(config.hooks.PostToolUse.length).toBe(1);
+  });
+});
