@@ -62,6 +62,14 @@ interface RunScopeResolutionInput {
    * is safe — falls back to a fresh parse inside the provider.
    */
   readonly treeCache?: { get(filePath: string): unknown };
+  /**
+   * Opaque per-language import-resolution config (e.g. tsconfig path
+   * aliases for TypeScript). Loaded once by the caller via
+   * `provider.loadResolutionConfig(repoPath)` and threaded into every
+   * `provider.resolveImportTarget` call. `undefined` when the
+   * provider doesn't supply a config loader.
+   */
+  readonly resolutionConfig?: unknown;
 }
 
 interface RunScopeResolutionStats {
@@ -135,10 +143,11 @@ export function runScopeResolution(
   const nodeLookup = buildGraphNodeLookup(graph);
   const mroByClassDefId = provider.buildMro(graph, parsedFiles, nodeLookup);
 
+  const resolutionConfig = input.resolutionConfig;
   const finalized = finalizeScopeModel(parsedFiles, {
     hooks: {
       resolveImportTarget: (targetRaw, fromFile) =>
-        provider.resolveImportTarget(targetRaw, fromFile, allFilePaths),
+        provider.resolveImportTarget(targetRaw, fromFile, allFilePaths, resolutionConfig),
       mergeBindings: (existing, incoming, scopeId) =>
         provider.mergeBindings(existing, incoming, scopeId),
     },
@@ -174,12 +183,17 @@ export function runScopeResolution(
     });
   }
 
+  const tFinalize = PROF ? process.hrtime.bigint() : 0n;
+
   // Cross-file return-type propagation (Contract Invariant I3 timing:
-  // after finalize, before resolve).
+  // after finalize, before resolve). Split-timed separately so the
+  // SCC-ordered pass's cost is observable (PR #1050 made this O(files)
+  // with chain-follow per importer; quadratic regressions show up
+  // here, not in finalize).
   if (provider.propagatesReturnTypesAcrossImports !== false) {
     propagateImportedReturnTypes(parsedFiles, indexes, workspaceIndex);
   }
-  const tFinalize = PROF ? process.hrtime.bigint() : 0n;
+  const tPropagate = PROF ? process.hrtime.bigint() : 0n;
 
   // ── Phase 3: resolve references via Registry.lookup ────────────────────
   const registryProviders: RegistryProviders = {
@@ -232,8 +246,9 @@ export function runScopeResolution(
     const ns = (a: bigint, b: bigint): number => Number(b - a) / 1_000_000;
     console.warn(
       `[scope-resolution prof] extract=${ns(tStart, tExtract).toFixed(0)}ms` +
-        ` finalize+propagate=${ns(tExtract, tFinalize).toFixed(0)}ms` +
-        ` resolve=${ns(tFinalize, tResolve).toFixed(0)}ms` +
+        ` finalize=${ns(tExtract, tFinalize).toFixed(0)}ms` +
+        ` propagate=${ns(tFinalize, tPropagate).toFixed(0)}ms` +
+        ` resolve=${ns(tPropagate, tResolve).toFixed(0)}ms` +
         ` emit=${ns(tResolve, tEnd).toFixed(0)}ms` +
         ` total=${ns(tStart, tEnd).toFixed(0)}ms` +
         ` (${parsedFiles.length} files)`,

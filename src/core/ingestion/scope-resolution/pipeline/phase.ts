@@ -126,12 +126,22 @@ export const scopeResolutionPhase: PipelinePhase<ScopeResolutionOutput> = {
         if (content !== undefined) files.push({ path: fp, content });
       }
 
+      // Load per-language import-resolution config (tsconfig paths,
+      // composer.json autoload, go.mod, ...). One I/O round trip per
+      // workspace pass — cached implicitly by the result handed to
+      // every `resolveImportTarget` call below.
+      const resolutionConfig =
+        provider.loadResolutionConfig !== undefined
+          ? await provider.loadResolutionConfig(ctx.repoPath)
+          : undefined;
+
       const stats = runScopeResolution(
         {
           graph: ctx.graph,
           model,
           files,
           treeCache: scopeTreeCache,
+          resolutionConfig,
           onWarn: (msg) => {
             if (isDev) console.warn(`[scope-resolution:${lang}] ${msg}`);
           },

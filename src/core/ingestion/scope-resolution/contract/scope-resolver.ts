@@ -88,14 +88,21 @@
  *     per-(caller, target) collapse semantics require multiple call
  *     sites in the same caller body not produce multiple edges.
  *
- *   - **I3 — `propagateImportedReturnTypes` mutation timing.** The
- *     pass mutates `Scope.typeBindings` (a plain `new Map(...)` from
+ *   - **I3 — `propagateImportedReturnTypes` mutation timing + ordering.**
+ *     The pass mutates `Scope.typeBindings` (a plain `new Map(...)` from
  *     `draftToScope`, NOT frozen). It MUST run AFTER `finalizeScopeModel`
  *     (so `indexes.bindings` is populated) and BEFORE
  *     `resolveReferenceSites` (so resolution sees the propagated types).
  *     The pass also re-runs `followChainPostFinalize` on every scope's
  *     typeBindings because scope-extractor's pass-4 already ran and
  *     missed any chain whose terminal lives in a foreign file.
+ *     Within the pass, files are walked in `indexes.sccs` reverse-
+ *     topological order (leaves first) so multi-hop alias chains
+ *     (e.g. `models.User → service.user → app.user`) collapse to the
+ *     terminal class in a single pass — every importer sees its
+ *     source's already-chain-followed typeBindings. Cyclic SCCs reach
+ *     a partial fixpoint within a single pass without iterating to
+ *     convergence; `ts-circular` only asserts pipeline-no-throw.
  *
  *   - **I4 — `emitReceiverBoundCalls` case order.** Cases are evaluated
  *     in this order; the FIRST that emits an edge wins:
@@ -264,12 +271,38 @@ export interface ScopeResolver {
    * resolvers that must distinguish "this module exists in the repo"
    * from "this module is external" (Python's fallback resolver, for
    * example).
+   *
+   * `resolutionConfig` is the opaque value returned by
+   * `loadResolutionConfig` (loaded once per workspace pass by the
+   * orchestrator). TypeScript uses this to thread `tsconfig.json` path
+   * aliases through to the standard resolver. Languages that don't
+   * need any extra config ignore the parameter.
    */
   resolveImportTarget(
     targetRaw: string,
     fromFile: string,
     allFilePaths: ReadonlySet<string>,
+    resolutionConfig?: unknown,
   ): string | null;
+
+  /**
+   * Optional one-shot loader for cross-file import-resolution config
+   * (e.g. tsconfig path aliases for TypeScript, go.mod paths for Go,
+   * composer.json autoload for PHP). The orchestrator calls this once
+   * per workspace pass with the repo root and threads the result into
+   * every subsequent `resolveImportTarget` call as the
+   * `resolutionConfig` parameter.
+   *
+   * Languages that don't need any per-workspace config leave this
+   * undefined; the orchestrator threads `undefined` to
+   * `resolveImportTarget` in that case. Returning `null` is also
+   * supported and equivalent to "no config available".
+   *
+   * May be sync or async — the orchestrator awaits the result. The
+   * shape is opaque to the orchestrator (`unknown`); the per-language
+   * `resolveImportTarget` casts it to the language's expected shape.
+   */
+  loadResolutionConfig?(repoPath: string): Promise<unknown> | unknown;
 
   /**
    * Per-scope binding-merge precedence. The shared finalize pass
