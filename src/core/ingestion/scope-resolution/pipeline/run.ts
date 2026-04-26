@@ -27,6 +27,7 @@ import type { ParsedFile, RegistryProviders } from 'gitnexus-shared';
 import type { KnowledgeGraph } from '../../../graph/types.js';
 import type { MutableSemanticModel, SemanticModel } from '../../model/semantic-model.js';
 import { reconcileOwnership, validateOwnershipParity } from './reconcile-ownership.js';
+import { validateBindingsImmutability } from './validate-bindings-immutability.js';
 import { extractParsedFile } from '../../scope-extractor-bridge.js';
 import { finalizeScopeModel } from '../../finalize-orchestrator.js';
 import { resolveReferenceSites, type ResolveStats } from '../../resolve-references.js';
@@ -174,6 +175,8 @@ export function runScopeResolution(
   // Cross-file implicit-namespace visibility (C#). Must run before
   // propagateImportedReturnTypes so the latter pass sees siblings'
   // class bindings when chasing return-type chains across files.
+  // The hook writes to `bindingAugmentations` only; finalized
+  // `indexes.bindings` remains immutable post-finalize (I8).
   if (provider.populateNamespaceSiblings !== undefined) {
     const fileContents = new Map<string, string>();
     for (const f of files) fileContents.set(f.path, f.content);
@@ -194,6 +197,14 @@ export function runScopeResolution(
     propagateImportedReturnTypes(parsedFiles, indexes, workspaceIndex);
   }
   const tPropagate = PROF ? process.hrtime.bigint() : 0n;
+
+  // Opt-in I8 invariant guard. Runs once after all post-finalize hooks
+  // (`populateNamespaceSiblings`, `propagateImportedReturnTypes`) have
+  // had a chance to drift, so a single sweep covers the full
+  // post-finalize surface visible to `resolveReferenceSites`. No-op in
+  // default CLI runs; enabled by NODE_ENV=development or
+  // VALIDATE_SEMANTIC_MODEL=1.
+  validateBindingsImmutability(indexes, onWarn);
 
   // ── Phase 3: resolve references via Registry.lookup ────────────────────
   const registryProviders: RegistryProviders = {

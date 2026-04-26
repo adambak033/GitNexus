@@ -37,6 +37,24 @@ describe('emitTsScopeCaptures — scopes', () => {
     expect(all.some((t) => t.includes('@scope.module'))).toBe(true);
   });
 
+  it('parses large cache-miss files with the adaptive tree-sitter buffer', () => {
+    const padding = 'x'.repeat(600 * 1024);
+    const match = findMatch(`// ${padding}\nclass Big { afterPadding(): void {} }`, (t) =>
+      t.includes('@declaration.method'),
+    );
+    expect(match).toBeDefined();
+    expect(match!['@declaration.name'].text).toBe('afterPadding');
+  });
+
+  it('parses UTF-8-heavy cache-miss files with a byte-sized buffer', () => {
+    const padding = '漢'.repeat(190_000);
+    const match = findMatch(`// ${padding}\nclass Big { afterPadding(): void {} }`, (t) =>
+      t.includes('@declaration.method'),
+    );
+    expect(match).toBeDefined();
+    expect(match!['@declaration.name'].text).toBe('afterPadding');
+  });
+
   it('captures internal_module as @scope.namespace', () => {
     const all = tagsFor('namespace Foo { class A { } }');
     expect(all.some((t) => t.includes('@scope.namespace'))).toBe(true);
