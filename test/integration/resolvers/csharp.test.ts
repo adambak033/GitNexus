@@ -2535,3 +2535,50 @@ describe('C# frozen-binding collision via using-import (issue #1066 companion)',
     expect(ctor!.targetFilePath).toBe('App/Program.cs');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Issue #1086 regression: when a C# file consists of a single top-level
+// namespace_declaration that ends exactly at EOF (no trailing newline,
+// no leading content outside the namespace block), tree-sitter-c-sharp
+// reports identical ranges for `compilation_unit` and `namespace_declaration`.
+// Pre-fix, scope-extractor's parent-finder relied on strict containment, so
+// the Module was popped off the stack and the Namespace ended up with
+// parent=null → ScopeTreeInvariantError → scopeResolution silently aborted
+// for the file (extractParsedFile swallows). Post-fix, `canParentScope`
+// allows a same-range Module to keep parenthood, so extraction completes
+// and the file's symbols stay reachable to the cross-file resolver.
+//
+// Hit on real PersistentWindows .Designer.cs files. The fixture mirrors
+// that shape minimally — both files end on the closing `}` with no
+// trailing newline.
+// ---------------------------------------------------------------------------
+
+describe('C# namespace-as-root with no trailing newline (issue #1086)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'csharp-namespace-as-root-no-trailing-newline'),
+      () => {},
+      { workerThresholdsForTest: { minFiles: 1, minBytes: 0 } },
+    );
+  }, 60000);
+
+  it('completes scope extraction for both files (no Namespace-as-root abort)', () => {
+    expect(getNodesByLabel(result, 'Class')).toEqual(expect.arrayContaining(['User', 'Program']));
+  });
+
+  it('emits the using-import edge App/Program.cs -> Models/User.cs through the scope-resolution path', () => {
+    // The `csharp-scope: using` reason on the IMPORTS edge is the signal
+    // that scope-resolution drove the resolution (not the legacy DAG
+    // fallback). Pre-fix, Models/User.cs aborted in scope-extractor and
+    // the only IMPORTS edge available — if any — would have come from a
+    // path with a different reason tag, or be missing entirely.
+    const imports = getRelationships(result, 'IMPORTS');
+    const edge = imports.find(
+      (e) => e.sourceFilePath === 'App/Program.cs' && e.targetFilePath === 'Models/User.cs',
+    );
+    expect(edge).toBeDefined();
+    expect(edge!.rel.reason).toBe('csharp-scope: using');
+  });
+});
