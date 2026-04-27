@@ -2485,3 +2485,50 @@ describe('C# large-file + frozen-bucket regression (issue #1066)', () => {
     expect(['import-resolved', 'global']).toContain(save!.rel.reason);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Issue #1066 companion regression: small-file trigger for the same
+// frozen-bucket failure. Where csharp-large-cache-miss-resolution exercises
+// the path through tree-sitter cache-miss reparse on >32 KB files, this
+// fixture trips the same `Object.freeze` contract on the populator's
+// namespace-import loop in a single small file pair: the importer locally
+// declares a class with the same simple name as a sibling reachable through
+// `using`, so the extractor pre-populates (and freezes) `User` in the
+// importer's Module bindings before populateNamespaceSiblings tries to
+// append the cross-file `Collision.Models.User`. Pre-#1082 the populator
+// pushed onto the frozen array → "Cannot add property N, object is not
+// extensible" → whole scopeResolution phase aborted. Post-#1082 the
+// augmentation channel keeps both bindings visible to readers, with the
+// local `Collision.App.User` taking precedence per origin ordering.
+// ---------------------------------------------------------------------------
+
+describe('C# frozen-binding collision via using-import (issue #1066 companion)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'csharp-frozen-binding-collision'),
+      () => {},
+    );
+  }, 60000);
+
+  it('completes scopeResolution without throwing on the colliding bucket', () => {
+    expect(getNodesByLabel(result, 'Class')).toEqual(expect.arrayContaining(['User', 'Program']));
+  });
+
+  it('detects both User declarations across the two namespaces', () => {
+    const users = getNodesByLabelFull(result, 'Class').filter((n) => n.name === 'User');
+    expect(users.length).toBe(2);
+    const paths = users.map((u) => u.properties.filePath).sort();
+    expect(paths).toEqual(['App/Program.cs', 'Models/User.cs']);
+  });
+
+  it('resolves Program.Run -> local Collision.App.User constructor (origin:local shadows namespace)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const ctor = calls.find(
+      (c) => c.source === 'Run' && c.target === 'User' && c.targetLabel === 'Class',
+    );
+    expect(ctor).toBeDefined();
+    expect(ctor!.targetFilePath).toBe('App/Program.cs');
+  });
+});
