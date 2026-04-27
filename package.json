@@ -35,7 +35,8 @@
     "hooks",
     "scripts",
     "skills",
-    "vendor"
+    "vendor",
+    "web"
   ],
   "scripts": {
     "build": "node scripts/build.js",
