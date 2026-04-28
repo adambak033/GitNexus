@@ -136,25 +136,37 @@ const TYPESCRIPT_SCOPE_QUERY = `
 ;; Arrow/function-expression assigned to a const/let/var — named by the
 ;; variable_declarator. Covers \`const fn = () => {}\` and its export
 ;; variant. Matches the legacy TYPESCRIPT_QUERIES pattern.
+;;
+;; The \`@declaration.function\` anchor sits on the INNER arrow_function /
+;; function_expression node (NOT the wrapping lexical_declaration), so
+;; \`anchor.range\` aligns with the corresponding \`@scope.function\` scope
+;; range. \`pass2AttachDeclarations\` then resolves \`innermost\` to the
+;; arrow's own scope (instead of the module scope) and the def is owned
+;; by the arrow itself. Without this alignment, calls inside the arrow
+;; body lose caller attribution: \`resolveCallerGraphId\` walks up past
+;; the empty arrow scope into the module scope and grabs whichever
+;; Function-like def appears first there — silently mis-attributing
+;; every nested call (Zustand stores, TanStack hooks, Promise-all/map,
+;; etc.). See \`typescript-hof-callbacks.test.ts\`.
 (lexical_declaration
   (variable_declarator
     name: (identifier) @declaration.name
-    value: (arrow_function))) @declaration.function
+    value: (arrow_function) @declaration.function))
 
 (lexical_declaration
   (variable_declarator
     name: (identifier) @declaration.name
-    value: (function_expression))) @declaration.function
+    value: (function_expression) @declaration.function))
 
 (variable_declaration
   (variable_declarator
     name: (identifier) @declaration.name
-    value: (arrow_function))) @declaration.function
+    value: (arrow_function) @declaration.function))
 
 (variable_declaration
   (variable_declarator
     name: (identifier) @declaration.name
-    value: (function_expression))) @declaration.function
+    value: (function_expression) @declaration.function))
 
 ;; Method definitions — regular + private (#field) methods.
 (method_definition
@@ -723,6 +735,53 @@ const TYPESCRIPT_SCOPE_QUERY = `
   property: (property_identifier) @reference.name) @reference.read.member
 `;
 
+/**
+ * JSX-only query suffix. Appended to the base query when compiling
+ * against the TSX grammar; NOT compiled against the plain TS grammar
+ * (which has no \`jsx_*\` node types and would reject these patterns).
+ *
+ * Why JSX as a CALLS edge: \`<Foo />\` is syntactic sugar for \`Foo(props)\`
+ * and the React component is invoked by the renderer, so for blast-radius
+ * (\`gitnexus_impact("Badge", direction: "upstream")\`) and call-graph
+ * (\`gitnexus_context("Foo")\`) purposes JSX usage IS a call. Routing
+ * through \`@reference.call.free\` / \`@reference.call.member\` makes the
+ * downstream caller-walk + edge-emission paths handle JSX uniformly with
+ * ordinary call expressions — no new edge type, no schema changes.
+ *
+ * Identifier-only JSX is filtered to PascalCase via \`(#match? ... "^[A-Z]")\`
+ * so \`<div>\`, \`<span>\`, \`<button>\` and other native HTML elements (which
+ * by JSX convention start lowercase) don't emit edges to nonexistent
+ * "div" / "span" symbols. Member-form JSX (\`<Foo.Bar />\`) is always a
+ * component (HTML element names can't contain dots), so no predicate
+ * filter is applied there.
+ *
+ * Both \`jsx_self_closing_element\` (\`<Foo />\`) and \`jsx_opening_element\`
+ * (\`<Foo>...</Foo>\`) emit; the closing tag is intentionally NOT captured —
+ * each JSX element should emit exactly one CALLS edge per use site.
+ */
+const TSX_JSX_QUERY_SUFFIX = `
+;; <Foo />
+((jsx_self_closing_element
+  name: (identifier) @reference.name) @reference.call.free
+  (#match? @reference.name "^[A-Z]"))
+
+;; <Foo> ... </Foo>  (paired form — match the opening tag only)
+((jsx_opening_element
+  name: (identifier) @reference.name) @reference.call.free
+  (#match? @reference.name "^[A-Z]"))
+
+;; <Foo.Bar />  /  <Container.Section.Title />  — namespaced JSX
+(jsx_self_closing_element
+  name: (member_expression
+    object: (_) @reference.receiver
+    property: (property_identifier) @reference.name)) @reference.call.member
+
+(jsx_opening_element
+  name: (member_expression
+    object: (_) @reference.receiver
+    property: (property_identifier) @reference.name)) @reference.call.member
+`;
+
 let _tsParser: Parser | null = null;
 let _tsxParser: Parser | null = null;
 let _tsQuery: Parser.Query | null = null;
@@ -753,11 +812,21 @@ export function getTsParser(filePath?: string): Parser {
  * executed against a Tree produced by the `tsx` grammar — tree-sitter
  * matches by node-type id, and the two grammars have separate id
  * spaces.
+ *
+ * The TSX query is compiled with the JSX-as-call patterns appended.
+ * Those patterns reference `jsx_self_closing_element` /
+ * `jsx_opening_element` which exist only in the TSX grammar — embedding
+ * them in the plain TS query would throw `Query.InvalidNodeType` at
+ * compile time (and even if it didn't, the patterns would never fire on
+ * `.ts` source).
  */
 export function getTsScopeQuery(filePath?: string): Parser.Query {
   if (filePath !== undefined && isTsxFile(filePath)) {
     if (_tsxQuery === null) {
-      _tsxQuery = new Parser.Query(TSX_GRAMMAR, TYPESCRIPT_SCOPE_QUERY);
+      _tsxQuery = new Parser.Query(
+        TSX_GRAMMAR,
+        TYPESCRIPT_SCOPE_QUERY + TSX_JSX_QUERY_SUFFIX,
+      );
     }
     return _tsxQuery;
   }

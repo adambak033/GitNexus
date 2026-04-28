@@ -84,6 +84,11 @@ function pickFirstDefined(grouped: CaptureMatch, tags: readonly string[]): Captu
  *      as `@reference.write.member`).
  *   4. The member_expression is the `function:` of an `await_expression`
  *      being called (handled by the member-call capture).
+ *   5. The member_expression is the `name:` of a `jsx_self_closing_element`
+ *      or `jsx_opening_element` (it's a JSX component invocation, already
+ *      captured as `@reference.call.member` by the TSX-only query suffix).
+ *      Without this filter, `<Foo.Bar />` would emit a phantom ACCESSES
+ *      edge to `Foo.Bar` IN ADDITION to the CALLS edge.
  *
  * Returns `true` when the capture should be kept as a read reference,
  * `false` when it should be dropped.
@@ -99,6 +104,9 @@ function shouldEmitReadMember(memberNode: SyntaxNode): boolean {
     case 'assignment_expression':
     case 'augmented_assignment_expression':
       return parent.childForFieldName('left')?.id !== memberNode.id;
+    case 'jsx_self_closing_element':
+    case 'jsx_opening_element':
+      return parent.childForFieldName('name')?.id !== memberNode.id;
     default:
       return true;
   }
