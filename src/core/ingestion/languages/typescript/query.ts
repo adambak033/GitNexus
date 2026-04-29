@@ -156,6 +156,27 @@ const TYPESCRIPT_SCOPE_QUERY = `
     name: (identifier) @declaration.name
     value: (function_expression))) @declaration.function
 
+;; Object-property arrows / function expressions named by their pair key:
+;; \`{ addItem: (item) => ... }\`. The legacy TYPESCRIPT_QUERIES emits the
+;; same shape; mirroring it here keeps scope-resolution declarations in
+;; sync (issue #1166). Computed keys (\`[K]: () => ...\`) intentionally
+;; fall through anonymous.
+(pair
+  key: (property_identifier) @declaration.name
+  value: (arrow_function)) @declaration.function
+
+(pair
+  key: (property_identifier) @declaration.name
+  value: (function_expression)) @declaration.function
+
+(pair
+  key: (string (string_fragment) @declaration.name)
+  value: (arrow_function)) @declaration.function
+
+(pair
+  key: (string (string_fragment) @declaration.name)
+  value: (function_expression)) @declaration.function
+
 ;; Method definitions — regular + private (#field) methods.
 (method_definition
   name: (property_identifier) @declaration.name) @declaration.method
