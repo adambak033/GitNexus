@@ -35,10 +35,7 @@ describe('TypeScript JSX-as-call CALLS edges', () => {
   let result: PipelineResult;
 
   beforeAll(async () => {
-    result = await runPipelineFromRepo(
-      path.join(FIXTURES, 'typescript-jsx-as-call'),
-      () => {},
-    );
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'typescript-jsx-as-call'), () => {});
   }, 60000);
 
   it('self-closing <Foo /> emits useFoo → Foo', () => {
@@ -110,14 +107,22 @@ describe('TypeScript JSX-as-call CALLS edges', () => {
     expect(accesses).toEqual([]);
   });
 
-  it('combined HOF + JSX: const Wrapped = () => <Foo /> emits Wrapped → Foo', () => {
+  it('combined HOF + JSX: const Wrapped = () => <Foo /> emits exactly one Wrapped → Foo', () => {
     // Probes the interaction between the HOF-callback caller-attribution
     // fix and the JSX-as-call fix. Pre-this-PR: caller mis-attribution
     // (HOF bug) plus invisible JSX (this fix's bug) both broke this
     // case. Post-PR: both are fixed and the edge lands.
+    //
+    // Asserts EXACTLY ONE edge: a single self-closing `<Foo />` is one
+    // logical invocation. If the JSX query suffix ever accidentally
+    // double-matched the same site (e.g. both
+    // `jsx_self_closing_element` and a generic call pattern firing, or
+    // both an opening-tag and a closing-tag capture), this would catch
+    // the regression — duplicate CALLS edges silently inflate
+    // blast-radius counts in `gitnexus_impact`.
     const calls = getRelationships(result, 'CALLS').filter(
       (c) => c.source === 'Wrapped' && c.target === 'Foo',
     );
-    expect(calls.length).toBeGreaterThan(0);
+    expect(calls).toHaveLength(1);
   });
 });

@@ -48,10 +48,7 @@ describe('TypeScript HOF-callback CALLS edges', () => {
   let result: PipelineResult;
 
   beforeAll(async () => {
-    result = await runPipelineFromRepo(
-      path.join(FIXTURES, 'typescript-hof-callbacks'),
-      () => {},
-    );
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'typescript-hof-callbacks'), () => {});
   }, 60000);
 
   it('control: direct (x) => transform(x) emits direct → transform', () => {
@@ -108,21 +105,30 @@ describe('TypeScript HOF-callback CALLS edges', () => {
     expect(fromCreate, 'create() must not be a phantom caller').toEqual([]);
   });
 
-  it('Zustand call expressions are attributable (to File or absent — never to a wrong sibling)', () => {
-    // The complement check: if any CALLS edge is emitted for the
-    // module-scope calls in store.ts, its source must be either
-    // `store.ts` (the File fallback) or undefined. We accept zero
-    // edges here as a valid outcome; the strict assertion is the
-    // anti-self-loop one above.
+  it('Zustand module-level calls source from the File node (not a sibling Function)', () => {
+    // The positive complement to the anti-self-loop assertion above:
+    // module-level calls in `store.ts` (`create()`, `devtools(...)`,
+    // `persist(...)`) MUST attribute to the `File` node — that's the
+    // entire point of `isCallerAnchorLabel` excluding `Variable` from
+    // the caller-walk fallback. If the fix regresses (Variable defs
+    // re-enter the fallback, or the walk-up grabs a sibling Function),
+    // the source would change away from `File:store.ts`.
+    //
+    // Earlier formulation iterated `for (c of calls)` and asserted each
+    // edge sourced from File. That passed VACUOUSLY when `calls` was
+    // empty — any change that silenced ALL CALLS edges from `store.ts`
+    // would have slipped through. The structural assertion below is
+    // explicit: at least one File-rooted edge must exist (proving the
+    // fallback fired), and no edge may source from anything else
+    // (proving the fallback fired EXCLUSIVELY, not as one option
+    // alongside a buggy sibling-Function attribution).
     const calls = getRelationships(result, 'CALLS').filter(
       (c) => c.sourceFilePath === 'src/store.ts',
     );
-    for (const c of calls) {
-      // Source must NOT be a sibling local Function. The only
-      // acceptable source for module-level calls in store.ts is the
-      // File node itself (label 'File', name 'store.ts').
-      expect([c.sourceLabel, c.source]).toEqual(['File', 'store.ts']);
-    }
+    const fromFile = calls.filter((c) => c.sourceLabel === 'File' && c.source === 'store.ts');
+    const fromOther = calls.filter((c) => !(c.sourceLabel === 'File' && c.source === 'store.ts'));
+    expect(fromOther, 'no module-level call may attribute to a non-File source').toEqual([]);
+    expect(fromFile.length, 'at least one File-rooted call edge must exist').toBeGreaterThan(0);
   });
 
   it('transform is reachable from at least 3 of {direct, fanOut, wrap}', () => {

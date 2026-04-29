@@ -823,10 +823,7 @@ export function getTsParser(filePath?: string): Parser {
 export function getTsScopeQuery(filePath?: string): Parser.Query {
   if (filePath !== undefined && isTsxFile(filePath)) {
     if (_tsxQuery === null) {
-      _tsxQuery = new Parser.Query(
-        TSX_GRAMMAR,
-        TYPESCRIPT_SCOPE_QUERY + TSX_JSX_QUERY_SUFFIX,
-      );
+      _tsxQuery = new Parser.Query(TSX_GRAMMAR, TYPESCRIPT_SCOPE_QUERY + TSX_JSX_QUERY_SUFFIX);
     }
     return _tsxQuery;
   }
