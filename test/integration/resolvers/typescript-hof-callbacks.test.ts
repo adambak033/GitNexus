@@ -68,9 +68,24 @@ describe('TypeScript HOF-callback CALLS edges', () => {
     expect(edgeSet(calls)).toContain('wrap → transform');
   });
 
-  it('useQuery({ queryFn: () => fetchData() }) emits useFeature → fetchData (call inside queryFn callback)', () => {
+  it('useQuery({ queryFn: () => fetchData() }) emits queryFn → fetchData (call inside named pair-arrow)', () => {
+    // The structurally correct attribution: `fetchData()` is called
+    // from inside the named pair-arrow `queryFn: () => fetchData()`.
+    // After moving `@declaration.function` to the inner arrow (mirroring
+    // the `lexical_declaration` fix), the pair-arrow becomes its own
+    // caller anchor — `resolveCallerGraphId`'s walk-up stops at
+    // `queryFn`'s scope rather than continuing into `useFeature`'s.
+    //
+    // Pre-fix this test asserted `useFeature → fetchData` because the
+    // pair pattern's `@declaration.function` anchor was on the outer
+    // `pair`, sending `queryFn`'s def into `useFeature`'s `ownedDefs`
+    // and bypassing `queryFn` as a caller anchor. That attribution
+    // was wrong twice over: it crossed a syntactic function boundary
+    // (the arrow body), and it depended on the pair-pattern bug to
+    // reroute the walk. Edges that capture intent should follow the
+    // syntax tree.
     const calls = getRelationships(result, 'CALLS').filter((c) => c.target === 'fetchData');
-    expect(edgeSet(calls)).toContain('useFeature → fetchData');
+    expect(edgeSet(calls)).toContain('queryFn → fetchData');
   });
 
   it('useQuery({ queryFn: () => fetchData() }) emits useFeature → useQuery (direct call in body)', () => {
@@ -143,5 +158,88 @@ describe('TypeScript HOF-callback CALLS edges', () => {
     expect(callers).toContain('direct');
     expect(callers).toContain('fanOut');
     expect(callers).toContain('wrap');
+  });
+
+  // ─────────────────────────────────────────────────────────────────
+  // Multi-pair object literal — regression case the single-pair `bump`
+  // fixture in `store.ts` masked. See `multi-action-store.ts` and the
+  // anchor-discipline comment in `query.ts` above the four pair-with-
+  // arrow patterns. PR #1175 review (medium finding) flagged this.
+  // ─────────────────────────────────────────────────────────────────
+
+  it('multi-action store: addItem → doA (calls inside addItem attribute to addItem, not first sibling)', () => {
+    // The diagnostic test for the pair-anchor fix. With the broken
+    // anchor (on outer `pair`), all three pair-function defs (addItem,
+    // removeItem, fetchData) landed in the same `(set) => ({...})`
+    // callback's `ownedDefs`, and `resolveCallerGraphId.ownedDefs.find()`
+    // returned the FIRST one — `addItem` — for every walk-up. So
+    // calls inside `removeItem` and `fetchData` got mis-attributed.
+    //
+    // After the fix, each pair-arrow gets its def in its OWN arrow
+    // scope's `ownedDefs`; the walk-up stops one level earlier and
+    // resolves to the correct sibling.
+    const calls = getRelationships(result, 'CALLS').filter(
+      (c) => c.sourceFilePath === 'src/multi-action-store.ts',
+    );
+    const fromAddItem = calls.filter((c) => c.source === 'addItem' && c.target === 'doA');
+    expect(fromAddItem.length, 'addItem must call doA').toBeGreaterThan(0);
+  });
+
+  it('multi-action store: removeItem → doB (NOT addItem → doB)', () => {
+    // The exact regression fingerprint. Pre-fix, `removeItem`'s body
+    // would attribute its `doB(item)` call to `addItem` (the first
+    // pair-function def in the parent `(set) => ({...})` scope),
+    // producing the bogus edge `addItem → doB` and zero outgoing
+    // edges from `removeItem`. The negative + positive assertion
+    // pinpoints both halves: no mis-attribution AND a real edge.
+    const calls = getRelationships(result, 'CALLS').filter(
+      (c) => c.sourceFilePath === 'src/multi-action-store.ts' && c.target === 'doB',
+    );
+    const fromRemoveItem = calls.filter((c) => c.source === 'removeItem');
+    const fromAddItem = calls.filter((c) => c.source === 'addItem');
+    expect(
+      fromAddItem,
+      'doB must NOT be attributed to addItem (mis-attribution regression)',
+    ).toEqual([]);
+    expect(fromRemoveItem.length, 'removeItem must call doB').toBeGreaterThan(0);
+  });
+
+  it('multi-action store: fetchData → doC (third action also attributes correctly)', () => {
+    // Three actions in the same object guarantees the `find()`-returns-
+    // first defect would mis-attribute fetchData's call. With the fix,
+    // each action's body is its own caller anchor.
+    const calls = getRelationships(result, 'CALLS').filter(
+      (c) => c.sourceFilePath === 'src/multi-action-store.ts' && c.target === 'doC',
+    );
+    const fromFetch = calls.filter((c) => c.source === 'fetchData');
+    const fromAddItem = calls.filter((c) => c.source === 'addItem');
+    expect(fromAddItem, 'doC must NOT be attributed to addItem').toEqual([]);
+    expect(fromFetch.length, 'fetchData must call doC').toBeGreaterThan(0);
+  });
+
+  it('multi-action store: each action attributes calls to itself (no cross-sibling leakage)', () => {
+    // Whole-of-fixture invariant: the set of (source, target) pairs
+    // for the three action calls must be exactly {addItem→doA,
+    // removeItem→doB, fetchData→doC}. No sibling leakage allowed.
+    const calls = getRelationships(result, 'CALLS').filter(
+      (c) =>
+        c.sourceFilePath === 'src/multi-action-store.ts' &&
+        ['doA', 'doB', 'doC'].includes(c.target as string),
+    );
+    const pairs = new Set(calls.map((c) => `${c.source} → ${c.target}`));
+    expect(pairs).toContain('addItem → doA');
+    expect(pairs).toContain('removeItem → doB');
+    expect(pairs).toContain('fetchData → doC');
+    // No cross-attribution like `addItem → doB`, `addItem → doC`, etc.
+    const crossLeaks = [...pairs].filter(
+      (p) =>
+        p === 'addItem → doB' ||
+        p === 'addItem → doC' ||
+        p === 'removeItem → doA' ||
+        p === 'removeItem → doC' ||
+        p === 'fetchData → doA' ||
+        p === 'fetchData → doB',
+    );
+    expect(crossLeaks, 'no pair-arrow may attribute calls to a sibling action').toEqual([]);
   });
 });

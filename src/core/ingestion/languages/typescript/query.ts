@@ -169,25 +169,50 @@ const TYPESCRIPT_SCOPE_QUERY = `
     value: (function_expression) @declaration.function))
 
 ;; Object-property arrows / function expressions named by their pair key:
-;; \`{ addItem: (item) => ... }\`. The legacy TYPESCRIPT_QUERIES emits the
-;; same shape; mirroring it here keeps scope-resolution declarations in
-;; sync (issue #1166). Computed keys (\`[K]: () => ...\`) intentionally
-;; fall through anonymous.
+;; \`{ addItem: (item) => ..., removeItem: (item) => ... }\`. The legacy
+;; TYPESCRIPT_QUERIES emits the same shape; mirroring it here keeps
+;; scope-resolution declarations in sync (issue #1166). Computed keys
+;; (\`[K]: () => ...\`) intentionally fall through anonymous.
+;;
+;; Same anchor discipline as the \`lexical_declaration\` block above: the
+;; \`@declaration.function\` capture must sit on the INNER \`arrow_function\`
+;; / \`function_expression\` node — NOT the outer \`pair\`. The pair node
+;; starts at the property-key token, BEFORE the arrow's
+;; \`@scope.function\` range. \`pass2AttachDeclarations.atPosition(pair.startLine,
+;; pair.startCol)\` therefore resolves to the PARENT scope (the enclosing
+;; function-like, e.g. the \`(set) => ({...})\` callback in
+;; \`persist((set) => ({...}))\`), not the inner arrow's own scope.
+;;
+;; With the anchor on \`pair\`, ALL pair-function defs from the same object
+;; literal land in the same parent scope's \`ownedDefs\`. \`resolveCallerGraphId\`
+;; walking up from a call inside any of those arrows then matches the
+;; FIRST Function-like def via \`ownedDefs.find()\` — silently mis-attributing
+;; every call to the first sibling. Multi-action Zustand stores
+;; (\`{ addItem, removeItem, fetchData, … }\`) — the dominant 0%-capture
+;; pattern in the bug report — would land all calls on \`addItem\`.
+;;
+;; With the anchor on the inner \`arrow_function\` / \`function_expression\`,
+;; \`anchor.range\` matches the arrow's own \`@scope.function\` range; the
+;; def lands in the arrow scope's own \`ownedDefs\` and \`pass2AttachDeclarations\`'s
+;; auto-hoist (\`rangesEqual(anchor.range, innermost.range)\`) promotes
+;; the BINDING to the parent scope (so importers and lookups still find
+;; the name in the object's surrounding scope). Each pair-arrow becomes
+;; an independent caller anchor in the walk.
 (pair
   key: (property_identifier) @declaration.name
-  value: (arrow_function)) @declaration.function
+  value: (arrow_function) @declaration.function)
 
 (pair
   key: (property_identifier) @declaration.name
-  value: (function_expression)) @declaration.function
+  value: (function_expression) @declaration.function)
 
 (pair
   key: (string (string_fragment) @declaration.name)
-  value: (arrow_function)) @declaration.function
+  value: (arrow_function) @declaration.function)
 
 (pair
   key: (string (string_fragment) @declaration.name)
-  value: (function_expression)) @declaration.function
+  value: (function_expression) @declaration.function)
 
 ;; Method definitions — regular + private (#field) methods.
 (method_definition
