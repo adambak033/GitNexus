@@ -105,9 +105,7 @@ const tsExtractFunctionName = (
     }
     if (keyNode.type === 'string') {
       // `"add-item": () => ...` — the literal text inside the quotes.
-      const fragment = keyNode.children?.find(
-        (c: SyntaxNode) => c.type === 'string_fragment',
-      );
+      const fragment = keyNode.children?.find((c: SyntaxNode) => c.type === 'string_fragment');
       const text = fragment?.text ?? null;
       return { funcName: text, label: 'Function' };
     }
