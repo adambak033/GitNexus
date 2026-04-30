@@ -73,7 +73,7 @@ export default defineConfig({
         extends: true,
         test: {
           name: 'default',
-          sequence: { groupOrder: 2 },
+          sequence: { groupOrder: 3 },
           include: ['test/**/*.test.ts'],
           exclude: [
             'test/integration/lbug-core-adapter.test.ts',
@@ -91,7 +91,17 @@ export default defineConfig({
             'test/integration/shape-check-regression.test.ts',
             'test/integration/java-class-impact.test.ts',
             'test/integration/class-impact-all-languages.test.ts',
+            'test/integration/skills-e2e.test.ts',
           ],
+        },
+      },
+      {
+        extends: true,
+        test: {
+          name: 'cli-e2e',
+          include: ['test/integration/skills-e2e.test.ts'],
+          fileParallelism: false,
+          sequence: { groupOrder: 2 },
         },
       },
     ],

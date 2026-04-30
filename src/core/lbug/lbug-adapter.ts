@@ -152,14 +152,15 @@ let ftsLoaded = false;
 let vectorExtensionLoaded = false;
 
 /**
- * In-process cache of FTS indexes that have been ensured against the current
- * writable connection. Prevents repeated `CALL CREATE_FTS_INDEX` round-trips
- * for callers that explicitly opt into `ensureFTSIndex`. Cleared by
- * `closeLbug` so a re-init starts fresh.
+ * In-process cache of FTS indexes observed against the current singleton
+ * connection. Avoids repeated `CALL CREATE_FTS_INDEX` calls, which can trip
+ * native duplicate-index/WAL edge cases. Cleared on re-init and close.
  *
  * Key format: `${tableName}:${indexName}`.
  */
 const ensuredFTSIndexes = new Set<string>();
+
+const ftsIndexKey = (tableName: string, indexName: string): string => `${tableName}:${indexName}`;
 
 /**
  * Check if an error indicates a missing column or table (schema-level problem)
@@ -271,6 +272,7 @@ export const withLbugDb = async <T>(dbPath: string, operation: () => Promise<T>)
         currentDbPath = null;
         ftsLoaded = false;
         vectorExtensionLoaded = false;
+        ensuredFTSIndexes.clear();
       });
       // Sleep outside the lock — no need to block others while waiting
       await new Promise((resolve) => setTimeout(resolve, DB_LOCK_RETRY_DELAY_MS * attempt));
@@ -303,6 +305,7 @@ const doInitLbug = async (dbPath: string) => {
     currentDbPath = null;
     ftsLoaded = false;
     vectorExtensionLoaded = false;
+    ensuredFTSIndexes.clear();
   }
 
   // LadybugDB stores the database as a single file (not a directory).
@@ -1212,6 +1215,9 @@ export const createFTSIndex = async (
     throw new Error('LadybugDB not initialized. Call initLbug first.');
   }
 
+  const key = ftsIndexKey(tableName, indexName);
+  if (ensuredFTSIndexes.has(key)) return;
+
   if (!(await loadFTSExtension())) {
     return;
   }
@@ -1221,10 +1227,13 @@ export const createFTSIndex = async (
 
   try {
     await conn.query(query);
+    ensuredFTSIndexes.add(key);
   } catch (e: any) {
-    if (!e.message?.includes('already exists')) {
-      throw e;
+    if (e.message?.includes('already exists')) {
+      ensuredFTSIndexes.add(key);
+      return;
     }
+    throw e;
   }
 };
 
@@ -1251,11 +1260,10 @@ export const ensureFTSIndex = async (
   properties: string[],
   stemmer: string = 'porter',
 ): Promise<void> => {
-  const key = `${tableName}:${indexName}`;
+  const key = ftsIndexKey(tableName, indexName);
   if (ensuredFTSIndexes.has(key)) return;
   try {
     await createFTSIndex(tableName, indexName, properties, stemmer);
-    ensuredFTSIndexes.add(key);
   } catch (e) {
     // Read-only DB: writable analyze owns index creation; silently skip
     // and cache so callers don't loop on a path that can never succeed
@@ -1337,5 +1345,7 @@ export const dropFTSIndex = async (tableName: string, indexName: string): Promis
     await conn.query(`CALL DROP_FTS_INDEX('${tableName}', '${indexName}')`);
   } catch {
     // Index may not exist
+  } finally {
+    ensuredFTSIndexes.delete(ftsIndexKey(tableName, indexName));
   }
 };
