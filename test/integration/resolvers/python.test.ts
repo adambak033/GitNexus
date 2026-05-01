@@ -417,6 +417,213 @@ describe('Python ancestor directory import resolution (Issue #417)', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Multi-segment ancestor walk: `from services.sync import X` style imports
+// from a sibling sub-package nested under a shared root directory.
+//
+// Before this fix, single-segment ancestor walks worked (`from middleware
+// import X` from `backend/services/auth.py` → `backend/middleware.py`) but
+// multi-segment dotted imports were only resolved against the workspace
+// root. In a `backend/`-prefixed repo, `from services.sync import X` from
+// `backend/routers/cron.py` would silently drop because `services/sync.py`
+// does not exist at the workspace root — only `backend/services/sync.py`
+// does. The fix mirrors the single-segment ancestor walk for multi-segment
+// paths.
+// ---------------------------------------------------------------------------
+
+describe('Python multi-segment ancestor directory import resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'python-multi-segment-ancestor-import'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves from services.sync import to backend/services/sync.py via ancestor walk', () => {
+    const imports = getRelationships(result, 'IMPORTS');
+    const syncImport = imports.find(
+      (i) =>
+        i.sourceFilePath === 'backend/routers/cron.py' &&
+        i.targetFilePath === 'backend/services/sync.py',
+    );
+    expect(syncImport).toBeDefined();
+  });
+
+  it('resolves from services.alerts import to backend/services/alerts.py via ancestor walk', () => {
+    const imports = getRelationships(result, 'IMPORTS');
+    const alertsImport = imports.find(
+      (i) =>
+        i.sourceFilePath === 'backend/routers/cron.py' &&
+        i.targetFilePath === 'backend/services/alerts.py',
+    );
+    expect(alertsImport).toBeDefined();
+  });
+
+  it('resolves from routers.alerts import to backend/routers/alerts.py (sibling sub-package)', () => {
+    const imports = getRelationships(result, 'IMPORTS');
+    const routerImport = imports.find(
+      (i) =>
+        i.sourceFilePath === 'backend/routers/cron.py' &&
+        i.targetFilePath === 'backend/routers/alerts.py',
+    );
+    expect(routerImport).toBeDefined();
+  });
+
+  it('emits CALLS edges for every multi-segment-imported callee', () => {
+    const calls = getRelationships(result, 'CALLS').filter(
+      (c) => c.sourceFilePath === 'backend/routers/cron.py',
+    );
+
+    const startCronRunCalls = calls.filter((c) => c.target === '_start_cron_run');
+    expect(startCronRunCalls.length).toBe(3);
+    expect(startCronRunCalls.every((c) => c.targetFilePath === 'backend/services/sync.py')).toBe(
+      true,
+    );
+
+    const completeCronRunCalls = calls.filter((c) => c.target === '_complete_cron_run');
+    expect(completeCronRunCalls.length).toBe(1);
+    expect(completeCronRunCalls[0].targetFilePath).toBe('backend/services/sync.py');
+
+    const opsAlertCalls = calls.filter((c) => c.target === '_create_ops_alert');
+    expect(opsAlertCalls.length).toBe(2);
+    expect(opsAlertCalls.every((c) => c.targetFilePath === 'backend/services/alerts.py')).toBe(
+      true,
+    );
+
+    const sendDailyCalls = calls.filter((c) => c.target === 'send_daily_alerts');
+    expect(sendDailyCalls.length).toBe(2);
+    expect(sendDailyCalls.every((c) => c.targetFilePath === 'backend/routers/alerts.py')).toBe(
+      true,
+    );
+  });
+
+  it('preserves single-segment ancestor walk (regression check for from auth_utils import X)', () => {
+    const calls = getRelationships(result, 'CALLS').filter(
+      (c) => c.sourceFilePath === 'backend/routers/cron.py',
+    );
+
+    const verifyCalls = calls.filter((c) => c.target === 'verify_cron_secret');
+    expect(verifyCalls.length).toBe(1);
+    expect(verifyCalls[0].targetFilePath).toBe('backend/auth_utils.py');
+
+    const orgCalls = calls.filter((c) => c.target === 'get_org_id_from_header');
+    expect(orgCalls.length).toBe(1);
+    expect(orgCalls[0].targetFilePath).toBe('backend/auth_utils.py');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Negative case for `hasRepoCandidate` widening: a vendored copy of an
+// external package (e.g. `vendor/django/urls.py`) must not cause an external
+// import like `from django.urls import path` issued from an unrelated file
+// (`app/main.py`) to be treated as a local candidate. The ancestor-bounded
+// nested check rejects vendored matches that don't sit on the importer's
+// own ancestor path.
+// ---------------------------------------------------------------------------
+
+describe('Python multi-segment widening: vendored external package false-positive guard', () => {
+  let repoDir: string;
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gn-python-vendored-django-'));
+    writeFixtureRepo(repoDir, {
+      'app/main.py': `from django.urls import path
+
+def boot():
+    path("/")
+`,
+      'vendor/django/__init__.py': '',
+      'vendor/django/urls.py': `def path(p):
+    return p
+`,
+    });
+    result = await runPipelineFromRepo(repoDir, () => {});
+  }, 60000);
+
+  afterAll(() => {
+    if (repoDir !== undefined) fs.rmSync(repoDir, { recursive: true, force: true });
+  });
+
+  it('does not resolve from django.urls to vendor/django/urls.py from an unrelated importer', () => {
+    const imports = getRelationships(result, 'IMPORTS');
+    const stray = imports.find(
+      (i) => i.sourceFilePath === 'app/main.py' && i.targetFilePath === 'vendor/django/urls.py',
+    );
+    expect(stray).toBeUndefined();
+  });
+
+  it('does not emit a CALLS edge from app/main.py:boot to vendor/django/urls.py:path', () => {
+    const calls = getRelationships(result, 'CALLS').filter(
+      (c) => c.sourceFilePath === 'app/main.py',
+    );
+    const stray = calls.find(
+      (c) => c.target === 'path' && c.targetFilePath === 'vendor/django/urls.py',
+    );
+    expect(stray).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Workspace-root precedence: when both `services/sync.py` (root) and
+// `backend/services/sync.py` (ancestor) exist, an importer at
+// `backend/routers/cron.py` doing `from services.sync import X` resolves to
+// the root file. Mirrors Python's `sys.path` semantics where the project
+// root is searched before package-local namespaces.
+// ---------------------------------------------------------------------------
+
+describe('Python multi-segment resolution: workspace root wins over ancestor', () => {
+  let repoDir: string;
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gn-python-root-precedence-'));
+    writeFixtureRepo(repoDir, {
+      'services/__init__.py': '',
+      'services/sync.py': `def root_marker():
+    return "root"
+`,
+      'backend/__init__.py': '',
+      'backend/services/__init__.py': '',
+      'backend/services/sync.py': `def ancestor_marker():
+    return "ancestor"
+`,
+      'backend/routers/__init__.py': '',
+      'backend/routers/cron.py': `from services.sync import root_marker
+
+def handler():
+    return root_marker()
+`,
+    });
+    result = await runPipelineFromRepo(repoDir, () => {});
+  }, 60000);
+
+  afterAll(() => {
+    if (repoDir !== undefined) fs.rmSync(repoDir, { recursive: true, force: true });
+  });
+
+  it('resolves the import edge to the root services/sync.py, not backend/services/sync.py', () => {
+    const imports = getRelationships(result, 'IMPORTS').filter(
+      (i) => i.sourceFilePath === 'backend/routers/cron.py',
+    );
+    const rootEdge = imports.find((i) => i.targetFilePath === 'services/sync.py');
+    expect(rootEdge).toBeDefined();
+
+    const ancestorEdge = imports.find((i) => i.targetFilePath === 'backend/services/sync.py');
+    expect(ancestorEdge).toBeUndefined();
+  });
+
+  it('binds the imported name to the root file, not the ancestor copy', () => {
+    const calls = getRelationships(result, 'CALLS').filter(
+      (c) => c.sourceFilePath === 'backend/routers/cron.py' && c.target === 'root_marker',
+    );
+    expect(calls.length).toBe(1);
+    expect(calls[0].targetFilePath).toBe('services/sync.py');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Re-export chain: from .base import X barrel pattern via __init__.py
 // ---------------------------------------------------------------------------
 
