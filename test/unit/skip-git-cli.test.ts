@@ -40,18 +40,19 @@ describe('--skip-git CLI flag', () => {
   describe('--skip-git does not walk up to parent git repo (#1232)', () => {
     const cliPath = path.resolve(__dirname, '../../dist/cli/index.js');
     let parentDir: string;
+    let gitnexusHome: string;
 
     function testEnv() {
       return {
         ...process.env,
         HOME: parentDir,
-        GITNEXUS_HOME: path.join(parentDir, '.gitnexus-home'),
+        GITNEXUS_HOME: gitnexusHome,
         GITNEXUS_LBUG_EXTENSION_INSTALL: 'never',
       };
     }
 
     function readRegistry(): Array<{ name: string; path: string }> {
-      const registryPath = path.join(parentDir, '.gitnexus-home', 'registry.json');
+      const registryPath = path.join(gitnexusHome, 'registry.json');
       expect(fs.existsSync(registryPath)).toBe(true);
       return JSON.parse(fs.readFileSync(registryPath, 'utf8'));
     }
@@ -99,6 +100,7 @@ describe('--skip-git CLI flag', () => {
       //       package.json
       //       src/index.ts
       parentDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gn-skip-git-'));
+      gitnexusHome = fs.mkdtempSync(path.join(os.tmpdir(), 'gn-skip-git-home-'));
       initParentGitRepo();
       fs.mkdirSync(path.join(parentDir, 'COOLIO', 'src'), { recursive: true });
       fs.writeFileSync(
@@ -125,6 +127,9 @@ describe('--skip-git CLI flag', () => {
       if (parentDir) {
         fs.rmSync(parentDir, { recursive: true, force: true });
       }
+      if (gitnexusHome) {
+        fs.rmSync(gitnexusHome, { recursive: true, force: true });
+      }
     }
 
     it('from subdir inside parent git repo, indexes subdir not parent', () => {
@@ -150,6 +155,36 @@ describe('--skip-git CLI flag', () => {
         });
         expect(siblingQuery).not.toContain('SubWooder');
         expect(siblingQuery).not.toContain('bass');
+      } finally {
+        cleanup();
+      }
+    });
+
+    it('keeps parent git status clean for --skip-git subdir analyze (#1233)', () => {
+      createTestStructure();
+      try {
+        fs.writeFileSync(path.join(parentDir, '.gitignore'), '.claude/\n');
+        execSync('git add .gitignore COOLIO SubWooder', { cwd: parentDir, stdio: 'ignore' });
+        execSync('git -c user.name=test -c user.email=test@example.com commit -m fixtures', {
+          cwd: parentDir,
+          stdio: 'ignore',
+        });
+
+        execSync(`node "${cliPath}" analyze --skip-git --skip-agents-md`, {
+          cwd: path.join(parentDir, 'COOLIO'),
+          encoding: 'utf8',
+          timeout: 60000,
+          env: testEnv(),
+        });
+
+        expect(
+          fs.readFileSync(path.join(parentDir, 'COOLIO', '.gitnexus', '.gitignore'), 'utf8'),
+        ).toBe('*\n');
+        const status = execSync('git status --short', {
+          cwd: parentDir,
+          encoding: 'utf8',
+        });
+        expect(status).toBe('');
       } finally {
         cleanup();
       }
