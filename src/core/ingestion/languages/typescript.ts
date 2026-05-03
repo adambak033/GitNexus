@@ -10,6 +10,7 @@
 import { SupportedLanguages } from 'gitnexus-shared';
 import type { NodeLabel } from 'gitnexus-shared';
 import { defineLanguage } from '../language-provider.js';
+import type { AstFrameworkPatternConfig } from '../language-provider.js';
 import { createClassExtractor } from '../class-extractors/generic.js';
 import {
   typescriptClassConfig,
@@ -217,6 +218,29 @@ export const BUILT_INS: ReadonlySet<string> = new Set([
 export const typescriptProvider = defineLanguage({
   id: SupportedLanguages.TypeScript,
   extensions: ['.ts', '.tsx'],
+  entryPointPatterns: [/^use[A-Z]/],
+  astFrameworkPatterns: [
+    {
+      framework: 'nestjs',
+      entryPointMultiplier: 3.2,
+      reason: 'nestjs-decorator',
+      patterns: ['@Controller', '@Get', '@Post', '@Put', '@Delete', '@Patch'],
+    },
+    {
+      framework: 'expo-router',
+      entryPointMultiplier: 2.5,
+      reason: 'expo-router-navigation',
+      patterns: [
+        'router.push',
+        'router.replace',
+        'router.navigate',
+        'useRouter',
+        'useLocalSearchParams',
+        'useSegments',
+        'expo-router',
+      ],
+    },
+  ] satisfies AstFrameworkPatternConfig[],
   treeSitterQueries: TYPESCRIPT_QUERIES,
   typeConfig: typescriptConfig,
   exportChecker: tsExportChecker,
@@ -256,6 +280,29 @@ export const typescriptProvider = defineLanguage({
 export const javascriptProvider = defineLanguage({
   id: SupportedLanguages.JavaScript,
   extensions: ['.js', '.jsx'],
+  entryPointPatterns: [/^use[A-Z]/],
+  astFrameworkPatterns: [
+    {
+      framework: 'nestjs',
+      entryPointMultiplier: 3.2,
+      reason: 'nestjs-decorator',
+      patterns: ['@Controller', '@Get', '@Post', '@Put', '@Delete', '@Patch'],
+    },
+    {
+      framework: 'expo-router',
+      entryPointMultiplier: 2.5,
+      reason: 'expo-router-navigation',
+      patterns: [
+        'router.push',
+        'router.replace',
+        'router.navigate',
+        'useRouter',
+        'useLocalSearchParams',
+        'useSegments',
+        'expo-router',
+      ],
+    },
+  ] satisfies AstFrameworkPatternConfig[],
   treeSitterQueries: JAVASCRIPT_QUERIES,
   typeConfig: typescriptConfig,
   exportChecker: tsExportChecker,
