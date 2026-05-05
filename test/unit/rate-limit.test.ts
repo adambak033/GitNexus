@@ -11,10 +11,10 @@
  *      per call, has the right signature, exposes the right error shape.
  *   2. Integration tests — mount the same factory on a tiny isolated express
  *      app that does fs.readFile (the exact CodeQL sink class) and prove the
- *      429 fires after the configured limit. Tight windowMs (100ms) + small
- *      sleep (200ms) keeps the suite fast and resistant to CI scheduling
- *      jitter; each test uses a fresh limiter so counter state never carries
- *      between tests.
+ *      429 fires after the configured limit. windowMs (2 000 ms) is generous
+ *      enough that 4 sequential requests fit inside one window even on slow
+ *      Windows CI runners; each test uses a fresh limiter so counter state
+ *      never carries between tests.
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import express, { type Express } from 'express';
@@ -41,9 +41,9 @@ afterAll(async () => {
 });
 
 // Build a fresh app + server per test so counter state never carries between
-// tests. Tight windowMs keeps the limiter responsive; the 200ms reset sleep
-// in window-rollover tests gives 2x margin even on slow CI.
-const buildApp = (limit: number, windowMs = 100): Express => {
+// tests. windowMs = 2 000 ms gives ample headroom for Windows CI where
+// sequential loopback HTTP requests can take 50–80 ms each.
+const buildApp = (limit: number, windowMs = 2000): Express => {
   const app = express();
   app.set('trust proxy', 'loopback, linklocal, uniquelocal');
   app.get('/test/file', createRouteLimiter({ windowMs, limit }), async (_req, res) => {
@@ -145,8 +145,8 @@ describe('createRouteLimiter — integration with a real route', () => {
     for (let i = 1; i <= 3; i++) await fetch(`${baseUrl}/test/file`);
     const tripped = await fetch(`${baseUrl}/test/file`);
     expect(tripped.status).toBe(429);
-    // Wait for the window to roll over (100ms window + 200ms margin).
-    await new Promise((r) => setTimeout(r, 200));
+    // Wait for the window to roll over (2 000 ms window + 200 ms margin).
+    await new Promise((r) => setTimeout(r, 2200));
     const reset = await fetch(`${baseUrl}/test/file`);
     expect(reset.status).toBe(200);
   });
