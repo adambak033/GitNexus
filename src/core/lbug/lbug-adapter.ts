@@ -257,26 +257,7 @@ export const withLbugDb = async <T>(dbPath: string, operation: () => Promise<T>)
       // Close stale connection inside the session lock to prevent race conditions
       // with concurrent operations that might acquire the lock between cleanup steps
       await runWithSessionLock(async () => {
-        // CHECKPOINT before close to flush WAL contents (same rationale as closeLbug)
-        if (conn) {
-          try {
-            await conn.query('CHECKPOINT');
-          } catch {
-            /* best-effort */
-          }
-        }
-        try {
-          if (conn) await conn.close();
-        } catch {
-          /* best-effort */
-        }
-        try {
-          if (db) await db.close();
-        } catch {
-          /* best-effort */
-        }
-        conn = null;
-        db = null;
+        await safeClose();
         currentDbPath = null;
         ftsLoaded = false;
         vectorExtensionLoaded = false;
@@ -302,22 +283,7 @@ const ensureLbugInitialized = async (dbPath: string) => {
 const doInitLbug = async (dbPath: string) => {
   // Different database requested — close the old one first
   if (conn || db) {
-    // CHECKPOINT before close to flush WAL contents (same rationale as closeLbug)
-    if (conn) {
-      try {
-        await conn.query('CHECKPOINT');
-      } catch {
-        /* ignore — older LadybugDB or schemaless DB may not accept it */
-      }
-    }
-    try {
-      if (conn) await conn.close();
-    } catch {}
-    try {
-      if (db) await db.close();
-    } catch {}
-    conn = null;
-    db = null;
+    await safeClose();
     currentDbPath = null;
     ftsLoaded = false;
     vectorExtensionLoaded = false;
@@ -1063,34 +1029,62 @@ export const fetchExistingEmbeddingHashes = async (
   }
 };
 
-export const closeLbug = async (): Promise<void> => {
-  // CHECKPOINT before close so the WAL/.shadow contents are flushed into
-  // the main database file. Without this, LadybugDB 0.16.0's non-blocking
-  // checkpoint thread can outlive the close call and leave sidecar pages
-  // pending on disk, which makes a subsequent read-side open either race
-  // with the WAL replay or trip the database-id check on the sidecars.
-  // This is especially critical after embedding writes, which generate
-  // large amounts of WAL data. CHECKPOINT is a no-op when there's nothing
-  // pending, so it's cheap on the happy path.
-  if (conn) {
-    try {
-      await conn.query('CHECKPOINT');
-    } catch {
-      /* ignore — older LadybugDB or schemaless DB may not accept it */
-    }
+/**
+ * Flush the WAL so all pending writes are visible to subsequent readers.
+ *
+ * Best-effort: swallows errors from older LadybugDB versions or schemaless
+ * databases that do not support the CHECKPOINT command.  A no-op when there
+ * is nothing pending, so safe (and cheap) to call unconditionally after any
+ * write path.
+ *
+ * Use this instead of safeClose when the connection must stay open
+ * (e.g. the /api/embed handler that keeps serving queries after flushing).
+ *
+ * @see safeClose — CHECKPOINT + connection/database close
+ */
+export const flushWAL = async (): Promise<void> => {
+  if (!conn) return;
+  try {
+    await conn.query('CHECKPOINT');
+  } catch {
+    /* ignore — older LadybugDB or schemaless DB may not accept it */
   }
+};
+
+/**
+ * Flush the WAL and close the connection and database handles.
+ *
+ * Consolidates the CHECKPOINT + close pattern into a single function so
+ * callers never call conn.close() or db.close() directly (#1376).
+ * An ESLint no-restricted-syntax rule enforces this — see eslint.config.mjs.
+ *
+ * @see flushWAL — CHECKPOINT-only (connection stays open)
+ * @see closeLbug — safeClose + module state reset (full teardown)
+ */
+export const safeClose = async (): Promise<void> => {
+  await flushWAL();
   if (conn) {
     try {
+      // eslint-disable-next-line no-restricted-syntax -- sole authorised close site
       await conn.close();
-    } catch {}
+    } catch {
+      /* best-effort */
+    }
     conn = null;
   }
   if (db) {
     try {
+      // eslint-disable-next-line no-restricted-syntax -- sole authorised close site
       await db.close();
-    } catch {}
+    } catch {
+      /* best-effort */
+    }
     db = null;
   }
+};
+
+export const closeLbug = async (): Promise<void> => {
+  await safeClose();
   currentDbPath = null;
   ftsLoaded = false;
   vectorExtensionLoaded = false;
