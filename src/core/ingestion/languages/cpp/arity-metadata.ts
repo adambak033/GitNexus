@@ -121,7 +121,7 @@ export function computeCppCallArity(node: SyntaxNode): number {
  * argument types (e.g. `inferCppLiteralType` returns `'string'` for
  * string literals, not `'std::string'`).
  */
-function normalizeCppParamType(raw: string): string {
+export function normalizeCppParamType(raw: string): string {
   let t = raw.trim();
   // Strip const, volatile, etc.
   t = t.replace(/\b(const|volatile|restrict|mutable|constexpr)\b/g, '').trim();
