@@ -104,14 +104,25 @@ export const processesPhase: PipelinePhase<ProcessesOutput> = {
 
     // Link Route and Tool nodes to Processes
     if (routeRegistry.size > 0 || toolDefs.length > 0) {
-      const routesByFile = new Map<string, string[]>();
+      const routesByFileAndMethod = new Map<string, string[]>();
+      const routesByFileOnly = new Map<string, string[]>();
       for (const [url, entry] of routeRegistry) {
-        let list = routesByFile.get(entry.filePath);
-        if (!list) {
-          list = [];
-          routesByFile.set(entry.filePath, list);
+        if (entry.methodName) {
+          const key = `${entry.filePath}::${entry.methodName}`;
+          let list = routesByFileAndMethod.get(key);
+          if (!list) {
+            list = [];
+            routesByFileAndMethod.set(key, list);
+          }
+          list.push(url);
+        } else {
+          let list = routesByFileOnly.get(entry.filePath);
+          if (!list) {
+            list = [];
+            routesByFileOnly.set(entry.filePath, list);
+          }
+          list.push(url);
         }
-        list.push(url);
       }
       const toolsByHandlerId = new Map<string, string[]>();
       const toolsWithoutHandlerByFile = new Map<string, string[]>();
@@ -134,7 +145,17 @@ export const processesPhase: PipelinePhase<ProcessesOutput> = {
         const entryFile = entryNode.properties.filePath;
         if (!entryFile) continue;
 
-        const routeURLs = routesByFile.get(entryFile);
+        const entryName = entryNode.properties.name as string | undefined;
+
+        // Try exact match by filePath + methodName first
+        let routeURLs: string[] | undefined;
+        if (entryName) {
+          routeURLs = routesByFileAndMethod.get(`${entryFile}::${entryName}`);
+        }
+        // Fallback: file-level match for routes without methodName
+        if (!routeURLs) {
+          routeURLs = routesByFileOnly.get(entryFile);
+        }
         if (routeURLs) {
           for (const routeURL of routeURLs) {
             const routeNodeId = generateId('Route', routeURL);
