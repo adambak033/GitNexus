@@ -190,6 +190,7 @@ export function emitTsScopeCaptures(
 
   const rawMatches = getTsScopeQuery(filePath).matches(tree.rootNode);
   const out: CaptureMatch[] = [];
+  const functionDeclDeclaratorStarts = new Set<number>();
 
   for (const m of rawMatches) {
     // Group captures by their tag name. Tree-sitter strips the leading
@@ -375,6 +376,32 @@ export function emitTsScopeCaptures(
           callNode,
           JSON.stringify(argTypes),
         );
+      }
+    }
+
+    // Dedup: when both @declaration.function and @declaration.variable
+    // match the same variable_declarator (e.g. `const fn = () => {}`),
+    // suppress the variable match. Function declarations are queried
+    // first and have higher priority.
+    if (fnDeclAnchor !== undefined) {
+      const fnNode = findFunctionNode(
+        tree.rootNode,
+        fnDeclAnchor.range,
+        groupedNodes['@declaration.function'],
+      );
+      if (fnNode !== null) {
+        const declarator = fnNode.parent;
+        if (declarator?.type === 'variable_declarator') {
+          functionDeclDeclaratorStarts.add(declarator.startIndex);
+        }
+      }
+    }
+    if (grouped['@declaration.variable'] !== undefined) {
+      const nameNode = groupedNodes['@declaration.name'];
+      if (nameNode?.parent?.type === 'variable_declarator') {
+        if (functionDeclDeclaratorStarts.has(nameNode.parent.startIndex)) {
+          continue;
+        }
       }
     }
 

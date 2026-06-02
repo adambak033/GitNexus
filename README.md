@@ -39,6 +39,39 @@ https://github.com/user-attachments/assets/172685ba-8e54-4ea7-9ad1-e31a3398da72
 
 ---
 
+## Fork: betterGitNexus — tRPC & Architecture Pattern Support
+
+This fork adds **tRPC pattern detection** and **curried-call resolution** to GitNexus's ingestion pipeline, enabling first-class indexing of tRPC-based architectures (router → procedure → workflow).
+
+### What changed
+
+| Feature | Files | Effect |
+|---------|-------|--------|
+| **HOC-in-pair function detection** | `query.ts`, `tree-sitter-queries.ts`, `typescript.ts` | tRPC procedures (`create: proc.mutation(async () => {})`) now appear as named Function nodes |
+| **Curried call detection** | `query.ts`, `tree-sitter-queries.ts` | `workflow(db)(input)` calls correctly resolve to the workflow function |
+| **tRPC route extraction** | `route-extractors/trpc.ts` (new), `framework-detection.ts`, `typescript.ts`, `parse-worker.ts` | Individual tRPC routes detected with procedure-name prefixing |
+| **Function/Const dedup** | `captures.ts` | `const fn = () => {}` no longer creates duplicate Const + Function nodes |
+
+### Results (Jurialis project)
+
+| Metric | Before | After |
+|--------|--------|-------|
+| Function nodes in routers | 0 | 363 |
+| Router → Workflow CALLS edges | 0 | 185 |
+| tRPC routes in route_map | 1 (catch-all) | 22 |
+| Impact analysis callers | 0 | Multi-hop traces working |
+
+### Upstream sync
+
+This fork tracks `abhigyanpatwari/GitNexus` as `upstream`. To sync:
+
+```bash
+git fetch upstream
+git merge upstream/main
+```
+
+---
+
 ## Star History
 
 [![Star History Chart](https://api.star-history.com/svg?repos=abhigyanpatwari/GitNexus&type=date&legend=top-left)](https://www.star-history.com/#abhigyanpatwari/GitNexus&type=date&legend=top-left)
