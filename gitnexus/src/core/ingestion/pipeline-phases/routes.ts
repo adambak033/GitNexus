@@ -42,6 +42,7 @@ const EXPO_NAV_PATTERNS = [
 export interface RouteEntry {
   filePath: string;
   source: string;
+  methodName?: string;
 }
 
 export interface RoutesOutput {
@@ -213,6 +214,7 @@ export const routesPhase: PipelinePhase<RoutesOutput> = {
       addRoute(routeUrl, {
         filePath: route.filePath,
         source: 'framework-route',
+        ...(route.methodName ? { methodName: route.methodName } : {}),
       });
       if (route.routeName && !namedRouteRegistry.has(route.routeName)) {
         namedRouteRegistry.set(route.routeName, routeUrl);

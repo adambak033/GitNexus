@@ -99,6 +99,7 @@ import type { LanguageProvider } from '../language-provider.js';
 import type { ParsedFile } from 'gitnexus-shared';
 import { extractParsedFile } from '../scope-extractor-bridge.js';
 import { extractLaravelRoutes, type ExtractedRoute } from '../route-extractors/laravel.js';
+import { extractTrpcRoutes } from '../route-extractors/trpc.js';
 
 import { logger } from '../../logger.js';
 export type { ExtractedRoute } from '../route-extractors/laravel.js';
@@ -1741,10 +1742,42 @@ const processFileGroup = (
       // Skip variable captures whose definition node was already processed.
       if (
         (nodeLabel === 'Const' || nodeLabel === 'Static' || nodeLabel === 'Variable') &&
-        definitionNode &&
-        processedDefinitionNodes.has(definitionNode.startIndex)
+        definitionNode
       ) {
-        continue;
+        if (processedDefinitionNodes.has(definitionNode.startIndex)) {
+          continue;
+        }
+        // Structural dedup: if the variable binding's value is an
+        // arrow_function or function_expression, the @definition.function
+        // pattern already covers this — skip the Const/Variable node.
+        // The definitionNode may be lexical_declaration, export_statement,
+        // or variable_declarator depending on the capture pattern.
+        let varDecl: SyntaxNode | null = null;
+        if (definitionNode.type === 'variable_declarator') {
+          varDecl = definitionNode;
+        } else if (
+          definitionNode.type === 'lexical_declaration' ||
+          definitionNode.type === 'variable_declaration'
+        ) {
+          varDecl = definitionNode.children.find((c) => c.type === 'variable_declarator') ?? null;
+        } else if (definitionNode.type === 'export_statement') {
+          const inner =
+            definitionNode.children.find(
+              (c) => c.type === 'lexical_declaration' || c.type === 'variable_declaration',
+            ) ?? null;
+          if (inner) {
+            varDecl = inner.children.find((c) => c.type === 'variable_declarator') ?? null;
+          }
+        }
+        if (varDecl) {
+          const valueChild = varDecl.childForFieldName?.('value');
+          if (
+            valueChild &&
+            (valueChild.type === 'arrow_function' || valueChild.type === 'function_expression')
+          ) {
+            continue;
+          }
+        }
       }
       if (definitionNode) {
         processedDefinitionNodes.add(definitionNode.startIndex);
@@ -2147,6 +2180,17 @@ const processFileGroup = (
     if (provider.isRouteFile?.(file.path)) {
       const extractedRoutes = extractLaravelRoutes(tree, file.path);
       for (const r of extractedRoutes) result.routes.push(r);
+    }
+
+    // Extract tRPC procedure routes from TS/JS router files
+    if (
+      (language === SupportedLanguages.TypeScript || language === SupportedLanguages.JavaScript) &&
+      (file.path.includes('/routers/') ||
+        file.path.includes('/trpc/') ||
+        file.path.includes('/server/'))
+    ) {
+      const trpcRoutes = extractTrpcRoutes(file.path, file.content);
+      for (const r of trpcRoutes) result.routes.push(r);
     }
 
     // Extract ORM queries (Prisma, Supabase)
