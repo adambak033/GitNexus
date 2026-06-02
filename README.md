@@ -70,6 +70,18 @@ git fetch upstream
 git merge upstream/main
 ```
 
+After any merge, **rebuild and re-link** to update the globally installed CLI:
+
+```bash
+cd gitnexus && npm run build && npm link
+```
+
+Then re-index your projects:
+
+```bash
+cd <your-project> && gitnexus analyze --force
+```
+
 ---
 
 ## Star History
