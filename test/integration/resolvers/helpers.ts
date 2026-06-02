@@ -21,11 +21,49 @@ const LEGACY_RESOLVER_PARITY_EXPECTED_FAILURES: Readonly<Record<string, Readonly
     // isFileLocalDef filtering of static functions.
     'caller.c calls b:helper via include, NOT a:static helper',
   ]),
+  dart: new Set([
+    // The legacy DAG DART_QUERIES capture member calls (obj.method()) only
+    // under expression_statement / initialized_variable_definition contexts
+    // (issue #1926 F24). The registry-primary scope path walks every postfix
+    // chain, so it resolves member calls in return / list-literal / named-arg /
+    // arrow-body contexts too. Scope-resolver-only correctness wins.
+    'resolves a member call in a return statement (svc.compute())',
+    'resolves member calls inside a list literal',
+    'resolves a member call in a named argument',
+    'resolves a member call in an arrow body',
+    // Calls inside constructor bodies are mis-attributed by the legacy
+    // enclosing-function finder (issue #1926 F25 — it only unwraps
+    // function_signature, not constructor_signature). The registry-primary
+    // scope path synthesizes a Function scope for the constructor body (whose
+    // body is a sibling of the wrapping method_signature) and the def is a
+    // Constructor (a valid caller anchor), so the call attributes to the
+    // constructor. Scope-resolver-only correctness win.
+    //
+    // Getter/setter and operator bodies are NOT covered (F25 partial):
+    //   - getter/setter defs are Property, which resolveCallerGraphId excludes
+    //     as a caller anchor (graph-bridge/ids.ts);
+    //   - the structure phase emits no Method node for operators, so there is
+    //     no node to attribute to.
+    // Both require a structure-phase / shared-pipeline change, out of scope for
+    // the scope-resolution path (tracked by #1926's legacy parsing-layer fix).
+    'attributes a call inside a constructor body to the constructor',
+    'attributes a call inside a named-constructor body to the constructor',
+  ]),
   csharp: new Set([
     'emits the using-import edge App/Program.cs -> Models/User.cs through the scope-resolution path',
     // Generic type-argument USES edges are emitted by the registry-primary
     // resolver only; the legacy DAG path does not synthesize these references.
     'emits USES edges for generic type arguments',
+    // Ambiguous same-named base (Handler/IProcessor declared in both Models/
+    // and Other/) is disambiguated to the Models/ definitions by the
+    // registry-primary import-aware resolver: `using MyApp.Models;` emits the
+    // file-level import edge that `resolveAmbiguousInheritanceBaseViaImports`
+    // keys on. The legacy DAG does not emit the C# namespace using-import edge
+    // (same root cause as the using-import-edge expected-failure above), so it
+    // cannot disambiguate and `resolveHeritageId` refuses to a synthetic
+    // Class:/Interface: target. Scope-resolver-only correctness win; backporting
+    // is out of scope per the migration policy.
+    'resolves both ambiguous bases to the imported Models namespace via import-aware disambiguation',
   ]),
   go: new Set([
     // The legacy DAG path does not resolve method calls when the method is
@@ -33,6 +71,20 @@ const LEGACY_RESOLVER_PARITY_EXPECTED_FAILURES: Readonly<Record<string, Readonly
     // fixture). This requires scope-based cross-file package-sibling resolution
     // which is only available in the registry-primary path.
     'resolves user.Save() to the method whose receiver type is declared in another package file',
+    // Go structural interface implementation inference is a registry-primary
+    // scope-resolution feature. The legacy DAG does not synthesize structural
+    // IMPLEMENTS / METHOD_IMPLEMENTS edges or feed them into interface dispatch.
+    'emits signature-checked structural IMPLEMENTS edges only for valid implementors',
+    'feeds structural IMPLEMENTS into METHOD_IMPLEMENTS edges',
+    'prefers the concrete local assignment over interface fan-out',
+    'fans out interface-typed receiver calls to all known implementors',
+    'includes embedded interface methods before emitting structural IMPLEMENTS edges',
+    'includes promoted embedded struct methods before emitting structural IMPLEMENTS edges',
+    'fans out embedded-interface receivers only to complete implementors',
+    'matches local interface types against package-qualified implementation signatures',
+    'merges methods from package-qualified embedded interfaces before matching implementors',
+    'fans out cross-package interface receivers only to valid implementors',
+    'dispatches package-qualified embedded-interface receivers only to complete implementors',
   ]),
   java: new Set([
     // Duplicate-FQN same-module path-affinity ordering is implemented in the
