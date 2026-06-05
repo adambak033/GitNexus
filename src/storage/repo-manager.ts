@@ -10,7 +10,7 @@ import fs from 'fs/promises';
 import { realpathSync } from 'fs';
 import path from 'path';
 import os from 'os';
-import { getInferredRepoName, resolveRepoIdentityRoot, hasGitDir } from './git.js';
+import { getInferredRepoName, resolveRepoIdentityRoot } from './git.js';
 import { logger } from '../core/logger.js';
 
 /**
@@ -571,15 +571,7 @@ export const registerRepo = async (
       // the collapse to canonical checkouts and linked worktree roots only,
       // so `--skip-git` subdirs of unrelated parent git repos keep using
       // their own basename (preserves the #1232/#1233 fix's intent).
-      const identityRoot = resolveRepoIdentityRoot(resolved);
-      const baseName = inferred ?? path.basename(identityRoot);
-      // Suffix worktrees with their directory basename to avoid duplicate
-      // registry names (e.g. "Jurialis (feat-15-1)" vs "Jurialis").
-      if (identityRoot !== resolved && hasGitDir(resolved)) {
-        name = `${baseName} (${path.basename(resolved)})`;
-      } else {
-        name = baseName;
-      }
+      name = inferred ?? path.basename(resolveRepoIdentityRoot(resolved));
     }
   }
 
