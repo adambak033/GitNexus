@@ -603,7 +603,12 @@ export class LocalBackend {
       return this.repos.values().next().value!;
     }
 
-    return null; // Multiple repos, no param — ambiguous
+    // No repo param and multiple repos — try cwd-based auto-detection
+    // across ALL repos so agents in a worktree don't need to pass repo.
+    const cwdPick = this.pickRepoHandleForCwd([...this.repos.values()]);
+    if (cwdPick) return cwdPick;
+
+    return null; // Multiple repos, no param, no cwd match — ambiguous
   }
 
   /**
