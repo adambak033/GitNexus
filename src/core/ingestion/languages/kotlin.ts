@@ -15,7 +15,6 @@ import { kotlinTypeConfig } from '../type-extractors/jvm.js';
 import { kotlinExportChecker } from '../export-detection.js';
 import { createImportResolver } from '../import-resolvers/resolver-factory.js';
 import { kotlinImportConfig } from '../import-resolvers/configs/jvm.js';
-import { extractKotlinNamedBindings } from '../named-bindings/kotlin.js';
 import { appendKotlinWildcard } from '../import-resolvers/jvm.js';
 import { KOTLIN_QUERIES } from '../tree-sitter-queries.js';
 import type { AstFrameworkPatternConfig } from '../language-provider.js';
@@ -28,8 +27,8 @@ import { createMethodExtractor } from '../method-extractors/generic.js';
 import { kotlinMethodConfig } from '../method-extractors/configs/jvm.js';
 import { createVariableExtractor } from '../variable-extractors/generic.js';
 import { kotlinVariableConfig } from '../variable-extractors/configs/jvm.js';
-import { createHeritageExtractor } from '../heritage-extractors/generic.js';
 import {
+  collectKotlinCaptureSideChannel,
   emitKotlinScopeCaptures,
   interpretKotlinImport,
   interpretKotlinTypeBinding,
@@ -161,7 +160,6 @@ export const kotlinProvider = defineLanguage({
   typeConfig: kotlinTypeConfig,
   exportChecker: kotlinExportChecker,
   importResolver: createImportResolver(kotlinImportConfig),
-  namedBindingExtractor: extractKotlinNamedBindings,
   importPathPreprocessor: appendKotlinWildcard,
   mroStrategy: 'implements-split',
   callExtractor: createCallExtractor(kotlinCallConfig),
@@ -169,7 +167,6 @@ export const kotlinProvider = defineLanguage({
   methodExtractor: createMethodExtractor(kotlinMethodConfig),
   variableExtractor: createVariableExtractor(kotlinVariableConfig),
   classExtractor: createClassExtractor(kotlinClassConfig),
-  heritageExtractor: createHeritageExtractor(SupportedLanguages.Kotlin),
   builtInNames: BUILT_INS,
   labelOverride: (functionNode, defaultLabel) => {
     if (defaultLabel !== 'Function') return defaultLabel;
@@ -179,6 +176,13 @@ export const kotlinProvider = defineLanguage({
 
   // ── RFC #909 Ring 3: scope-based resolution hooks ──
   emitScopeCaptures: emitKotlinScopeCaptures,
+  // Worker-side: snapshot the module-level companion-scope marks
+  // `emitKotlinScopeCaptures` just populated for this file (`markCompanionScope`
+  // → `companionScopesByFile`) into plain data on `ParsedFile.captureSideChannel`,
+  // so the main thread can restore them via `applyCaptureSideChannel` WITHOUT a
+  // re-parse (#1983). Without this, companion/static dispatch emits no CALLS
+  // edges on the worker path. See `kotlin/capture-side-channel.ts`.
+  collectCaptureSideChannel: collectKotlinCaptureSideChannel,
   interpretImport: interpretKotlinImport,
   interpretTypeBinding: interpretKotlinTypeBinding,
   bindingScopeFor: kotlinBindingScopeFor,

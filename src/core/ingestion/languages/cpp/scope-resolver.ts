@@ -5,7 +5,10 @@ import {
 } from '../../scope-resolution/scope/walkers.js';
 import { SupportedLanguages } from 'gitnexus-shared';
 import { buildMro, defaultLinearize } from '../../scope-resolution/passes/mro.js';
-import { populateClassOwnedMembers } from '../../scope-resolution/scope/walkers.js';
+import {
+  populateClassOwnedMembers,
+  tagNamespacePrefixes,
+} from '../../scope-resolution/scope/walkers.js';
 import type { ScopeResolver } from '../../scope-resolution/contract/scope-resolver.js';
 import { cppProvider } from '../c-cpp.js';
 import { cppArityCompatibility } from './arity.js';
@@ -27,6 +30,7 @@ import {
   isCppDependentBaseMember,
 } from './two-phase-lookup.js';
 import { populateCppAssociatedNamespaces, clearCppAdlState, pickCppAdlCandidates } from './adl.js';
+import { applyCppCaptureSideChannel } from './capture-side-channel.js';
 import {
   clearCppInlineNamespaces,
   populateCppInlineNamespaceScopes,
@@ -38,6 +42,40 @@ import {
   clearCppUserDefinedConversions,
   populateCppUserDefinedConversions,
 } from './user-defined-conversions.js';
+
+/**
+ * Per-pass memo of the augmented `#include`-resolution file set
+ * (`allFilePaths` ∪ header paths), keyed on the two stable source sets.
+ * `resolveImportTarget` is called once per C++ `#include`; the old code rebuilt
+ * a fresh ~F-entry `Set` on every call AND defeated the shared
+ * `resolveCImportTarget` suffix-index memo (in `c/import-target.ts`) by handing
+ * it a new set identity each time. Both inputs are stable per pass, so the
+ * union is built once and reused. `WeakMap`-keyed → reclaimed with the pass.
+ * (Twin of the C resolver's `augmentedFilePaths`.)
+ */
+const augmentedPathsByPass = new WeakMap<
+  ReadonlySet<string>,
+  WeakMap<ReadonlySet<string>, ReadonlySet<string>>
+>();
+
+function augmentedFilePaths(
+  allFilePaths: ReadonlySet<string>,
+  headerPaths: ReadonlySet<string>,
+): ReadonlySet<string> {
+  let byHeaders = augmentedPathsByPass.get(allFilePaths);
+  if (byHeaders === undefined) {
+    byHeaders = new WeakMap();
+    augmentedPathsByPass.set(allFilePaths, byHeaders);
+  }
+  let augmented = byHeaders.get(headerPaths);
+  if (augmented === undefined) {
+    const set = new Set(allFilePaths);
+    for (const h of headerPaths) set.add(h);
+    augmented = set;
+    byHeaders.set(headerPaths, augmented);
+  }
+  return augmented;
+}
 
 /**
  * C++ `ScopeResolver` registered in `SCOPE_RESOLVERS` and consumed by
@@ -75,9 +113,11 @@ export const cppScopeResolver: ScopeResolver = {
     // detection but are importable from .cpp files via #include.
     const headerPaths = resolutionConfig as ReadonlySet<string> | undefined;
     if (headerPaths !== undefined && headerPaths.size > 0) {
-      const augmented = new Set(allFilePaths);
-      for (const h of headerPaths) augmented.add(h);
-      return resolveCppImportTarget(targetRaw, fromFile, augmented);
+      return resolveCppImportTarget(
+        targetRaw,
+        fromFile,
+        augmentedFilePaths(allFilePaths, headerPaths),
+      );
     }
     return resolveCppImportTarget(targetRaw, fromFile, allFilePaths);
   },
@@ -100,8 +140,31 @@ export const cppScopeResolver: ScopeResolver = {
   buildMro: (graph, parsedFiles, nodeLookup) =>
     buildMro(graph, parsedFiles, nodeLookup, defaultLinearize),
 
+  // Worker-boundary restore (see `ScopeResolver.applyCaptureSideChannel`).
+  // `emitCppScopeCaptures` records per-file ADL call-site arg shapes
+  // (`markCppAdlSiteArgs`/`markCppAdlSiteNoAdl`), inline-/anonymous-namespace
+  // ranges (`markCppInlineNamespaceRange`/`markCppAnonymousNamespaceRange`),
+  // dependent-base names (`markCppDependentBase`/`markCppDependentPackBase`),
+  // and file-local linkage (`markFileLocal`) into module-level maps as a SIDE
+  // EFFECT — none of it is serialized onto the returned ParsedFile's scopes/defs.
+  // On the worker path those marks are populated in the worker process and lost
+  // across the MessageChannel / disk store; the main thread reuses the
+  // serialized ParsedFile and skips `extractParsedFile`, so `populateOwners` +
+  // the ADL / two-phase-lookup passes would see empty maps and emit zero edges.
+  // The worker stashed a plain-data snapshot on `parsed.captureSideChannel` via
+  // `cppProvider.collectCaptureSideChannel`; this restores it into the module
+  // maps WITHOUT any tree-sitter re-parse (the #1983 fix — the old re-parse
+  // replay re-OOM'd huge `.h`/`.cpp` repos). The freshly-extracted leg never
+  // calls this — its marks were just populated in this process.
+  applyCaptureSideChannel: applyCppCaptureSideChannel,
+
   populateOwners: (parsed: ParsedFile) => {
     populateClassOwnedMembers(parsed);
+    // #1982: tag namespace-nested defs with their enclosing-namespace prefix so
+    // resolveDefGraphId can map them to the namespace-qualified structure-phase
+    // node (`NS.A.Inner`) instead of collapsing same-tail nested bases via the
+    // simpleKey fallback. Does NOT change qualifiedName (resolution unaffected).
+    tagNamespacePrefixes(parsed);
     // Resolve inline- and anonymous-namespace ranges (recorded at capture
     // time) to ScopeIds BEFORE `populateCppNonGloballyVisible` runs, so
     // both exemptions see the populated Sets.
