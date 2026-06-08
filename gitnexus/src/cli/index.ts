@@ -44,6 +44,11 @@ program
       '(no-op when --index-only is also set).',
   )
   .option('--skip-agents-md', 'Skip updating the gitnexus section in AGENTS.md and CLAUDE.md')
+  .option(
+    '--default-branch <branch>',
+    'Default branch used in the generated regression-compare example (base_ref). ' +
+      'Falls back to .gitnexusrc, then auto-detected origin/HEAD, then "main".',
+  )
   .option('--no-stats', 'Omit volatile file/symbol counts from AGENTS.md and CLAUDE.md')
   .option(
     '--skip-skills',
@@ -82,7 +87,7 @@ program
   )
   .option(
     '--workers <n>',
-    'Parse worker pool size. Default: cores-1 capped at 16. Pass 0 to disable workers (sequential).',
+    'Parse worker pool size (>=1). Default: cores-1 capped at 16, auto-sized to the repo.',
   )
   .option('--embedding-threads <n>', 'Limit local ONNX embedding CPU threads')
   .option('--embedding-batch-size <n>', 'Number of nodes per embedding batch')
@@ -150,7 +155,7 @@ program
   .option('-f, --force', 'Force full regeneration even if up to date')
   .option(
     '--provider <provider>',
-    'LLM provider: openai, openrouter, azure, custom, cursor, claude, or codex (default: openai)',
+    'LLM provider: openai, openrouter, azure, custom, cursor, claude, codex, or opencode (default: openai)',
   )
   .option('--model <model>', 'LLM model or Azure deployment name (default: minimax/minimax-m2.5)')
   .option(

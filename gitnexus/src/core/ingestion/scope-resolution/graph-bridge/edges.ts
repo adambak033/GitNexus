@@ -39,6 +39,11 @@ export function mapReferenceKindToEdgeType(
       return 'EXTENDS';
     case 'type-reference':
       return 'USES';
+    // Macro invocations resolve to a `Macro` node (never a function), so
+    // they emit `USES` — kept out of the `CALLS` keyspace which denotes
+    // function/method dispatch (#1934 review).
+    case 'macro':
+      return 'USES';
     case 'import-use':
       return undefined;
     default:
@@ -73,7 +78,7 @@ export function tryEmitEdge(
   // Inheritance edges are emitted directly by `preEmitInheritanceEdges` (which
   // owns the enclosing-class caller and the EXTENDS-vs-IMPLEMENTS type), so this
   // generic bridge derives caller + edge type purely from the site.
-  const callerGraphId = resolveCallerGraphId(site.inScope, scopes, nodeLookup);
+  const callerGraphId = resolveCallerGraphId(site.inScope, scopes, nodeLookup, site.atRange);
   const targetGraphId = resolveDefGraphId(targetDef.filePath, targetDef, nodeLookup);
   const edgeType = mapReferenceKindToEdgeType(site.kind as Reference['kind']);
   if (callerGraphId === undefined) return false;
@@ -130,7 +135,7 @@ export function tryEmitEdgeWithExplicitTargetId(
   confidence = 0.85,
   collapseByCallerTarget = false,
 ): boolean {
-  const callerGraphId = resolveCallerGraphId(site.inScope, scopes, nodeLookup);
+  const callerGraphId = resolveCallerGraphId(site.inScope, scopes, nodeLookup, site.atRange);
   const edgeType = mapReferenceKindToEdgeType(site.kind as Reference['kind']);
   if (callerGraphId === undefined) return false;
   if (edgeType === undefined) return false;

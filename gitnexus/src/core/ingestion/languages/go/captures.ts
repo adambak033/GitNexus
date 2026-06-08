@@ -10,7 +10,7 @@ import { recordGoCacheHit, recordGoCacheMiss } from './cache-stats.js';
 import { computeGoCallArity, computeGoDeclarationArity } from './arity-metadata.js';
 import { splitGoImportStatement } from './import-decomposer.js';
 import { synthesizeGoReceiverBinding } from './receiver-binding.js';
-import { synthesizeGoTypeBindings } from './type-binding.js';
+import { synthesizeGoTypeBindings, extractSimpleTypeNameText } from './type-binding.js';
 import { getTreeSitterBufferSize } from '../../constants.js';
 import { parseSourceSafe } from '../../../tree-sitter/safe-parse.js';
 
@@ -81,6 +81,8 @@ export function emitGoScopeCaptures(
     }
 
     if (isRawMultiAssignTypeBinding(nodeMap)) continue;
+
+    normalizeGenericConstructorCapture(nodeMap, grouped);
 
     const declAnchorNode = nodeMap['@declaration.function'] ?? nodeMap['@declaration.method'];
     if (declAnchorNode !== undefined) {
@@ -181,9 +183,9 @@ export function emitGoScopeCaptures(
  * Synthesize `@reference.inherits` captures for Go struct embedding so the
  * registry-primary scope-resolution path emits inheritance edges (mirrors C#
  * `synthesizeCsharpInheritanceReferences` / C++ `emitCppInheritanceCaptures`).
- * Without this, Go embedding edges came only from the legacy `@heritage.*`
- * path, which is dropped for registry-primary languages in the worker pipeline
- * (issue #1951).
+ * Without this, Go embedding edges came only from the legacy heritage-capture
+ * leg (removed in #942), which is dropped for registry-primary languages in the
+ * worker pipeline (issue #1951).
  *
  * Scope EXACTLY matches the legacy Go heritage query + its `shouldSkipExtends`
  * hook (`heritage-extractors/configs/go.ts`), whose supertype alternation is
@@ -202,7 +204,7 @@ export function emitGoScopeCaptures(
  *
  * The base shapes covered (issue #1951 — these were previously DROPPED by the
  * registry-primary synth, so production silently omitted their edges even though
- * the legacy `@heritage` leg, config-driven since #1940, captured them):
+ * the legacy heritage leg, config-driven since #1940, captured them):
  *   - bare `type_identifier`  (`Base`)                       → the node itself
  *   - `qualified_type`        (`pkg.Base`)                    → `name:` tail
  *   - `generic_type`          (`Box[T]`)                      → `type:` base
@@ -274,7 +276,7 @@ function emitGoEmbedInheritance(baseNode: SyntaxNode | null, out: CaptureMatch[]
 
 /**
  * Reduce a Go embed base node to its trailing bare `type_identifier`, matching
- * the node shapes the legacy `@heritage` query accepts (`goHeritageShapes`) and
+ * the node shapes the legacy heritage query accepted (`goHeritageShapes`) and
  * the reduction `normalizeSupertypeName` performs (verified by real-parse to
  * yield an identical `.text` for each shape):
  *   - `type_identifier`                          → the node itself (`Base`)
@@ -338,6 +340,37 @@ function nodeRangeEquals(a: SyntaxNode, b: SyntaxNode): boolean {
     a.endPosition.row === b.endPosition.row &&
     a.endPosition.column === b.endPosition.column
   );
+}
+
+function normalizeGenericConstructorCapture(
+  nodeMap: Record<string, SyntaxNode>,
+  grouped: Record<string, Capture>,
+): void {
+  const typeNode =
+    grouped['@type-binding.constructor'] !== undefined ? nodeMap['@type-binding.type'] : undefined;
+  if (typeNode !== undefined && typeNode.type === 'generic_type') {
+    const base = typeNode.childForFieldName('type');
+    if (base !== null) {
+      grouped['@type-binding.type'] = syntheticCapture(
+        '@type-binding.type',
+        base,
+        extractSimpleTypeNameText(base),
+      );
+    }
+  }
+
+  const referenceNode =
+    grouped['@reference.call.constructor'] !== undefined ? nodeMap['@reference.name'] : undefined;
+  if (referenceNode !== undefined && referenceNode.type === 'generic_type') {
+    const base = referenceNode.childForFieldName('type');
+    if (base !== null) {
+      grouped['@reference.name'] = syntheticCapture(
+        '@reference.name',
+        base,
+        extractSimpleTypeNameText(base),
+      );
+    }
+  }
 }
 
 function isRawMultiAssignTypeBinding(nodeMap: Record<string, SyntaxNode>): boolean {

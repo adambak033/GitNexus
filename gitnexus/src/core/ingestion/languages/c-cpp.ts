@@ -44,7 +44,6 @@ import { createVariableExtractor } from '../variable-extractors/generic.js';
 import { cVariableConfig, cppVariableConfig } from '../variable-extractors/configs/c-cpp.js';
 import { createCallExtractor } from '../call-extractors/generic.js';
 import { cCallConfig, cppCallConfig } from '../call-extractors/configs/c-cpp.js';
-import { createHeritageExtractor } from '../heritage-extractors/generic.js';
 import { stripUeMacros } from '../cpp-ue-preprocessor.js';
 import {
   emitCScopeCaptures,
@@ -54,6 +53,7 @@ import {
   cBindingScopeFor,
   cImportOwningScope,
   cReceiverBinding,
+  collectCStaticLinkageSideChannel,
 } from './c/index.js';
 import {
   emitCppScopeCaptures,
@@ -63,6 +63,7 @@ import {
   cppBindingScopeFor,
   cppImportOwningScope,
   cppReceiverBinding,
+  collectCppCaptureSideChannel,
 } from './cpp/index.js';
 import { extractCppTemplateConstraints } from './cpp/constraint-extractor.js';
 
@@ -383,7 +384,6 @@ export const cProvider = defineLanguage({
   typeConfig: cCppConfig,
   exportChecker: cCppExportChecker,
   importResolver: createImportResolver(cImportConfig),
-  importSemantics: 'wildcard-transitive',
   callExtractor: createCallExtractor(cCallConfig),
   fieldExtractor: createFieldExtractor(cFieldConfig),
   methodExtractor: createMethodExtractor({
@@ -392,12 +392,20 @@ export const cProvider = defineLanguage({
   }),
   variableExtractor: createVariableExtractor(cVariableConfig),
   classExtractor: cClassExtractor,
-  heritageExtractor: createHeritageExtractor(SupportedLanguages.C),
   labelOverride: cppLabelOverride,
   builtInNames: C_BUILT_INS,
 
   // ── RFC #909 Ring 3: scope-based resolution hooks (RFC §5) ──────────
   emitScopeCaptures: emitCScopeCaptures,
+  // Worker-side: snapshot the module-level `static`-linkage marks
+  // `emitCScopeCaptures` just populated for this file (`markStaticName` →
+  // `staticNames`) into plain data on `ParsedFile.captureSideChannel`, so the
+  // main thread can restore them via `applyCaptureSideChannel` WITHOUT a
+  // re-parse (#1983 — the worker is the sole parse path). Without this, C
+  // `static` functions look non-file-local on the main thread and leak into
+  // cross-file global free-call resolution / wildcard imports. See
+  // `c/capture-side-channel.ts`.
+  collectCaptureSideChannel: collectCStaticLinkageSideChannel,
   interpretImport: interpretCImport,
   interpretTypeBinding: interpretCTypeBinding,
   bindingScopeFor: cBindingScopeFor,
@@ -453,7 +461,6 @@ export const cppProvider = defineLanguage({
   typeConfig: cCppConfig,
   exportChecker: cCppExportChecker,
   importResolver: createImportResolver(cppImportConfig),
-  importSemantics: 'wildcard-transitive',
   mroStrategy: 'leftmost-base',
   callExtractor: createCallExtractor(cppCallConfig),
   fieldExtractor: createFieldExtractor(cppFieldConfig),
@@ -463,13 +470,17 @@ export const cppProvider = defineLanguage({
   }),
   variableExtractor: createVariableExtractor(cppVariableConfig),
   classExtractor: cppClassExtractor,
-  heritageExtractor: createHeritageExtractor(SupportedLanguages.CPlusPlus),
   labelOverride: cppLabelOverride,
   builtInNames: C_BUILT_INS,
   extractTemplateConstraints: extractCppTemplateConstraintsForProvider,
 
   // ── RFC #909 Ring 3: scope-based resolution hooks (RFC §5) ──────────
   emitScopeCaptures: emitCppScopeCaptures,
+  // Worker-side: snapshot the module-level capture marks `emitCppScopeCaptures`
+  // just populated for this file into plain data on `ParsedFile.captureSideChannel`,
+  // so the main thread can restore them via `applyCaptureSideChannel` WITHOUT a
+  // re-parse (#1983). See `cpp/capture-side-channel.ts`.
+  collectCaptureSideChannel: collectCppCaptureSideChannel,
   interpretImport: interpretCppImport,
   interpretTypeBinding: interpretCppTypeBinding,
   bindingScopeFor: cppBindingScopeFor,
