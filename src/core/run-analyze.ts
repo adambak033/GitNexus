@@ -45,7 +45,10 @@ import {
   type RepoMeta,
 } from '../storage/repo-manager.js';
 import { DEFAULT_PDG_MAX_FUNCTION_LINES } from './ingestion/cfg/collect.js';
-import { DEFAULT_MAX_CFG_EDGES_PER_FUNCTION } from './ingestion/cfg/emit.js';
+import {
+  DEFAULT_MAX_CFG_EDGES_PER_FUNCTION,
+  DEFAULT_PDG_MAX_REACHING_DEF_EDGES_PER_FUNCTION,
+} from './ingestion/cfg/emit.js';
 import { computeFileHashes, diffFileHashes } from '../storage/file-hash.js';
 import {
   extractChangedSubgraph,
@@ -135,6 +138,9 @@ export interface AnalyzeOptions {
   pdgMaxFunctionLines?: number;
   /** Per-function CFG edge cap. Forwarded to `PipelineOptions.pdgMaxEdgesPerFunction`. */
   pdgMaxEdgesPerFunction?: number;
+  /** Per-function REACHING_DEF edge cap (#2082 M2). Forwarded to
+   *  `PipelineOptions.pdgMaxReachingDefEdgesPerFunction`. */
+  pdgMaxReachingDefEdgesPerFunction?: number;
   /**
    * Default branch threaded into generated AGENTS.md / CLAUDE.md so the
    * regression-compare example uses the configured branch instead of a
@@ -335,13 +341,19 @@ export const collectBranchCacheKeys = async (
  * defaults so an explicit-default run compares equal to a default run
  * (`0` = unlimited is preserved as `0`). Pure + exported for testing.
  */
-type PdgOptions = Pick<AnalyzeOptions, 'pdg' | 'pdgMaxFunctionLines' | 'pdgMaxEdgesPerFunction'>;
+type PdgOptions = Pick<
+  AnalyzeOptions,
+  'pdg' | 'pdgMaxFunctionLines' | 'pdgMaxEdgesPerFunction' | 'pdgMaxReachingDefEdgesPerFunction'
+>;
 
 export const resolvePdgConfig = (options: PdgOptions): RepoMeta['pdg'] =>
   options.pdg === true
     ? {
         maxFunctionLines: options.pdgMaxFunctionLines ?? DEFAULT_PDG_MAX_FUNCTION_LINES,
         maxEdgesPerFunction: options.pdgMaxEdgesPerFunction ?? DEFAULT_MAX_CFG_EDGES_PER_FUNCTION,
+        maxReachingDefEdgesPerFunction:
+          options.pdgMaxReachingDefEdgesPerFunction ??
+          DEFAULT_PDG_MAX_REACHING_DEF_EDGES_PER_FUNCTION,
       }
     : undefined;
 
@@ -358,10 +370,20 @@ export const pdgModeMismatch = (recorded: RepoMeta['pdg'], options: PdgOptions):
   const requested = resolvePdgConfig(options);
   if (!requested && !recorded) return false;
   if (!requested || !recorded) return true;
-  return (
-    requested.maxFunctionLines !== recorded.maxFunctionLines ||
-    requested.maxEdgesPerFunction !== recorded.maxEdgesPerFunction
-  );
+  // Structural comparison over the KEY UNION of both resolved records — not a
+  // hand-maintained field list. Both sides come fully resolved from
+  // resolvePdgConfig, so any new emit-affecting knob added there joins the
+  // comparison automatically (M1's hand-extended comparator was the trap this
+  // closes: a knob it missed would silently strand a stale projection). It is
+  // also what makes the M1→M2 upgrade work with zero extra code: an M1-era
+  // stamp lacks maxReachingDefEdgesPerFunction, so `4000 !== undefined` trips
+  // a full writeback that populates REACHING_DEF rows without `--force`.
+  const reqRecord = requested as Record<string, unknown>;
+  const recRecord = recorded as Record<string, unknown>;
+  for (const key of new Set([...Object.keys(reqRecord), ...Object.keys(recRecord)])) {
+    if (reqRecord[key] !== recRecord[key]) return true;
+  }
+  return false;
 };
 
 export async function runFullAnalysis(
@@ -730,6 +752,7 @@ export async function runFullAnalysis(
       pdg: options.pdg === true,
       pdgMaxFunctionLines: options.pdgMaxFunctionLines,
       pdgMaxEdgesPerFunction: options.pdgMaxEdgesPerFunction,
+      pdgMaxReachingDefEdgesPerFunction: options.pdgMaxReachingDefEdgesPerFunction,
       fetchWrappers: options.fetchWrappers,
     },
   );

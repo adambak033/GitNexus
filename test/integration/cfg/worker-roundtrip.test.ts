@@ -94,6 +94,16 @@ describe('U3 — CFG side-channel JSON round-trip (no AST leakage, no field loss
       for (const b of c.blocks) expect(typeof b.text).toBe('string');
       for (const e of c.edges) expect(typeof e.from).toBe('number');
     }
+    // M2 (#2082 U1): the binding table + statement facts must survive the
+    // boundary — a future cache-slimming field list that drops them would
+    // silently break reaching-defs (the #2038 mergeChunkResults lesson).
+    for (const c of round) {
+      expect(Array.isArray(c.bindings)).toBe(true);
+      expect(c.blocks.every((b: { statements?: unknown }) => Array.isArray(b.statements))).toBe(
+        true,
+      );
+    }
+    expect(round.some((c: { bindings: unknown[] }) => c.bindings.length > 0)).toBe(true);
   });
 });
 
@@ -148,5 +158,28 @@ describe('U3 — parse-cache key folds the --pdg flag (R4, #2038-class guard)', 
         maxEdgesPerFunction: 100,
       } as Parameters<typeof computeChunkHash>[1]),
     ).toBe(base);
+  });
+});
+
+describe('#2082 M2 — the REACHING_DEF emit cap does NOT perturb the chunk key', () => {
+  const entries = [
+    { filePath: 'b.ts', contentHash: 'h2' },
+    { filePath: 'a.ts', contentHash: 'h1' },
+  ];
+
+  it('pdgMaxReachingDefEdgesPerFunction is emit-time-only — same key across values (F3 discipline)', () => {
+    // The worker never sees the REACHING_DEF edge cap (solve + emit happen in
+    // scope-resolution on the main thread), so the cached shard is identical
+    // across cap values. Folding it in would be the #2099-F3 over-correction:
+    // a spurious full re-parse on every cap change. PdgCacheKey simply has no
+    // field for it — this test pins that the key API surface stays that way
+    // (the object form ignores unknown extras rather than hashing them).
+    const base = computeChunkHash(entries, { pdg: true });
+    const withExtra = computeChunkHash(entries, {
+      pdg: true,
+      // @ts-expect-error — deliberately passing an unknown field: the key must ignore it
+      maxReachingDefEdgesPerFunction: 1,
+    });
+    expect(withExtra).toBe(base);
   });
 });

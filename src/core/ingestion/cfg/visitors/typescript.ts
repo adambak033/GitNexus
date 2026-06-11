@@ -18,23 +18,40 @@
  *  - `try/catch/finally` routes both normal completion AND a `throw` in the try
  *    through `finally` (the finally block post-dominates the try/catch); a
  *    `throw` with no catch propagates through finally to the enclosing handler.
- *  - labeled `break`/`continue` resolve against the labeled loop's frame.
+ *  - EARLY EXITS THROUGH FINALLY (#2082 M2 U2, closes the M1 soundness gap): a
+ *    `break`/`continue`/`return` whose jump CROSSES a `finally` is re-routed to
+ *    the finally entry (keeping its bare jump kind), and the finally's exits
+ *    gain a `finally-return`/`finally-break`/`finally-continue` completion edge
+ *    to the resumed target. Threading is TARGET-RELATIVE via finalizer frames
+ *    interleaved on the {@link ControlFlowContext} stack: only the finallys
+ *    lexically between the jump and its target thread (a `break` whose loop is
+ *    wholly inside the try keeps its direct edge — re-routing it would let a
+ *    finally redefinition falsely kill in-loop defs for reaching-defs). Nested
+ *    finallys chain inner→outer; finally-as-shared-join conflates exit paths
+ *    (sound over-approximation; duplication-per-exit-path was rejected). An
+ *    empty/comment-only finally pushes no frame — jumps keep direct edges.
+ *  - labeled `break`/`continue` resolve against the labeled construct's frame:
+ *    loops/switches carry their full label LIST (`outer: inner: for` resolves
+ *    both), and a labeled NON-loop statement (`blk: { … break blk; … }`) gets
+ *    a break-target frame whose target is a synthesized join after the body —
+ *    the M1 route-to-EXIT fallback removed the real continuation and falsely
+ *    killed defs for reaching-defs (tri-review P1).
  *
- * Known M1 limitations:
- *  - SOUNDNESS GAP (M2 blocker, not mere precision): a non-local jump
- *    (`break`/`continue`/`return`) out of a `try` that has a `finally` edges
- *    directly to its target rather than routing THROUGH the `finally` block
- *    first. A future taint/PDG pass will therefore MISS flow mediated by a
- *    `finally` on the early-exit path (e.g. a value the `finally` taints or
- *    sanitizes before the `return` reaches its target) — a false negative. The
- *    general fix duplicates `finally` per exit path; deferred past M1 and
- *    tracked for M2. Normal completion and `throw` DO route through `finally`.
- *  - A `break`/`continue` to a label on a non-loop/non-switch block, and the
- *    OUTER label of a doubly-labeled construct (`outer: inner: for (...)`), are
- *    not modeled. The jump is conservatively routed to the function EXIT (a
- *    sound over-approximation that keeps the graph single-exit — see visitBreak)
- *    rather than left as a dangling sink; only the precise labeled target is
- *    unmodeled. Single-labeled loops/switches resolve correctly.
+ * Known limitations:
+ *  - A jump whose label STILL fails to resolve (malformed source) keeps the
+ *    conservative route-to-EXIT + thread-all-finallys fallback in
+ *    visitBreak/visitContinue — single-exit preserved, no finally bypassed,
+ *    but the continuation path is approximate.
+ *  - Exceptional flow stays the sound over-approximation: EVERY protected-region
+ *    block edges to the handler (an exception may fire mid-block), which
+ *    over-supplies reaching-defs facts into `catch` — extra facts, never false
+ *    kills. Per-leader throw precision is deliberately deferred (M3 decides).
+ *  - Def/use harvest scope (#2082 M2, see typescript-harvest.ts for the full
+ *    v1 semantics table): member/property writes are not scalar defs; nested
+ *    function bodies are opaque in BOTH directions (writes to and reads of
+ *    captured outer variables are invisible — callback flows are M4 territory);
+ *    `case x:` test uses attach to the switch dispatch block (sound
+ *    over-approximation of in-order case evaluation).
  *
  * Block/edge accounting and reachability are pinned in
  * `test/unit/cfg/cfg-builder.test.ts` (core) and
@@ -42,9 +59,14 @@
  */
 import type { SyntaxNode } from '../../utils/ast-helpers.js';
 import { CfgBuilder } from '../cfg-builder.js';
-import { ControlFlowContext } from '../control-flow-context.js';
+import {
+  ControlFlowContext,
+  drainFinalizerPending,
+  wireJumpThroughFinalizers,
+} from '../control-flow-context.js';
 import type { TraversalResult } from '../traversal-result.js';
 import type { CfgVisitor, FunctionCfg } from '../types.js';
+import { TsHarvester } from './typescript-harvest.js';
 
 /** TS/JS node types that own a CFG-bearing function body. */
 const TS_FUNCTION_TYPES = new Set([
@@ -100,10 +122,15 @@ class TsCfgWalk {
   private readonly cfc = new ControlFlowContext();
   /** Stack of exception-handler entry blocks (catch/finally) a `throw` jumps to. */
   private readonly handlers: number[] = [];
-  /** Label awaiting the loop/switch it immediately precedes (labeled_statement). */
-  private pendingLabel: string | undefined;
+  /** Labels awaiting the construct they precede (`outer: inner: for` = both). */
+  private pendingLabels: string[] = [];
 
-  constructor(private readonly builder: CfgBuilder) {}
+  constructor(
+    private readonly builder: CfgBuilder,
+    /** Def/use fact extractor (#2082 M2 U1) — phase-2 only; its scope tree is
+     *  already complete, so any walk order resolves names correctly. */
+    private readonly harvest: TsHarvester,
+  ) {}
 
   /** Statements of a block node, ignoring comments. */
   private statementsOf(block: SyntaxNode): SyntaxNode[] {
@@ -141,13 +168,24 @@ class TsCfgWalk {
       } else {
         // Simple statement — coalesce into the current straight-line block.
         if (openSimple === undefined) {
-          const idx = this.builder.newBlock(startLineOf(stmt), endLineOf(stmt), stmt.text);
+          const idx = this.builder.newBlock(
+            startLineOf(stmt),
+            endLineOf(stmt),
+            stmt.text,
+            'normal',
+            this.harvest.facts(stmt),
+          );
           if (entry === undefined) entry = idx;
           else this.builder.connect(dangling, idx, 'seq');
           openSimple = idx;
           dangling = [idx];
         } else {
-          this.builder.extendBlock(openSimple, endLineOf(stmt), stmt.text);
+          this.builder.extendBlock(
+            openSimple,
+            endLineOf(stmt),
+            stmt.text,
+            this.harvest.facts(stmt),
+          );
         }
       }
     }
@@ -192,59 +230,119 @@ class TsCfgWalk {
   }
 
   private visitSimple(stmt: SyntaxNode): TraversalResult {
-    const idx = this.builder.newBlock(startLineOf(stmt), endLineOf(stmt), stmt.text);
+    const idx = this.builder.newBlock(
+      startLineOf(stmt),
+      endLineOf(stmt),
+      stmt.text,
+      'normal',
+      this.harvest.facts(stmt),
+    );
     return { entry: idx, exits: [idx] };
   }
 
   private visitReturn(stmt: SyntaxNode): TraversalResult {
-    const idx = this.builder.newBlock(startLineOf(stmt), endLineOf(stmt), stmt.text);
-    this.builder.edge(idx, this.builder.exitIndex, 'return');
+    // Harvest the argument expression's uses — `return x` blocks live in this
+    // dedicated handler, not visitSeq, and were a silently-missed site once.
+    const idx = this.builder.newBlock(
+      startLineOf(stmt),
+      endLineOf(stmt),
+      stmt.text,
+      'normal',
+      this.harvest.facts(stmt),
+    );
+    // A return crosses EVERY active finally before reaching EXIT.
+    wireJumpThroughFinalizers(
+      this.builder,
+      idx,
+      this.cfc.finalizersForReturn(),
+      this.builder.exitIndex,
+      'return',
+    );
     return { entry: idx, exits: [] };
   }
 
   private visitThrow(stmt: SyntaxNode): TraversalResult {
-    const idx = this.builder.newBlock(startLineOf(stmt), endLineOf(stmt), stmt.text);
+    const idx = this.builder.newBlock(
+      startLineOf(stmt),
+      endLineOf(stmt),
+      stmt.text,
+      'normal',
+      this.harvest.facts(stmt),
+    );
     this.builder.edge(idx, this.currentHandler(), 'throw');
     return { entry: idx, exits: [] };
   }
 
   private visitBreak(stmt: SyntaxNode): TraversalResult {
     const idx = this.builder.newBlock(startLineOf(stmt), endLineOf(stmt), stmt.text);
-    const target = this.cfc.breakTarget(this.labelOf(stmt));
-    // An unresolved target — a label this M1 visitor doesn't model (a stacked
+    const res = this.cfc.resolveBreak(this.labelOf(stmt));
+    // An unresolved target — a label this visitor doesn't model (a stacked
     // outer label like `outer: inner: for`, or a labeled non-loop block) —
     // would otherwise leave this block with NO out-edge, stranding it and
     // breaking the single-exit invariant a downstream post-dominator / PDG pass
     // relies on. Conservatively route an unresolved jump to the function EXIT
-    // ("escapes the function"): sound over-approximation, keeps single-exit.
-    this.builder.edge(idx, target ?? this.builder.exitIndex, 'break');
+    // ("escapes the function") and thread ALL active finallys — a superset of
+    // the truly-crossed set (the real target is somewhere in the function, so
+    // execution provably runs every finally between the jump and wherever it
+    // lands... up to the ones the conservative EXIT routing over-includes).
+    // Sound for dataflow either way: extra paths, never a bypassed finally.
+    const { target, finalizers } = res ?? {
+      target: this.builder.exitIndex,
+      finalizers: this.cfc.finalizersForReturn(),
+    };
+    wireJumpThroughFinalizers(this.builder, idx, finalizers, target, 'break');
     return { entry: idx, exits: [] };
   }
 
   private visitContinue(stmt: SyntaxNode): TraversalResult {
     const idx = this.builder.newBlock(startLineOf(stmt), endLineOf(stmt), stmt.text);
-    const target = this.cfc.continueTarget(this.labelOf(stmt));
-    // See visitBreak: an unresolved label routes to EXIT to preserve single-exit.
-    this.builder.edge(idx, target ?? this.builder.exitIndex, 'continue');
+    const res = this.cfc.resolveContinue(this.labelOf(stmt));
+    // See visitBreak: an unresolved label routes to EXIT (threading all
+    // active finallys) to preserve single-exit without bypassing a finally.
+    const { target, finalizers } = res ?? {
+      target: this.builder.exitIndex,
+      finalizers: this.cfc.finalizersForReturn(),
+    };
+    wireJumpThroughFinalizers(this.builder, idx, finalizers, target, 'continue');
     return { entry: idx, exits: [] };
   }
 
   private visitLabeled(stmt: SyntaxNode): SeqResult {
     const body =
       stmt.childForFieldName('body') ?? stmt.namedChildren[stmt.namedChildren.length - 1];
-    if (body && LOOP_OR_SWITCH_TYPES.has(body.type)) {
-      this.pendingLabel = this.labelOf(stmt);
+    const label = this.labelOf(stmt);
+    if (body && (LOOP_OR_SWITCH_TYPES.has(body.type) || body.type === 'labeled_statement')) {
+      // Loop/switch consumes the accumulated labels via takeLabels(); a nested
+      // labeled_statement keeps accumulating (`outer: inner: for` → both
+      // labels land on the loop frame).
+      if (label) this.pendingLabels.push(label);
       const res = this.visitStmt(body);
-      this.pendingLabel = undefined; // clear even if the construct didn't consume it
+      this.pendingLabels = []; // clear leftovers if the construct didn't consume
       return res;
     }
-    // Labeled non-loop blocks (break-to-block-label) are not modeled in M1.
-    return this.visitBody(body);
+    // Labeled NON-loop statement (`blk: { … break blk; … }`): break-to-label
+    // targets a synthesized join after the body. Routing it to EXIT instead
+    // (the M1 behavior) removed the real continuation and falsely killed
+    // every def live at the jump for post-construct uses (tri-review P1).
+    const labels = [...this.pendingLabels, ...(label ? [label] : [])];
+    this.pendingLabels = [];
+    const join = this.builder.newBlock(endLineOf(stmt), endLineOf(stmt), '');
+    this.cfc.pushLabeledBlock(join, labels);
+    const res = this.visitBody(body);
+    this.cfc.pop();
+    if (res) this.builder.connect(res.exits, join, 'seq');
+    return { entry: res?.entry ?? join, exits: [join] };
   }
 
   private visitIf(stmt: SyntaxNode): TraversalResult {
     const cond = stmt.childForFieldName('condition') ?? stmt;
-    const condBlock = this.builder.newBlock(startLineOf(stmt), endLineOf(cond), cond.text);
+    const condBlock = this.builder.newBlock(
+      startLineOf(stmt),
+      endLineOf(cond),
+      cond.text,
+      'normal',
+      this.harvest.facts(cond),
+    );
 
     const exits: number[] = [];
 
@@ -283,12 +381,18 @@ class TsCfgWalk {
   }
 
   private visitWhile(stmt: SyntaxNode): TraversalResult {
-    const label = this.takeLabel();
+    const labels = this.takeLabels();
     const cond = stmt.childForFieldName('condition') ?? stmt;
-    const header = this.builder.newBlock(startLineOf(stmt), endLineOf(cond), cond.text);
+    const header = this.builder.newBlock(
+      startLineOf(stmt),
+      endLineOf(cond),
+      cond.text,
+      'normal',
+      this.harvest.facts(cond),
+    );
     const loopExit = this.builder.newBlock(endLineOf(stmt), endLineOf(stmt), '');
 
-    this.cfc.pushLoop(header, loopExit, label);
+    this.cfc.pushLoop(header, loopExit, labels);
     const body = this.visitBody(this.bodyBlockOf(stmt));
     this.cfc.pop();
 
@@ -303,12 +407,18 @@ class TsCfgWalk {
   }
 
   private visitDoWhile(stmt: SyntaxNode): TraversalResult {
-    const label = this.takeLabel();
+    const labels = this.takeLabels();
     const cond = stmt.childForFieldName('condition') ?? stmt;
-    const condBlock = this.builder.newBlock(startLineOf(cond), endLineOf(cond), cond.text);
+    const condBlock = this.builder.newBlock(
+      startLineOf(cond),
+      endLineOf(cond),
+      cond.text,
+      'normal',
+      this.harvest.facts(cond),
+    );
     const loopExit = this.builder.newBlock(endLineOf(stmt), endLineOf(stmt), '');
 
-    this.cfc.pushLoop(condBlock, loopExit, label);
+    this.cfc.pushLoop(condBlock, loopExit, labels);
     const body = this.visitBody(this.bodyBlockOf(stmt));
     this.cfc.pop();
 
@@ -320,7 +430,7 @@ class TsCfgWalk {
   }
 
   private visitFor(stmt: SyntaxNode): TraversalResult {
-    const label = this.takeLabel();
+    const labels = this.takeLabels();
     const init = stmt.childForFieldName('initializer');
     const cond = stmt.childForFieldName('condition');
     const incr = stmt.childForFieldName('increment');
@@ -329,16 +439,24 @@ class TsCfgWalk {
       startLineOf(stmt),
       cond ? endLineOf(cond) : startLineOf(stmt),
       cond ? cond.text : 'for(;;)',
+      'normal',
+      cond ? this.harvest.facts(cond) : undefined,
     );
     const loopExit = this.builder.newBlock(endLineOf(stmt), endLineOf(stmt), '');
 
     let incrBlock = header;
     if (incr) {
-      incrBlock = this.builder.newBlock(startLineOf(incr), endLineOf(incr), incr.text);
+      incrBlock = this.builder.newBlock(
+        startLineOf(incr),
+        endLineOf(incr),
+        incr.text,
+        'normal',
+        this.harvest.facts(incr),
+      );
       this.builder.edge(incrBlock, header, 'loop-back');
     }
 
-    this.cfc.pushLoop(incrBlock, loopExit, label);
+    this.cfc.pushLoop(incrBlock, loopExit, labels);
     const body = this.visitBody(this.bodyBlockOf(stmt));
     this.cfc.pop();
 
@@ -359,7 +477,13 @@ class TsCfgWalk {
 
     let entry = header;
     if (init) {
-      const initBlock = this.builder.newBlock(startLineOf(init), endLineOf(init), init.text);
+      const initBlock = this.builder.newBlock(
+        startLineOf(init),
+        endLineOf(init),
+        init.text,
+        'normal',
+        this.harvest.facts(init),
+      );
       this.builder.edge(initBlock, header, 'seq');
       entry = initBlock;
     }
@@ -367,15 +491,19 @@ class TsCfgWalk {
   }
 
   private visitForIn(stmt: SyntaxNode): TraversalResult {
-    const label = this.takeLabel();
+    const labels = this.takeLabels();
+    // Header text is SYNTHESIZED, so facts come from the left/right AST nodes
+    // directly (the loop variable is a def, the iterated expression a use).
     const header = this.builder.newBlock(
       startLineOf(stmt),
       startLineOf(stmt),
       this.forInHeaderText(stmt),
+      'normal',
+      this.harvest.forInHeadFacts(stmt),
     );
     const loopExit = this.builder.newBlock(endLineOf(stmt), endLineOf(stmt), '');
 
-    this.cfc.pushLoop(header, loopExit, label);
+    this.cfc.pushLoop(header, loopExit, labels);
     const body = this.visitBody(this.bodyBlockOf(stmt));
     this.cfc.pop();
 
@@ -396,16 +524,34 @@ class TsCfgWalk {
   }
 
   private visitSwitch(stmt: SyntaxNode): TraversalResult {
-    const label = this.takeLabel();
+    const labels = this.takeLabels();
     const value = stmt.childForFieldName('value') ?? stmt;
-    const dispatch = this.builder.newBlock(startLineOf(stmt), endLineOf(value), value.text);
+    const dispatch = this.builder.newBlock(
+      startLineOf(stmt),
+      endLineOf(value),
+      value.text,
+      'normal',
+      this.harvest.facts(value),
+    );
     const switchExit = this.builder.newBlock(endLineOf(stmt), endLineOf(stmt), '');
 
-    this.cfc.pushSwitch(switchExit, label);
+    this.cfc.pushSwitch(switchExit, labels);
     const body = stmt.childForFieldName('body');
     const cases = body
       ? body.namedChildren.filter((c) => c.type === 'switch_case' || c.type === 'switch_default')
       : [];
+
+    // `case x:` test expressions live in no block (caseStatements filters the
+    // value node out) — harvest their uses onto the dispatch block, one record
+    // per case in source order (a sound over-approximation of JS's in-order
+    // case evaluation). Conditionally: a later case test only evaluates when
+    // earlier cases didn't match, so any def inside one is a may-def — as a
+    // must-def on the always-executed dispatch block it would falsely kill
+    // prior defs for earlier-matching arms (tri-review).
+    for (const c of cases) {
+      const caseValue = c.childForFieldName('value');
+      if (caseValue) this.builder.attachFacts(dispatch, this.harvest.factsConditional(caseValue));
+    }
 
     const caseResults = cases.map((c) => this.visitSeq(this.caseStatements(c)));
     const hasDefault = cases.some((c) => c.type === 'switch_default');
@@ -453,10 +599,19 @@ class TsCfgWalk {
     }
 
     // Build finally first so its entry is known as both a normal join and a
-    // handler target. The finally body runs in the OUTER handler context.
+    // handler target. The finally body runs in the OUTER handler context — and
+    // OUTSIDE this try's finalizer frame: a return inside the finally must not
+    // thread itself (it threads only outer finallys, matching JS semantics).
     const finallyRes = finallyClause
       ? this.visitSeq(this.statementsOf(this.bodyBlockOf(finallyClause) as SyntaxNode))
       : null;
+
+    // Finalizer frame for early-exit threading (#2082 M2 U2): active while the
+    // catch and protected bodies are walked, so a crossing `return`/`break`/
+    // `continue` inside either routes through the finally. An empty/comment-only
+    // finally (`finallyRes` null — the #2099-F2 empty-catch bug shape) pushes
+    // NO frame: it can define nothing, so jumps soundly keep direct edges.
+    const finFrame = finallyRes ? this.cfc.pushFinalizer(finallyRes.entry) : null;
 
     // A throw inside catch propagates to finally (if any), else the outer handler.
     let catchRes: SeqResult = null;
@@ -476,6 +631,27 @@ class TsCfgWalk {
         // region is walked, so it never receives a spurious throw edge.
         const idx = this.builder.newBlock(startLineOf(catchClause), endLineOf(catchClause), '');
         catchRes = { entry: idx, exits: [idx] };
+      }
+      // `catch (e)` has no header block — the param def gets its OWN
+      // facts-only block in front of the body entry. It must NOT be prepended
+      // into the body's entry block: when the catch body STARTS with a loop,
+      // that entry is the loop HEADER, re-entered on every iteration — the
+      // param def would re-gen there and falsely KILL loop-carried
+      // redefinitions of the param (`catch (e) { while (c) { e = fix(e); }
+      // sink(e); }` would lose the fix→sink fact, a taint false negative).
+      // The param block becomes the handler entry, which is also semantically
+      // right: the binding happens exactly once, on handler entry.
+      const paramFacts = this.harvest.catchParamFacts(catchClause);
+      if (paramFacts) {
+        const paramBlock = this.builder.newBlock(
+          startLineOf(catchClause),
+          startLineOf(catchClause),
+          '',
+          'normal',
+          paramFacts,
+        );
+        this.builder.edge(paramBlock, catchRes.entry, 'seq');
+        catchRes = { entry: paramBlock, exits: catchRes.exits };
       }
     }
 
@@ -498,6 +674,15 @@ class TsCfgWalk {
       for (let b = protectedStart; b < this.builder.blockCount; b++) {
         this.builder.edge(b, tryHandler, 'throw');
       }
+    }
+
+    // The finalizer frame closes once the protected/catch walks are done; any
+    // jumps that crossed it left their completion legs on `pending`, wired
+    // here from the finally's exits (see drainFinalizerPending for the
+    // finally-override semantics of an always-jumping finally).
+    if (finFrame && finallyRes) {
+      this.cfc.pop();
+      drainFinalizerPending(this.builder, finFrame, finallyRes.exits);
     }
 
     const exits: number[] = [];
@@ -523,11 +708,11 @@ class TsCfgWalk {
     return this.handlers.length ? this.handlers[this.handlers.length - 1] : this.builder.exitIndex;
   }
 
-  /** Consume the label awaiting the loop/switch this call is building. */
-  private takeLabel(): string | undefined {
-    const label = this.pendingLabel;
-    this.pendingLabel = undefined;
-    return label;
+  /** Consume the labels awaiting the loop/switch this call is building. */
+  private takeLabels(): string[] {
+    const labels = this.pendingLabels;
+    this.pendingLabels = [];
+    return labels;
   }
 
   private labelOf(stmt: SyntaxNode): string | undefined {
@@ -549,23 +734,39 @@ function buildFunctionCfg(fnNode: SyntaxNode, filePath: string): FunctionCfg | u
   const body = fnNode.childForFieldName('body');
   if (!body) return undefined; // overload signature / abstract method — no body
 
+  // Phase-1 declaration pre-scan (#2082 M2 U1) — must complete before any
+  // facts are extracted; the CFG walk below is not source-order.
+  const harvest = new TsHarvester(fnNode);
+
+  // Parameters define at ENTRY (facts only — never touch the entry block's
+  // text or span: bench fingerprints and CFG snapshots include block text).
+  const paramFacts = harvest.paramFacts();
+  if (paramFacts) builder.attachFacts(builder.entryIndex, paramFacts);
+
   if (body.type !== 'statement_block') {
     // Expression-bodied arrow: `() => expr` — one block whose value is returned.
-    const blk = builder.newBlock(startLineOf(body), endLineOf(body), body.text);
+    // Lives outside the walk class, so it harvests explicitly.
+    const blk = builder.newBlock(
+      startLineOf(body),
+      endLineOf(body),
+      body.text,
+      'normal',
+      harvest.facts(body),
+    );
     builder.edge(builder.entryIndex, blk, 'seq');
     builder.edge(blk, builder.exitIndex, 'return');
-    return builder.finish();
+    return builder.finish(harvest.table());
   }
 
-  const walk = new TsCfgWalk(builder);
+  const walk = new TsCfgWalk(builder, harvest);
   const res = walk.visitSeq(body.namedChildren.filter((c) => c.type !== 'comment'));
   if (!res) {
     builder.edge(builder.entryIndex, builder.exitIndex, 'seq'); // empty body
-    return builder.finish();
+    return builder.finish(harvest.table());
   }
   builder.edge(builder.entryIndex, res.entry, 'seq');
   builder.connect(res.exits, builder.exitIndex, 'seq'); // normal fall-off → EXIT
-  return builder.finish();
+  return builder.finish(harvest.table());
 }
 
 /** Whether a node is a TS/JS function this visitor builds a CFG for. */

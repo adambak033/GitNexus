@@ -34,6 +34,80 @@ async function countBasicBlocks(repoPath: string): Promise<number> {
   }
 }
 
+describe('pdgModeMismatch — M1→M2 stamp upgrade (#2082 M2, pure)', () => {
+  it('an M1-era stamp (no REACHING_DEF cap) mismatches an M2 request — upgrade forces full writeback', async () => {
+    const { pdgModeMismatch } = await import('../../src/core/run-analyze.js');
+    const m1Stamp = { maxFunctionLines: 2000, maxEdgesPerFunction: 5000 };
+    // default M2 request resolves maxReachingDefEdgesPerFunction=4000 ≠ undefined
+    expect(pdgModeMismatch(m1Stamp, { pdg: true })).toBe(true);
+  });
+
+  it('an identical resolved M2 config compares equal (steady state keeps incremental)', async () => {
+    const { pdgModeMismatch, resolvePdgConfig } = await import('../../src/core/run-analyze.js');
+    const stamp = resolvePdgConfig({ pdg: true });
+    expect(pdgModeMismatch(stamp, { pdg: true })).toBe(false);
+  });
+
+  it('a REACHING_DEF cap change alone trips the mismatch', async () => {
+    const { pdgModeMismatch, resolvePdgConfig } = await import('../../src/core/run-analyze.js');
+    const stamp = resolvePdgConfig({ pdg: true });
+    expect(pdgModeMismatch(stamp, { pdg: true, pdgMaxReachingDefEdgesPerFunction: 100 })).toBe(
+      true,
+    );
+    expect(pdgModeMismatch(stamp, { pdg: true, pdgMaxReachingDefEdgesPerFunction: 4000 })).toBe(
+      false, // explicit default ≡ default (resolution before comparison)
+    );
+  });
+});
+
+describe('detect_changes BasicBlock exclusion (#2082 U7)', () => {
+  it('the symbol-overlap id-prefix filter excludes exactly the BasicBlock rows', async () => {
+    const repo = await setupMiniRepo();
+    try {
+      const { runFullAnalysis } = await import('../../src/core/run-analyze.js');
+      const cb = { onProgress: () => {}, onLog: () => {} };
+      await runFullAnalysis(repo.dbPath, { skipAgentsMd: true, pdg: true }, cb);
+
+      const adapter = await import('../../src/core/lbug/lbug-adapter.js');
+      const { lbugPath } = getStoragePaths(repo.dbPath);
+      await adapter.initLbug(lbugPath);
+      try {
+        // Counterfactual: WITHOUT the U7 filter, line-bearing BasicBlock rows
+        // exist on a pdg index (the noise detect_changes used to report).
+        const blocks = (await adapter.executeQuery(
+          `MATCH (n) WHERE n.id STARTS WITH 'BasicBlock:'
+             AND n.startLine IS NOT NULL AND n.endLine IS NOT NULL
+           RETURN n.id AS id`,
+        )) as Array<{ id: string }>;
+        expect(blocks.length).toBeGreaterThan(0);
+        // With the U7 filter (the exact predicate detectChanges now runs —
+        // also validates STARTS WITH against the real engine): no BasicBlocks,
+        // real symbols intact.
+        const symbols = (await adapter.executeQuery(
+          `MATCH (n) WHERE NOT n.id STARTS WITH 'BasicBlock:'
+             AND n.startLine IS NOT NULL AND n.endLine IS NOT NULL
+           RETURN n.id AS id`,
+        )) as Array<{ id: string }>;
+        expect(symbols.length).toBeGreaterThan(0);
+        for (const row of symbols) {
+          expect(String(row.id)).not.toMatch(/^BasicBlock:/);
+        }
+        // DB-level smoke for the M2 projection itself: REACHING_DEF rows
+        // persisted with the variable name in `reason` (plan Validation).
+        const rd = (await adapter.executeQuery(
+          `MATCH (:BasicBlock)-[r:CodeRelation {type: 'REACHING_DEF'}]->(:BasicBlock)
+           RETURN count(r) AS c`,
+        )) as Array<{ c: number | bigint }>;
+        expect(Number(rd[0]?.c ?? 0)).toBeGreaterThan(0);
+      } finally {
+        await adapter.closeLbug();
+      }
+    } finally {
+      await repo.cleanup();
+    }
+  }, 600_000);
+});
+
 describe('runFullAnalysis — pdg-mode flip (#2099 F1)', () => {
   it('off→on flip forces a full writeback that persists the CFG layer; on→off removes it', async () => {
     const repo = await setupMiniRepo();
@@ -57,7 +131,11 @@ describe('runFullAnalysis — pdg-mode flip (#2099 F1)', () => {
       expect(logs.some((m) => m.includes('pdg mode changed'))).toBe(true);
       expect(await countBasicBlocks(repo.dbPath)).toBeGreaterThan(0);
       const stamped = await loadMeta(storagePath);
-      expect(stamped!.pdg).toEqual({ maxFunctionLines: 2000, maxEdgesPerFunction: 5000 });
+      expect(stamped!.pdg).toEqual({
+        maxFunctionLines: 2000,
+        maxEdgesPerFunction: 5000,
+        maxReachingDefEdgesPerFunction: 4000,
+      });
       expect(stamped!.incrementalInProgress).toBeUndefined(); // cleared on success
 
       // 3. Steady state: a second identical --pdg run takes the fast path —
@@ -105,6 +183,7 @@ describe('runFullAnalysis — pdg-mode flip (#2099 F1)', () => {
       expect((await loadMeta(storagePath))!.pdg).toEqual({
         maxFunctionLines: 2000,
         maxEdgesPerFunction: 1,
+        maxReachingDefEdgesPerFunction: 4000,
       });
       // The CFG layer survives a rebuild under a tighter edge cap (blocks are
       // never capped, only edges).
