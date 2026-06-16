@@ -4,8 +4,6 @@ import { createInterface } from 'readline';
 import { once } from 'events';
 import { finished } from 'stream/promises';
 import path from 'path';
-import os from 'os';
-import crypto from 'crypto';
 import lbug from '@ladybugdb/core';
 import { closeQueryResults } from './query-result-utils.js';
 import { KnowledgeGraph } from '../graph/types.js';
@@ -19,6 +17,7 @@ import {
   NodeTableName,
 } from './schema.js';
 import { streamAllCSVsToDisk } from './csv-generator.js';
+import type { PdgEmitManifest } from './pdg-emit-sink.js';
 import { getNodeLabel as deriveNodeLabel, type WriteStreamFactory } from './rel-pair-routing.js';
 import type { CachedEmbedding } from '../embeddings/types.js';
 import { extensionManager, type ExtensionEnsureOptions } from './extension-loader.js';
@@ -29,6 +28,7 @@ import {
   isWalCorruptionError,
   openLbugConnection,
   toNativeSafePath,
+  resolveNativeSafeStorageDir,
   WAL_RECOVERY_SUGGESTION,
   waitForWindowsHandleRelease,
   type LbugConnectionHandle,
@@ -881,6 +881,15 @@ export const loadGraphToLbug = async (
   repoPath: string,
   storagePath: string,
   onProgress?: LbugProgressCallback,
+  /**
+   * Streamed PDG-emit manifest (#2202). When present (streaming was on, full
+   * rebuild), the BasicBlock node CSV + per-pair PDG-edge CSVs it points at
+   * were already flushed to disk during the emit loop; they are merged into the
+   * COPY plan below so they load alongside the structural CSVs. When streaming
+   * was on the in-memory `graph` holds zero BasicBlocks, so `streamAllCSVsToDisk`
+   * emits none — the manifest is the sole source and there is no double-COPY.
+   */
+  pdgEmitManifest?: PdgEmitManifest,
 ) => {
   if (!conn) {
     throw new Error('LadybugDB not initialized. Call initLbug first.');
@@ -899,16 +908,43 @@ export const loadGraphToLbug = async (
   const span = (a: bigint, b: bigint): string => (Number(b - a) / 1e6).toFixed(1);
   const tStart = mark();
 
-  let csvDir: string;
-  if (process.platform === 'win32' && /[^\x00-\x7F]/.test(storagePath)) {
-    const hash = crypto.createHash('sha256').update(storagePath).digest('hex').slice(0, 16);
-    csvDir = toNativeSafePath(path.join(os.tmpdir(), `gitnexus-csv-${hash}`));
-  } else {
-    csvDir = path.join(storagePath, 'csv');
-  }
+  const csvDir = resolveNativeSafeStorageDir(storagePath, 'csv');
 
   log('Streaming CSVs to disk...');
   const csvResult = await streamAllCSVsToDisk(graph, repoPath, csvDir);
+
+  // Merge the streamed PDG-emit CSVs (#2202) into the COPY plan so the
+  // BasicBlock node table + per-pair PDG edges (CFG / REACHING_DEF / CDG /
+  // POST_DOMINATE / TAINTED / SANITIZES) load through the SAME node + per-pair
+  // COPY loops as the structural CSVs. The graph held zero BasicBlocks when
+  // streaming, so `streamAllCSVsToDisk` produced none of these — the manifest
+  // is the sole source and there is no double-COPY. Absent ⇒ no-op.
+  if (pdgEmitManifest) {
+    for (const [table, meta] of pdgEmitManifest.nodeFiles) {
+      // A collision means a BasicBlock leaked into the in-memory graph during a
+      // streamed run (streamAllCSVsToDisk then emitted a structural basicblock.csv).
+      // That is a streaming-invariant violation — fail loudly rather than
+      // silently overwrite one CSV with the other and drop its rows (#2202 review #3).
+      if (csvResult.nodeFiles.has(table)) {
+        throw new Error(
+          `Streaming PDG manifest collides with a structural node CSV for "${table}" — ` +
+            `the in-memory graph should hold zero ${table} nodes when streaming. ` +
+            `A ${table} node leaked into the graph during a streamed emit.`,
+        );
+      }
+      csvResult.nodeFiles.set(table, meta);
+    }
+    for (const [pairKey, meta] of pdgEmitManifest.relsByPair) {
+      if (csvResult.relsByPair.has(pairKey)) {
+        throw new Error(
+          `Streaming PDG manifest collides with a structural relationship CSV for pair ` +
+            `"${pairKey}" — a PDG edge leaked into the in-memory graph during a streamed emit.`,
+        );
+      }
+      csvResult.relsByPair.set(pairKey, meta);
+      csvResult.totalValidRels += meta.rows;
+    }
+  }
   const tCsv = mark();
 
   const validTables = new Set<string>(NODE_TABLES as readonly string[]);
