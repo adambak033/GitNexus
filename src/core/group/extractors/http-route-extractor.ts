@@ -58,11 +58,91 @@ RETURN callerFile.id AS fileId, callerFile.filePath AS filePath,
        route.name AS routePath, route.id AS routeId,
        r.reason AS fetchReason`;
 
-const CONTAINS_QUERY = `
-MATCH (file:File {id: $fileId})<-[:CodeRelation {type: 'CONTAINS'}]-(sym)
-WHERE sym.startLine IS NOT NULL
-RETURN sym.id AS uid, sym.name AS name, sym.filePath AS filePath, labels(sym) AS labels
-ORDER BY sym.startLine`;
+// Function/Method/CodeElement symbols (with line spans) in a file, addressed by
+// repo-relative path so the source-scan paths — which have a path but no graph
+// `fileId` — can resolve the symbol CONTAINING an HTTP call by line-span
+// containment. Matched by `filePath` rather than a File-[DEFINES]->sym edge so
+// it also reaches methods nested in classes (Java/Kotlin), where the File
+// defines the class and the class defines the method.
+const CONTAINING_QUERY = `
+MATCH (sym:Function)
+WHERE sym.filePath = $filePath AND sym.startLine IS NOT NULL AND sym.endLine IS NOT NULL
+RETURN sym.id AS uid, sym.name AS name, sym.filePath AS filePath,
+       sym.startLine AS startLine, sym.endLine AS endLine, labels(sym) AS labels
+UNION ALL
+MATCH (sym:Method)
+WHERE sym.filePath = $filePath AND sym.startLine IS NOT NULL AND sym.endLine IS NOT NULL
+RETURN sym.id AS uid, sym.name AS name, sym.filePath AS filePath,
+       sym.startLine AS startLine, sym.endLine AS endLine, labels(sym) AS labels
+UNION ALL
+MATCH (sym:CodeElement)
+WHERE sym.filePath = $filePath AND sym.startLine IS NOT NULL AND sym.endLine IS NOT NULL
+RETURN sym.id AS uid, sym.name AS name, sym.filePath AS filePath,
+       sym.startLine AS startLine, sym.endLine AS endLine, labels(sym) AS labels`;
+
+interface ResolvedSymbol {
+  uid: string;
+  name: string;
+  filePath: string;
+}
+
+/**
+ * The innermost Function/Method whose `[startLine, endLine]` span contains
+ * `line` — i.e. the symbol the HTTP call lives inside. For a consumer this is
+ * the function making the `fetch`; for an inline-arrow provider it is the
+ * handler arrow itself. Returns null when nothing encloses the line (e.g. a
+ * route registered at module scope referencing a named handler defined
+ * elsewhere — that case resolves by name instead).
+ */
+function resolveContainingSymbol(
+  rows: Record<string, unknown>[],
+  line: number,
+): ResolvedSymbol | null {
+  const norm = (x: unknown): string => String(x ?? '');
+  // Detection lines are 1-based; symbol spans are stored 0-based for the
+  // languages indexed today (parse-worker records `startPosition.row`). So the
+  // base-correct probe is `line - 1`. Pick the INNERMOST (smallest-span) symbol
+  // whose span contains the probe. Only if nothing contains `line - 1` do we
+  // retry with the raw `line` — a defensive fallback for any future language
+  // that stores 1-based spans. Probing `line - 1` first (rather than OR-ing both)
+  // avoids the +1 slack mis-picking a one-line sibling that sits on `line`.
+  const pick = (probe: number): ResolvedSymbol | null => {
+    let best: ResolvedSymbol | null = null;
+    let bestSpan = Number.POSITIVE_INFINITY;
+    for (const r of rows) {
+      const labels = JSON.stringify(r.labels ?? r[5] ?? '');
+      if (!['Function', 'Method', 'CodeElement'].some((l) => labels.includes(l))) continue;
+      const start = Number(r.startLine ?? r[3]);
+      const end = Number(r.endLine ?? r[4]);
+      if (!Number.isFinite(start) || !Number.isFinite(end)) continue;
+      if (probe < start || probe > end) continue;
+      const span = end - start;
+      if (span < bestSpan) {
+        bestSpan = span;
+        best = {
+          uid: norm(r.uid ?? r[0]),
+          name: norm(r.name ?? r[1]),
+          filePath: norm(r.filePath ?? r[2]),
+        };
+      }
+    }
+    return best && best.uid ? best : null;
+  };
+  return pick(line - 1) ?? pick(line);
+}
+
+/** A Function/Method in the file matching `name` exactly (for named handlers). */
+function resolveSymbolByName(rows: Record<string, unknown>[], name: string): ResolvedSymbol | null {
+  const norm = (x: unknown): string => String(x ?? '');
+  for (const r of rows) {
+    const labels = JSON.stringify(r.labels ?? r[5] ?? '');
+    if (!['Function', 'Method', 'CodeElement'].some((l) => labels.includes(l))) continue;
+    if (norm(r.name ?? r[1]) !== name) continue;
+    const uid = norm(r.uid ?? r[0]);
+    if (uid) return { uid, name, filePath: norm(r.filePath ?? r[2]) };
+  }
+  return null;
+}
 
 // ─── Path normalization (shared between provider / consumer paths) ──
 
@@ -122,35 +202,6 @@ function methodFromRouteReason(reason: string): string | null {
   if (/DeleteMapping|decorator-Delete/i.test(r)) return 'DELETE';
   if (/PatchMapping|decorator-Patch/i.test(r)) return 'PATCH';
   return null;
-}
-
-function pickSymbolUid(
-  rows: Record<string, unknown>[],
-  preferredName: string | null,
-): { uid: string; name: string; filePath: string } {
-  const norm = (x: unknown) => String(x ?? '');
-  const labeled = rows.filter((r) => {
-    const labels = r.labels ?? r[3];
-    const s = JSON.stringify(labels);
-    return s.includes('Method') || s.includes('Function');
-  });
-  const pool = labeled.length > 0 ? labeled : rows;
-  if (preferredName) {
-    const hit = pool.find((r) => norm(r.name ?? r[1]) === preferredName);
-    if (hit) {
-      return {
-        uid: norm(hit.uid ?? hit[0]),
-        name: norm(hit.name ?? hit[1]),
-        filePath: norm(hit.filePath ?? hit[2]),
-      };
-    }
-  }
-  const first = pool[0] || rows[0];
-  return {
-    uid: norm(first?.uid ?? first?.[0]),
-    name: norm(first?.name ?? first?.[1]),
-    filePath: norm(first?.filePath ?? first?.[2]),
-  };
 }
 
 // ─── Orchestrator ────────────────────────────────────────────────────
@@ -284,6 +335,47 @@ export class HttpRouteExtractor implements ContractExtractor {
 
     const files = await getScannedFiles();
 
+    // Resolve an HTTP detection to the symbol it lives in — the containing
+    // function for a consumer / inline-arrow provider, or a named handler for
+    // a provider — addressed by repo-relative file path so the source-scan
+    // paths (which have no graph `fileId`) can resolve too. Per-file symbol
+    // lists are cached. Returns null without a DB or when nothing resolves (a
+    // named provider resolves by name even with no `line`; containment needs
+    // one); the contract then keeps an empty symbolUid and downstream falls
+    // back to file-level boundary matching.
+    const fileSymbolCache = new Map<string, Record<string, unknown>[]>();
+    const loadFileSymbols = async (filePath: string): Promise<Record<string, unknown>[]> => {
+      if (!dbExecutor) return [];
+      const cached = fileSymbolCache.get(filePath);
+      if (cached) return cached;
+      let rows: Record<string, unknown>[] = [];
+      try {
+        rows = await dbExecutor(CONTAINING_QUERY, { filePath });
+      } catch {
+        rows = [];
+      }
+      fileSymbolCache.set(filePath, rows);
+      return rows;
+    };
+    const resolveDetectionSymbol = async (
+      filePath: string,
+      d: HttpDetection,
+    ): Promise<ResolvedSymbol | null> => {
+      if (!dbExecutor) return null;
+      const syms = await loadFileSymbols(filePath);
+      if (syms.length === 0) return null;
+      // Name resolution does NOT need a detection line — a named provider
+      // handler (Spring/Go/etc. method name) resolves by name even when the
+      // plugin didn't set `line`. Try it FIRST; only the containment fallback
+      // requires a line.
+      if (d.role === 'provider' && d.name) {
+        const byName = resolveSymbolByName(syms, d.name);
+        if (byName) return byName;
+      }
+      if (d.line == null) return null;
+      return resolveContainingSymbol(syms, d.line);
+    };
+
     // Run the graph provider pass FIRST. After #2138 Part 2 it reads handler
     // symbols from the graph (no source parse for resolved routes), so it can
     // report which files are fully graph-covered BEFORE we decide what to
@@ -294,7 +386,12 @@ export class HttpRouteExtractor implements ContractExtractor {
     const coveredFiles = new Set<string>();
     const graphProviders =
       dbExecutor != null
-        ? await this.extractProvidersGraph(dbExecutor, getDetections, coveredFiles)
+        ? await this.extractProvidersGraph(
+            dbExecutor,
+            getDetections,
+            resolveDetectionSymbol,
+            coveredFiles,
+          )
         : [];
 
     // Consumer-safety gate (#2138 Part 2): `extractProvidersGraph` marks a file
@@ -326,14 +423,16 @@ export class HttpRouteExtractor implements ContractExtractor {
 
     const providers = this.mergeGraphAndSourceContracts(
       graphProviders,
-      await this.extractProvidersSourceScan(scanFiles, getDetections),
+      await this.extractProvidersSourceScan(scanFiles, getDetections, resolveDetectionSymbol),
     );
 
     const graphConsumers =
-      dbExecutor != null ? await this.extractConsumersGraph(dbExecutor, getDetections) : [];
+      dbExecutor != null
+        ? await this.extractConsumersGraph(dbExecutor, getDetections, resolveDetectionSymbol)
+        : [];
     const consumers = this.mergeGraphAndSourceContracts(
       graphConsumers,
-      await this.extractConsumersSourceScan(scanFiles, getDetections),
+      await this.extractConsumersSourceScan(scanFiles, getDetections, resolveDetectionSymbol),
     );
 
     return [...providers, ...consumers];
@@ -359,6 +458,7 @@ export class HttpRouteExtractor implements ContractExtractor {
   private async extractProvidersGraph(
     db: CypherExecutor,
     getDetections: (rel: string) => Promise<HttpDetection[]>,
+    resolveSymbol: (filePath: string, d: HttpDetection) => Promise<ResolvedSymbol | null>,
     coveredFiles?: Set<string>,
   ): Promise<ExtractedContract[]> {
     const out: ExtractedContract[] = [];
@@ -409,19 +509,17 @@ export class HttpRouteExtractor implements ContractExtractor {
       let symbolUid = '';
       let symbolName = path.basename(filePath) || 'handler';
       let symPath = filePath;
-
       if (handlerSymbolId) {
         // Fast path (Part 2, #2138): the handler symbol was resolved during
-        // ingestion and persisted on the Route node, so we read it straight
-        // from the graph and SKIP the `getDetections()` source-scan/parse the
-        // legacy path needed just to recover the handler name. CONTAINS is a
-        // cheap graph query (no tree-sitter parse) used only to surface the
-        // handler's display name/path; the uid is authoritative regardless.
+        // ingestion and persisted on the Route node, so the uid is authoritative
+        // and we SKIP the source-scan/parse the legacy path needed. Recover the
+        // display name from the file's symbols via CONTAINING_QUERY (the correct
+        // File-[DEFINES]->symbol edge — NOT CONTAINS, which is File->Folder).
         if (!method) method = 'GET';
         symbolUid = handlerSymbolId;
-        if (fileId) {
+        if (filePath) {
           try {
-            const syms = await db(CONTAINS_QUERY, { fileId });
+            const syms = await db(CONTAINING_QUERY, { filePath });
             const hit = syms.find((s) => String(s.uid ?? s[0]) === handlerSymbolId);
             if (hit) {
               symbolName = String(hit.name ?? hit[1]) || symbolName;
@@ -433,11 +531,13 @@ export class HttpRouteExtractor implements ContractExtractor {
         }
       } else {
         // Legacy fallback (old index / unresolved handler): recover the handler
-        // name from the plugin's scan of the handler file (this parses source).
-        // Always run the lookup: even when method is set, we still need the name.
+        // from the plugin's scan and resolve it to a real symbol by name (the
+        // handler/method name) or, for an inline handler, by line-span containment
+        // — both over File-[DEFINES]->symbol via resolveSymbol. No CONTAINS /
+        // pickSymbolUid: CONTAINS is File->Folder and the old first-symbol guess
+        // could win the contractId merge with a wrong uid.
         const detections = filePath ? await getDetections(filePath) : [];
         const providerDetections = detections.filter((d) => d.role === 'provider');
-        let handlerName: string | null = null;
         // Candidates share the same normalized path. When multiple detections at
         // the same path exist (GET + POST /api/orders in one router), a blind
         // `.find()` silently returned the first verb — attaching the wrong
@@ -452,28 +552,17 @@ export class HttpRouteExtractor implements ContractExtractor {
         } else if (candidates.length === 1) {
           match = candidates[0];
         }
-        // else: multiple candidates + unknown method → leave match undefined so
-        // handlerName stays null and we skip symbol enrichment, keeping the
-        // file-basename fallback rather than letting pickSymbolUid pick the
-        // first Function/Method (which reintroduces mis-attribution).
-        if (match) {
-          if (!method) method = match.method;
-          handlerName = match.name;
-        }
+        // else: multiple candidates + unknown method → leave match undefined and
+        // skip symbol enrichment, keeping the file-basename fallback rather than
+        // guessing the wrong handler.
+        if (match && !method) method = match.method;
         if (!method) method = 'GET';
-
-        if (fileId && !ambiguousCandidates) {
-          try {
-            const syms = await db(CONTAINS_QUERY, { fileId });
-            if (syms.length > 0) {
-              const picked = pickSymbolUid(syms, handlerName);
-              symbolUid = picked.uid;
-              symbolName = picked.name;
-              symPath = picked.filePath || filePath;
-            }
-          } catch {
-            /* ignore */
-          }
+        const resolved =
+          match && !ambiguousCandidates ? await resolveSymbol(filePath, match) : null;
+        if (resolved) {
+          symbolUid = resolved.uid;
+          symbolName = resolved.name;
+          symPath = resolved.filePath || filePath;
         }
       }
 
@@ -517,6 +606,7 @@ export class HttpRouteExtractor implements ContractExtractor {
   private async extractProvidersSourceScan(
     files: string[],
     getDetections: (rel: string) => Promise<HttpDetection[]>,
+    resolveSymbol: (filePath: string, d: HttpDetection) => Promise<ResolvedSymbol | null>,
   ): Promise<ExtractedContract[]> {
     const out: ExtractedContract[] = [];
     for (const rel of files) {
@@ -524,19 +614,26 @@ export class HttpRouteExtractor implements ContractExtractor {
       for (const d of detections) {
         if (d.role !== 'provider') continue;
         const pathNorm = normalizeHttpPath(d.path);
+        // Resolve the handler to a real symbol (named handler, or the inline
+        // arrow that encloses the registration line) so the contract carries a
+        // real symbolUid; fall back to the file + detection name otherwise.
+        const resolved = await resolveSymbol(rel, d);
         out.push({
           contractId: contractIdFor(d.method, pathNorm),
           type: 'http',
           role: 'provider',
-          symbolUid: '',
-          symbolRef: { filePath: rel, name: d.name ?? 'handler' },
-          symbolName: d.name ?? 'handler',
+          symbolUid: resolved?.uid ?? '',
+          symbolRef: {
+            filePath: resolved?.filePath || rel,
+            name: resolved?.name ?? d.name ?? 'handler',
+          },
+          symbolName: resolved?.name ?? d.name ?? 'handler',
           confidence: d.confidence,
           meta: {
             method: d.method,
             path: pathNorm,
             pathSegments: pathNorm.split('/').filter(Boolean),
-            extractionStrategy: 'source_scan',
+            extractionStrategy: resolved ? 'source_scan_resolved' : 'source_scan',
             framework: d.framework,
           },
         });
@@ -550,6 +647,7 @@ export class HttpRouteExtractor implements ContractExtractor {
   private async extractConsumersGraph(
     db: CypherExecutor,
     getDetections: (rel: string) => Promise<HttpDetection[]>,
+    resolveSymbol: (filePath: string, d: HttpDetection) => Promise<ResolvedSymbol | null>,
   ): Promise<ExtractedContract[]> {
     const out: ExtractedContract[] = [];
     let rows: Record<string, unknown>[];
@@ -589,19 +687,19 @@ export class HttpRouteExtractor implements ContractExtractor {
       let symbolUid = '';
       let symbolName = 'fetch';
       let symPath = filePath;
-      const fileId = row.fileId ?? row[0];
-      if (fileId) {
-        try {
-          const syms = await db(CONTAINS_QUERY, { fileId });
-          if (syms.length > 0) {
-            const picked = pickSymbolUid(syms, null);
-            symbolUid = picked.uid;
-            symbolName = picked.name;
-            symPath = picked.filePath || filePath;
-          }
-        } catch {
-          /* ignore */
-        }
+      // Resolve the function CONTAINING the fetch by line-span. Do NOT fall back
+      // to the old `pickSymbolUid(syms, null)` first-symbol-in-file guess: an
+      // arbitrary wrong uid is worse than an empty one because it would win the
+      // contractId merge over a correctly-resolved source-scan contract (and the
+      // empty case degrades to the file-level boundary fallback downstream).
+      const resolved =
+        consumerCandidates.length === 1
+          ? await resolveSymbol(filePath, consumerCandidates[0])
+          : null;
+      if (resolved) {
+        symbolUid = resolved.uid;
+        symbolName = resolved.name;
+        symPath = resolved.filePath || filePath;
       }
       out.push({
         contractId: cid,
@@ -627,6 +725,7 @@ export class HttpRouteExtractor implements ContractExtractor {
   private async extractConsumersSourceScan(
     files: string[],
     getDetections: (rel: string) => Promise<HttpDetection[]>,
+    resolveSymbol: (filePath: string, d: HttpDetection) => Promise<ResolvedSymbol | null>,
   ): Promise<ExtractedContract[]> {
     const out: ExtractedContract[] = [];
     for (const rel of files) {
@@ -634,18 +733,22 @@ export class HttpRouteExtractor implements ContractExtractor {
       for (const d of detections) {
         if (d.role !== 'consumer') continue;
         const pathNorm = normalizeConsumerPath(d.path);
+        // Resolve the function CONTAINING the fetch/axios call so the consumer
+        // contract carries a real symbolUid (was always '' — the gap that left
+        // cross-repo trace/impact unable to traverse HTTP links).
+        const resolved = await resolveSymbol(rel, d);
         out.push({
           contractId: contractIdFor(d.method, pathNorm),
           type: 'http',
           role: 'consumer',
-          symbolUid: '',
-          symbolRef: { filePath: rel, name: 'fetch' },
-          symbolName: 'fetch',
+          symbolUid: resolved?.uid ?? '',
+          symbolRef: { filePath: resolved?.filePath || rel, name: resolved?.name ?? 'fetch' },
+          symbolName: resolved?.name ?? 'fetch',
           confidence: d.confidence,
           meta: {
             method: d.method,
             path: pathNorm,
-            extractionStrategy: 'source_scan',
+            extractionStrategy: resolved ? 'source_scan_resolved' : 'source_scan',
             framework: d.framework,
           },
         });

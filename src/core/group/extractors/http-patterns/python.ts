@@ -1021,6 +1021,7 @@ export const PYTHON_HTTP_PLUGIN: HttpLanguagePlugin = {
         method: methodNode.text.toUpperCase(),
         path,
         name: null,
+        line: pathNode.startPosition.row + 1,
         confidence: 0.7,
       });
     }
@@ -1038,6 +1039,7 @@ export const PYTHON_HTTP_PLUGIN: HttpLanguagePlugin = {
         method: methodNode.text.toUpperCase(),
         path,
         name: null,
+        line: pathNode.startPosition.row + 1,
         confidence: 0.7,
       });
     }
@@ -1056,6 +1058,7 @@ export const PYTHON_HTTP_PLUGIN: HttpLanguagePlugin = {
         method: methodRaw.toUpperCase(),
         path,
         name: null,
+        line: pathNode.startPosition.row + 1,
         confidence: 0.7,
       });
     }
@@ -1075,6 +1078,7 @@ export const PYTHON_HTTP_PLUGIN: HttpLanguagePlugin = {
         method: methodNode.text.toUpperCase(),
         path,
         name: null,
+        line: pathNode.startPosition.row + 1,
         confidence: 0.7,
       });
     }
@@ -1095,6 +1099,7 @@ export const PYTHON_HTTP_PLUGIN: HttpLanguagePlugin = {
         method: methodRaw.toUpperCase(),
         path,
         name: null,
+        line: pathNode.startPosition.row + 1,
         confidence: 0.7,
       });
     }
@@ -1127,6 +1132,7 @@ export const PYTHON_HTTP_PLUGIN: HttpLanguagePlugin = {
         method: httpMethod,
         path,
         name: null,
+        line: methodNode.startPosition.row + 1,
         confidence: 0.65,
       });
     }
@@ -1153,6 +1159,7 @@ export const PYTHON_HTTP_PLUGIN: HttpLanguagePlugin = {
         method: httpMethod,
         path: normalized,
         name: null,
+        line: methodNode.startPosition.row + 1,
         confidence: 0.6,
       });
     }

@@ -97,7 +97,7 @@ describe('HttpRouteExtractor — Route.method from graph (Step A / #2138)', () =
           },
         ];
       }
-      if (query.includes('CONTAINS')) return containsFor(['createOrder']);
+      if (query.includes('UNION ALL')) return containsFor(['createOrder']);
       return [];
     });
 
@@ -130,7 +130,7 @@ describe('HttpRouteExtractor — Route.method from graph (Step A / #2138)', () =
           },
         ];
       }
-      if (query.includes('CONTAINS')) return containsFor(['listOrders', 'replaceOrder']);
+      if (query.includes('UNION ALL')) return containsFor(['listOrders', 'replaceOrder']);
       return [];
     });
 
@@ -160,7 +160,7 @@ describe('HttpRouteExtractor — Route.method from graph (Step A / #2138)', () =
           },
         ];
       }
-      if (query.includes('CONTAINS')) return containsFor(['deleteOrder']);
+      if (query.includes('UNION ALL')) return containsFor(['deleteOrder']);
       return [];
     });
 
@@ -188,7 +188,7 @@ describe('HttpRouteExtractor — Route.method from graph (Step A / #2138)', () =
           },
         ];
       }
-      if (query.includes('CONTAINS')) return containsFor(['listOrders']);
+      if (query.includes('UNION ALL')) return containsFor(['listOrders']);
       return [];
     });
 
@@ -218,17 +218,18 @@ describe('HttpRouteExtractor — Route.method from graph (Step A / #2138)', () =
           },
         ];
       }
-      if (query.includes('CONTAINS')) {
+      if (query.includes('UNION ALL')) {
         return [
           {
             uid: HID,
             name: 'createOrder',
             filePath: 'OrderController.java',
+            startLine: 10,
+            endLine: 12,
             labels: ['Method'],
             0: HID,
             1: 'createOrder',
             2: 'OrderController.java',
-            3: ['Method'],
           },
         ];
       }
@@ -242,7 +243,7 @@ describe('HttpRouteExtractor — Route.method from graph (Step A / #2138)', () =
     expect(out).toHaveLength(1);
     expect(out[0].meta.method).toBe('POST');
     // The persisted symbol id is authoritative; name/path come from the cheap
-    // CONTAINS graph query (no source parse).
+    // CONTAINING_QUERY graph lookup by filePath (no source parse).
     expect(out[0].symbolUid).toBe(HID);
     expect(out[0].symbolName).toBe('createOrder');
   });
@@ -261,7 +262,7 @@ describe('HttpRouteExtractor — Route.method from graph (Step A / #2138)', () =
           },
         ];
       }
-      if (query.includes('CONTAINS')) return containsFor(['createOrder']);
+      if (query.includes('UNION ALL')) return containsFor(['createOrder']);
       return [];
     });
 
