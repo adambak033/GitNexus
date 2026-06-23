@@ -49,6 +49,7 @@ MATCH (handlerFile:File)-[r:CodeRelation {type: 'HANDLES_ROUTE'}]->(route:Route)
 RETURN handlerFile.id AS fileId, handlerFile.filePath AS filePath,
        route.name AS routePath, route.id AS routeId,
        route.method AS routeMethod,
+       route.handlerSymbolId AS handlerSymbolId,
        route.responseKeys AS responseKeys,
        r.reason AS routeSource`;
 const FETCHES_QUERY = `
@@ -282,22 +283,57 @@ export class HttpRouteExtractor implements ContractExtractor {
     };
 
     const files = await getScannedFiles();
-    await collectProjectDetections(files);
 
+    // Run the graph provider pass FIRST. After #2138 Part 2 it reads handler
+    // symbols from the graph (no source parse for resolved routes), so it can
+    // report which files are fully graph-covered BEFORE we decide what to
+    // parse. Files fully covered by a `routeCoverage: 'complete'` language are
+    // candidates to skip the source scan + tree-sitter parse — but only their
+    // *providers* are graph-authoritative; the consumer-safety gate below
+    // removes any candidate that still needs scanning for outbound calls.
+    const coveredFiles = new Set<string>();
     const graphProviders =
-      dbExecutor != null ? await this.extractProvidersGraph(dbExecutor, getDetections) : [];
-    // Source scan always runs to capture routes in languages/files not covered
-    // by graph edges; the glob and per-file parse results are cached above.
+      dbExecutor != null
+        ? await this.extractProvidersGraph(dbExecutor, getDetections, coveredFiles)
+        : [];
+
+    // Consumer-safety gate (#2138 Part 2): `extractProvidersGraph` marks a file
+    // covered on *provider* grounds (all HANDLES_ROUTE rows resolved + a
+    // `routeCoverage: 'complete'` language). But a provider-covered file may also
+    // be a *consumer* (a controller that calls RestTemplate/WebClient/Guzzle/
+    // requests/...), and ingestion emits no FETCHES edges for those server-side
+    // languages — the graph can't back them up. So a covered file is only truly
+    // safe to skip (parse) when its plugin can PROVE, from a cheap parse-free
+    // text scan, that it holds no such consumer call. Anything else (a positive
+    // signal, no `hasConsumerSignals` hook, or an unreadable file) stays in the
+    // scan set so its consumer contracts are preserved.
+    for (const f of [...coveredFiles]) {
+      const plugin = getPluginForFile(f);
+      const content = readSafe(repoPath, f);
+      const provenNoConsumer =
+        content != null && typeof plugin?.hasConsumerSignals === 'function'
+          ? plugin.hasConsumerSignals(content) === false
+          : false;
+      if (!provenNoConsumer) coveredFiles.delete(f);
+    }
+
+    // Everything the graph did not fully cover still gets a full source scan
+    // (fail-open: partial-coverage languages, unresolved routes, and graph-less
+    // runs all land here).
+    const scanFiles = files.filter((f) => !coveredFiles.has(f));
+
+    await collectProjectDetections(scanFiles);
+
     const providers = this.mergeGraphAndSourceContracts(
       graphProviders,
-      await this.extractProvidersSourceScan(files, getDetections),
+      await this.extractProvidersSourceScan(scanFiles, getDetections),
     );
 
     const graphConsumers =
       dbExecutor != null ? await this.extractConsumersGraph(dbExecutor, getDetections) : [];
     const consumers = this.mergeGraphAndSourceContracts(
       graphConsumers,
-      await this.extractConsumersSourceScan(files, getDetections),
+      await this.extractConsumersSourceScan(scanFiles, getDetections),
     );
 
     return [...providers, ...consumers];
@@ -323,8 +359,14 @@ export class HttpRouteExtractor implements ContractExtractor {
   private async extractProvidersGraph(
     db: CypherExecutor,
     getDetections: (rel: string) => Promise<HttpDetection[]>,
+    coveredFiles?: Set<string>,
   ): Promise<ExtractedContract[]> {
     const out: ExtractedContract[] = [];
+    // Per-file coverage tracking (#2138 Part 2): a file is "fully graph-covered"
+    // when every one of its HANDLES_ROUTE rows resolved a handlerSymbolId AND its
+    // language plugin declares `routeCoverage: 'complete'`. Such files can skip
+    // the source scan + parse entirely — the graph is authoritative for them.
+    const fileAllResolved = new Map<string, boolean>();
     let rows: Record<string, unknown>[];
     try {
       rows = await db(HANDLES_ROUTE_QUERY);
@@ -354,66 +396,89 @@ export class HttpRouteExtractor implements ContractExtractor {
         .toUpperCase();
       let method = (graphMethod || null) ?? methodFromRouteReason(routeSource);
 
-      // Look up handler name (and backfill method if missing) from the
-      // plugin's scan of the handler file. This replaces the old
-      // regex-based `inferMethodFromFileScan` and `pickJavaHandlerName`
-      // helpers — tree-sitter gives both pieces of information
-      // structurally. Always run the lookup: even when method is set by
-      // `methodFromRouteReason`, we still need the handler name.
-      const detections = filePath ? await getDetections(filePath) : [];
-      const providerDetections = detections.filter((d) => d.role === 'provider');
-      let handlerName: string | null = null;
-      const normalizedRoute = normalizeHttpPath(routePath);
-      // Candidates share the same normalized path. When multiple
-      // detections at the same path exist (e.g. GET + POST /api/orders
-      // in one router), a blind `.find()` silently returned the first
-      // verb — attaching the wrong handler and, when method was not
-      // already pinned by the route reason, the wrong method too.
-      // Disambiguate by method when we know it; refuse to guess when
-      // we don't.
-      const candidates = providerDetections.filter(
-        (d) => normalizeHttpPath(d.path) === normalizedRoute,
-      );
-      let match: (typeof candidates)[number] | undefined;
-      const ambiguousCandidates = !method && candidates.length > 1;
-      if (method) {
-        match = candidates.find((d) => d.method === method);
-      } else if (candidates.length === 1) {
-        match = candidates[0];
+      const handlerSymbolId = String(row.handlerSymbolId ?? '').trim();
+      const fileId = row.fileId ?? row[0];
+      // Track per-file resolution for the parse-skip coverage set: a file stays
+      // "all resolved" only while every one of its rows carries a handlerSymbolId.
+      if (filePath) {
+        const prev = fileAllResolved.get(filePath);
+        fileAllResolved.set(filePath, (prev ?? true) && handlerSymbolId.length > 0);
       }
-      // else: multiple candidates + unknown method → leave match
-      // undefined so handlerName stays null and skip symbol
-      // enrichment below, keeping the file-basename fallback instead
-      // of letting pickSymbolUid silently pick the first Function /
-      // Method in the file (which reintroduces the mis-attribution
-      // we were trying to avoid). Method stays at the conservative
-      // 'GET' default set below.
-      if (match) {
-        if (!method) method = match.method;
-        handlerName = match.name;
-      }
-      if (!method) method = 'GET';
-
-      const pathNorm = normalizeHttpPath(routePath);
-      const cid = contractIdFor(method, pathNorm);
+      const pathNormEarly = normalizeHttpPath(routePath);
 
       let symbolUid = '';
       let symbolName = path.basename(filePath) || 'handler';
       let symPath = filePath;
-      const fileId = row.fileId ?? row[0];
-      if (fileId && !ambiguousCandidates) {
-        try {
-          const syms = await db(CONTAINS_QUERY, { fileId });
-          if (syms.length > 0) {
-            const picked = pickSymbolUid(syms, handlerName);
-            symbolUid = picked.uid;
-            symbolName = picked.name;
-            symPath = picked.filePath || filePath;
+
+      if (handlerSymbolId) {
+        // Fast path (Part 2, #2138): the handler symbol was resolved during
+        // ingestion and persisted on the Route node, so we read it straight
+        // from the graph and SKIP the `getDetections()` source-scan/parse the
+        // legacy path needed just to recover the handler name. CONTAINS is a
+        // cheap graph query (no tree-sitter parse) used only to surface the
+        // handler's display name/path; the uid is authoritative regardless.
+        if (!method) method = 'GET';
+        symbolUid = handlerSymbolId;
+        if (fileId) {
+          try {
+            const syms = await db(CONTAINS_QUERY, { fileId });
+            const hit = syms.find((s) => String(s.uid ?? s[0]) === handlerSymbolId);
+            if (hit) {
+              symbolName = String(hit.name ?? hit[1]) || symbolName;
+              symPath = String(hit.filePath ?? hit[2]) || filePath;
+            }
+          } catch {
+            /* keep the authoritative uid + basename fallback */
           }
-        } catch {
-          /* ignore */
+        }
+      } else {
+        // Legacy fallback (old index / unresolved handler): recover the handler
+        // name from the plugin's scan of the handler file (this parses source).
+        // Always run the lookup: even when method is set, we still need the name.
+        const detections = filePath ? await getDetections(filePath) : [];
+        const providerDetections = detections.filter((d) => d.role === 'provider');
+        let handlerName: string | null = null;
+        // Candidates share the same normalized path. When multiple detections at
+        // the same path exist (GET + POST /api/orders in one router), a blind
+        // `.find()` silently returned the first verb — attaching the wrong
+        // handler/method. Disambiguate by method when known; refuse to guess.
+        const candidates = providerDetections.filter(
+          (d) => normalizeHttpPath(d.path) === pathNormEarly,
+        );
+        let match: (typeof candidates)[number] | undefined;
+        const ambiguousCandidates = !method && candidates.length > 1;
+        if (method) {
+          match = candidates.find((d) => d.method === method);
+        } else if (candidates.length === 1) {
+          match = candidates[0];
+        }
+        // else: multiple candidates + unknown method → leave match undefined so
+        // handlerName stays null and we skip symbol enrichment, keeping the
+        // file-basename fallback rather than letting pickSymbolUid pick the
+        // first Function/Method (which reintroduces mis-attribution).
+        if (match) {
+          if (!method) method = match.method;
+          handlerName = match.name;
+        }
+        if (!method) method = 'GET';
+
+        if (fileId && !ambiguousCandidates) {
+          try {
+            const syms = await db(CONTAINS_QUERY, { fileId });
+            if (syms.length > 0) {
+              const picked = pickSymbolUid(syms, handlerName);
+              symbolUid = picked.uid;
+              symbolName = picked.name;
+              symPath = picked.filePath || filePath;
+            }
+          } catch {
+            /* ignore */
+          }
         }
       }
+
+      const pathNorm = pathNormEarly;
+      const cid = contractIdFor(method, pathNorm);
 
       out.push({
         contractId: cid,
@@ -431,6 +496,18 @@ export class HttpRouteExtractor implements ContractExtractor {
           routeSource,
         },
       });
+    }
+
+    // Populate the parse-skip coverage set: files whose every provider route
+    // resolved a handler symbol AND whose language declares complete ingestion
+    // route coverage. Fail-open — any unresolved row or a 'partial' language
+    // leaves the file out, so it still gets a full source scan.
+    if (coveredFiles) {
+      for (const [fp, allResolved] of fileAllResolved) {
+        if (allResolved && getPluginForFile(fp)?.routeCoverage === 'complete') {
+          coveredFiles.add(fp);
+        }
+      }
     }
     return out;
   }
