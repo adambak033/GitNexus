@@ -37,10 +37,25 @@ const FTS_UNAVAILABLE_NOTE =
 /**
  * Dynamically skip an FTS-primitive test when the extension cannot load.
  * `ctx.skip()` aborts the test, so callers should `await` this first thing.
+ *
+ * Honors GITNEXUS_REQUIRE_FTS=1 the same way `withTestLbugDB` does (see
+ * test/helpers/test-indexed-db.ts): when CI sets it, an unavailable extension is
+ * a HARD FAILURE, never a silent skip — otherwise these FTS-primitive tests
+ * (this file is in LBUG_NATIVE, so it runs on the ubuntu/macOS/windows jobs that
+ * all set GITNEXUS_REQUIRE_FTS=1) could vanish from a green run. Offline/local
+ * runs (no env var) still skip gracefully (#2299).
  */
 const skipUnlessFtsAvailable = async (ctx: { skip: (note?: string) => void }): Promise<void> => {
   const { loadFTSExtension } = await import('../../src/core/lbug/lbug-adapter.js');
-  if (!(await loadFTSExtension())) ctx.skip(FTS_UNAVAILABLE_NOTE);
+  if (await loadFTSExtension()) return;
+  if (process.env.GITNEXUS_REQUIRE_FTS === '1') {
+    throw new Error(
+      'FTS extension is required (GITNEXUS_REQUIRE_FTS=1) but could not be loaded or installed. ' +
+        'FTS-dependent tests must not be silently skipped in CI — install/repair the LadybugDB ' +
+        'FTS extension (see `gitnexus doctor`) or unset GITNEXUS_REQUIRE_FTS for offline/local runs.',
+    );
+  }
+  ctx.skip(FTS_UNAVAILABLE_NOTE);
 };
 
 // ─── Core LadybugDB Adapter ─────────────────────────────────────────────
@@ -112,6 +127,31 @@ withTestLbugDB(
 
         // 4 relationships (2 CALLS, 2 CONTAINS)
         expect(stats.edges).toBe(4);
+      });
+
+      it('deleteAllInterprocTaintPaths: removes TAINT_PATH edges and is benign when none exist (#2084 review P2-5)', async () => {
+        const { executeQuery: coreExecuteQuery, deleteAllInterprocTaintPaths } =
+          await import('../../src/core/lbug/lbug-adapter.js');
+
+        // Benign: no TAINT_PATH rows yet → returns 0, does NOT throw.
+        await expect(deleteAllInterprocTaintPaths()).resolves.toEqual({ edgesDeleted: 0 });
+
+        // Seed one TAINT_PATH edge between the two seeded Function nodes, then
+        // delete-all and confirm it is removed (the incremental-rebuild guard).
+        const fns = (await coreExecuteQuery('MATCH (n:Function) RETURN n.id AS id')) as {
+          id: string;
+        }[];
+        expect(fns.length).toBe(2);
+        await coreExecuteQuery(
+          `MATCH (a:Function {id: '${fns[0].id}'}), (b:Function {id: '${fns[1].id}'}) ` +
+            `CREATE (a)-[:CodeRelation {type: 'TAINT_PATH', confidence: 0.6, reason: '1', step: 0}]->(b)`,
+        );
+        const r = await deleteAllInterprocTaintPaths();
+        expect(r.edgesDeleted).toBe(1);
+        const left = await coreExecuteQuery(
+          `MATCH ()-[r:CodeRelation]->() WHERE r.type = 'TAINT_PATH' RETURN count(r) AS cnt`,
+        );
+        expect(Number((left[0] as { cnt: number }).cnt)).toBe(0);
       });
 
       describe('unhappy path', () => {

@@ -191,7 +191,26 @@ export function emitTsScopeCaptures(
 
   const rawMatches = getTsScopeQuery(filePath).matches(tree.rootNode);
   const out: CaptureMatch[] = [];
+
+  // Pre-pass: collect all function-declaration variable_declarator start indices.
+  // tree-sitter .matches() returns captures in document byte order, so the
+  // @declaration.variable anchor (on `lexical_declaration`, byte 0) is yielded
+  // BEFORE the @declaration.function anchor (on `arrow_function`, byte ~28).
+  // A single-pass forward check would always miss because the set is empty
+  // when the variable capture is processed.
   const functionDeclDeclaratorStarts = new Set<number>();
+  for (const m of rawMatches) {
+    let fnDeclNode: SyntaxNode | undefined;
+    for (const c of m.captures) {
+      if (c.name === 'declaration.function') fnDeclNode = c.node;
+    }
+    if (fnDeclNode) {
+      const declarator = fnDeclNode.parent;
+      if (declarator?.type === 'variable_declarator') {
+        functionDeclDeclaratorStarts.add(declarator.startIndex);
+      }
+    }
+  }
 
   for (const m of rawMatches) {
     // Group captures by their tag name. Tree-sitter strips the leading
@@ -390,21 +409,8 @@ export function emitTsScopeCaptures(
 
     // Dedup: when both @declaration.function and @declaration.variable
     // match the same variable_declarator (e.g. `const fn = () => {}`),
-    // suppress the variable match. Function declarations are queried
-    // first and have higher priority.
-    if (fnDeclAnchor !== undefined) {
-      const fnNode = findFunctionNode(
-        tree.rootNode,
-        fnDeclAnchor.range,
-        groupedNodes['@declaration.function'],
-      );
-      if (fnNode !== null) {
-        const declarator = fnNode.parent;
-        if (declarator?.type === 'variable_declarator') {
-          functionDeclDeclaratorStarts.add(declarator.startIndex);
-        }
-      }
-    }
+    // suppress the variable match. The set is populated in the pre-pass
+    // above so ordering no longer matters.
     if (grouped['@declaration.variable'] !== undefined) {
       const nameNode = groupedNodes['@declaration.name'];
       if (nameNode?.parent?.type === 'variable_declarator') {

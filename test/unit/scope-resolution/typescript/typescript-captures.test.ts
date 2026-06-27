@@ -175,15 +175,15 @@ describe('emitTsScopeCaptures — declarations', () => {
     expect(m!['@declaration.name'].text).toBe('gen');
   });
 
-  it('captures `const fn = () => {}` as both @declaration.function and @declaration.variable', () => {
-    // Dual classification is load-bearing: downstream consumers expect a
-    // Function def for call targets + a Variable def for name resolution.
-    // The central extractor dedupes by node position via FUNCTION_NODE_TYPES.
+  it('captures `const fn = () => {}` as @declaration.function only (dedup suppresses @declaration.variable)', () => {
+    // The @declaration.variable capture is suppressed when @declaration.function
+    // covers the same variable_declarator, preventing duplicate Function/Const
+    // graph nodes. Name resolution uses the @declaration.function binding.
     const src = 'const fn = () => { };';
     const fnCount = countMatches(src, (t) => t.includes('@declaration.function'));
     const varCount = countMatches(src, (t) => t.includes('@declaration.variable'));
     expect(fnCount).toBe(1);
-    expect(varCount).toBe(1);
+    expect(varCount).toBe(0);
   });
 
   it('captures method_definition, abstract_method_signature, method_signature under @declaration.method', () => {
@@ -611,10 +611,10 @@ describe('emitTsScopeCaptures — #1876 array-method-callback narrowing', () => 
     expect(declWithName(src, '@declaration.function', 'cb')).toBe(true);
   });
 
-  it('keeps dual classification for a direct arrow `const fn = () => {}`', () => {
+  it('suppresses @declaration.variable for a direct arrow `const fn = () => {}` (dedup)', () => {
     const src = 'const fn = () => { doThing(); };';
     expect(declWithName(src, '@declaration.function', 'fn')).toBe(true);
-    expect(declWithName(src, '@declaration.variable', 'fn')).toBe(true);
+    expect(declWithName(src, '@declaration.variable', 'fn')).toBe(false);
   });
 
   it('keeps @declaration.function for a non-array fluent-API member call (accepted limitation)', () => {

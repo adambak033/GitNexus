@@ -11,6 +11,7 @@ import type { HttpDetection, HttpLanguagePlugin, RepoContext } from './types.js'
 /**
  * Python HTTP plugin. Handles:
  *   - FastAPI `@app.get("/path")` provider decorators
+ *   - Django `path("route/", view)` provider calls
  *   - `requests.get/post/...("url")` consumer calls
  *   - Generic `requests.request("METHOD", "url")` consumer calls
  *   - `httpx.AsyncClient` instances calling `.get/.post/...("url")`, including
@@ -52,6 +53,14 @@ const FASTAPI_APP_PATTERNS = compilePatterns({
   ],
 } satisfies LanguagePatterns<Record<string, never>>);
 
+// NOTE: Django providers are NOT extracted by this per-file source scan.
+// A standalone scan of `path()`/`re_path()` calls cannot tell a route from an
+// `include()` mount point, nor compose the include() prefix across files, so it
+// emitted bogus fragments (e.g. `/api` for a mount and `/items` un-prefixed
+// instead of the real `/api/items`). Django provider contracts come from the
+// graph Route nodes, which the ingestion route extractor builds with the
+// includes already composed.
+
 const FASTAPI_ROUTER_PATTERNS = compilePatterns({
   name: 'python-fastapi-router',
   language: Python,
@@ -65,6 +74,33 @@ const FASTAPI_ROUTER_PATTERNS = compilePatterns({
               object: (identifier) @obj (#eq? @obj "router")
               attribute: (identifier) @method (#match? @method "^(get|post|put|delete|patch)$"))
             arguments: (argument_list . (string) @path)))
+      `,
+    },
+  ],
+} satisfies LanguagePatterns<Record<string, never>>);
+
+// ─── Provider: Flask `app.add_url_rule('/path', view_func=handler)` ───
+// The imperative Flask route registration: unlike `@app.route` (whose handler
+// is the decorated function, same-file), `view_func` is frequently an IMPORTED
+// (and sometimes aliased) view, so the handler resolves through the file's
+// imports. `add_url_rule` + a `view_func=` keyword is highly Flask-specific, so
+// the false-positive risk is low. Method(s) come from a `methods=[...]` keyword
+// (default GET), extracted in code from the captured call.
+const FLASK_ADD_URL_RULE_PATTERNS = compilePatterns({
+  name: 'python-flask-add-url-rule',
+  language: Python,
+  patterns: [
+    {
+      meta: {},
+      query: `
+        (call
+          function: (attribute
+            attribute: (identifier) @fn (#eq? @fn "add_url_rule"))
+          arguments: (argument_list
+            . (string) @path
+            (keyword_argument
+              name: (identifier) @kw (#eq? @kw "view_func")
+              value: (identifier) @handler))) @call
       `,
     },
   ],
@@ -184,7 +220,7 @@ const FROM_IMPORT_MODULE_PATTERNS = compilePatterns({
   ],
 } satisfies LanguagePatterns<Record<string, never>>);
 
-// ─── Consumer: requests.get/post/... ──────────────────────────────────
+// ─── Consumer: requests.get/post/...("literal") ──────────────────────
 const REQUESTS_VERB_PATTERNS = compilePatterns({
   name: 'python-requests-verb',
   language: Python,
@@ -197,6 +233,27 @@ const REQUESTS_VERB_PATTERNS = compilePatterns({
             object: (identifier) @obj (#eq? @obj "requests")
             attribute: (identifier) @method (#match? @method "^(get|post|put|delete|patch)$"))
           arguments: (argument_list . (string) @path))
+      `,
+    },
+  ],
+} satisfies LanguagePatterns<Record<string, never>>);
+
+// ─── Consumer: requests.get/post/...(url=VALUE) keyword ──────────────
+const REQUESTS_KEYWORD_URL_PATTERNS = compilePatterns({
+  name: 'python-requests-keyword-url',
+  language: Python,
+  patterns: [
+    {
+      meta: {},
+      query: `
+        (call
+          function: (attribute
+            object: (identifier) @obj (#eq? @obj "requests")
+            attribute: (identifier) @method (#match? @method "^(get|post|put|delete|patch)$"))
+          arguments: (argument_list
+            (keyword_argument
+              name: (identifier) @kw (#eq? @kw "url")
+              value: (string) @path)))
       `,
     },
   ],
@@ -219,6 +276,168 @@ const REQUESTS_GENERIC_PATTERNS = compilePatterns({
     },
   ],
 } satisfies LanguagePatterns<Record<string, never>>);
+
+// ─── Consumer: wrapper classes with uri= or url= keyword argument ──────
+// Common pattern: wrapper classes like RequestFetch that accept URL via
+// named argument instead of positional argument:
+//   obj.fetch(uri="api/v1/camera/info/")
+//   obj.get(url="api/v1/camera/info/")
+//   obj.post(uri="api/v1/config/update/")
+const WRAPPER_URI_PATTERNS = compilePatterns({
+  name: 'python-http-wrapper-uri',
+  language: Python,
+  patterns: [
+    {
+      meta: {},
+      // Match any method call where keyword argument is `uri` or `url`
+      query: `
+        (call
+          function: (attribute
+            object: (_) @client
+            attribute: (identifier) @method)
+          arguments: (argument_list
+            (keyword_argument
+              name: (identifier) @kw (#match? @kw "^(uri|url)$")
+              value: (string) @path)))
+      `,
+    },
+  ],
+} satisfies LanguagePatterns<Record<string, never>>);
+
+// Map wrapper method names to HTTP verbs
+const WRAPPER_METHOD_TO_HTTP: Record<string, string> = {
+  get: 'GET',
+  post: 'POST',
+  put: 'PUT',
+  delete: 'DELETE',
+  patch: 'PATCH',
+  fetch: 'GET',
+  request: 'GET',
+};
+
+// ─── Variable-to-string propagation patterns ─────────────────────────
+// Many repos assign URL paths to local variables then pass them as
+// keyword arguments: uri = "api/v1/endpoint/"; obj.fetch(uri=uri, body)
+// These patterns + buildLocalStringMap resolve the variable → literal chain.
+
+// Track local string constants: uri = "api/v1/endpoint/"
+const LOCAL_STRING_ASSIGNMENTS = compilePatterns({
+  name: 'python-local-string-assign',
+  language: Python,
+  patterns: [
+    {
+      meta: {},
+      query: `
+        (assignment
+          left: (identifier) @var_name
+          right: (string) @var_value)
+      `,
+    },
+  ],
+} satisfies LanguagePatterns<Record<string, never>>);
+
+// Match method calls where uri=/url= value is a variable that was previously
+// assigned a string literal
+const WRAPPER_URI_VAR_PATTERNS = compilePatterns({
+  name: 'python-http-wrapper-uri-var',
+  language: Python,
+  patterns: [
+    {
+      meta: {},
+      query: `
+        (call
+          function: (attribute
+            object: (_) @client
+            attribute: (identifier) @method)
+          arguments: (argument_list
+            (keyword_argument
+              name: (identifier) @kw (#match? @kw "^(uri|url)$")
+              value: (identifier) @path_var)))
+      `,
+    },
+  ],
+} satisfies LanguagePatterns<Record<string, never>>);
+
+/**
+ * Map each `from <module> import <name> [as <alias>]` binding to its declared
+ * name + raw module specifier (the spec keeps the leading dots for relative
+ * imports — `.users`, `..pkg.users` — which the extractor resolves to a target
+ * file). Lets a Flask `view_func` handler resolve through an alias to the real
+ * symbol in its module rather than the local alias text. `import x` / `import x
+ * as y` (module imports, not symbol imports) are left out — a route handler is a
+ * symbol, addressed via `from … import …`.
+ */
+function buildPythonImportMap(tree: Parser.Tree): Map<string, { name: string; module: string }> {
+  const map = new Map<string, { name: string; module: string }>();
+  const walk = (node: Parser.SyntaxNode): void => {
+    if (node.type === 'import_from_statement') {
+      const moduleNode = node.childForFieldName('module_name');
+      const module = moduleNode?.text ?? null;
+      if (module !== null) {
+        for (let i = 0; i < node.namedChildCount; i++) {
+          const c = node.namedChild(i);
+          if (!c || c.id === moduleNode?.id) continue;
+          if (c.type === 'dotted_name') {
+            map.set(c.text, { name: c.text, module });
+          } else if (c.type === 'aliased_import') {
+            const nameNode = c.childForFieldName('name');
+            const aliasNode = c.childForFieldName('alias');
+            if (nameNode && aliasNode) {
+              map.set(aliasNode.text, { name: nameNode.text, module });
+            }
+          }
+        }
+      }
+    }
+    for (let i = 0; i < node.namedChildCount; i++) {
+      const c = node.namedChild(i);
+      if (c) walk(c);
+    }
+  };
+  walk(tree.rootNode);
+  return map;
+}
+
+/**
+ * HTTP verbs declared on a Flask `add_url_rule(..., methods=[...])` call, upper-
+ * cased. Defaults to `['GET']` when no `methods` keyword is present (Flask's own
+ * default). Reads the captured call node directly since the list value is awkward
+ * to capture in a tree-sitter query.
+ */
+function extractFlaskMethods(callNode: Parser.SyntaxNode): string[] {
+  const args = callNode.childForFieldName('arguments');
+  if (args) {
+    for (let i = 0; i < args.namedChildCount; i++) {
+      const kw = args.namedChild(i);
+      if (!kw || kw.type !== 'keyword_argument') continue;
+      if (kw.childForFieldName('name')?.text !== 'methods') continue;
+      const list = kw.childForFieldName('value');
+      if (!list) continue;
+      const methods: string[] = [];
+      for (let j = 0; j < list.namedChildCount; j++) {
+        const el = list.namedChild(j);
+        const v = el && el.type === 'string' ? unquoteLiteral(el.text) : null;
+        if (v) methods.push(v.toUpperCase());
+      }
+      if (methods.length > 0) return methods;
+    }
+  }
+  return ['GET'];
+}
+
+// Pre-scan: collect local string assignments (uri = "api/v1/endpoint/")
+function buildLocalStringMap(tree: Parser.Tree): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const match of runCompiledPatterns(LOCAL_STRING_ASSIGNMENTS, tree)) {
+    const varNode = match.captures.var_name;
+    const valNode = match.captures.var_value;
+    if (!varNode || !valNode) continue;
+    const val = unquoteLiteral(valNode.text);
+    if (val === null) continue;
+    map.set(varNode.text, val);
+  }
+  return map;
+}
 
 // ─── Consumer: httpx.AsyncClient assignments ────────────────────────
 // Module-scope clients are only matched
@@ -795,6 +1014,22 @@ function joinPrefix(prefix: string, route: string): string {
 export const PYTHON_HTTP_PLUGIN: HttpLanguagePlugin = {
   name: 'python-http',
   language: Python,
+  // routeCoverage intentionally LEFT at the default 'partial' (#2138 Part 2).
+  // It would be a no-op even if set to 'complete': FastAPI decorator routes set
+  // no handlerName (generic worker path) and Django sets methodName: null, so no
+  // Python file ever resolves a handlerSymbolId and none would be parse-skipped.
+  // Declaring 'complete' now is only a latent trap for the moment a follow-up
+  // gives FastAPI routes a handlerName. `hasConsumerSignals` is kept (and is a
+  // true superset of scan()'s consumer shapes) so the precondition already holds
+  // when Python is later flipped to 'complete'.
+  // Consumer signals scan() can detect: `requests.<verb>`/`requests.request`,
+  // `httpx` (sync/async client), the `uri=`/`url=` keyword/variable wrapper
+  // calls, plus aiohttp/urllib. Conservative — over-matching only costs a parse.
+  hasConsumerSignals(content) {
+    return /\brequests\s*\.|\bhttpx\b|\baiohttp\b|\burllib\b|\burlopen\b|\buri\s*=|\burl\s*=/.test(
+      content,
+    );
+  },
   prepareRepo({ files, parser, readFile, parseSource }): RepoContext {
     return buildPythonRepoContext(files, parser, readFile, parseSource);
   },
@@ -802,6 +1037,10 @@ export const PYTHON_HTTP_PLUGIN: HttpLanguagePlugin = {
     const out: HttpDetection[] = [];
     const httpxAsyncClients = collectHttpxAsyncClients(tree);
     const ctx = repoContext as PythonRepoContext | undefined;
+    // Local-binding → { declared name, module } for the file's `from … import …`
+    // statements, so an imperatively-registered handler (Flask `view_func`) that
+    // is an imported (possibly aliased) symbol resolves to its real definition.
+    const importMap = buildPythonImportMap(tree);
 
     // Providers: FastAPI @app.<verb>("/path") — already absolute path.
     for (const match of runCompiledPatterns(FASTAPI_APP_PATTERNS, tree)) {
@@ -818,9 +1057,19 @@ export const PYTHON_HTTP_PLUGIN: HttpLanguagePlugin = {
         method: httpMethod,
         path,
         name: null,
+        // The decorated handler has no captured name → resolve by line-span
+        // containment. Best-effort fallback: FastAPI routes are graph-backed
+        // (ingestion decorator routes) and the function span starts at `def`
+        // (decorators excluded), so this lands the single-decorator case and
+        // degrades to file-level for multi-decorator stacks.
+        line: pathNode.startPosition.row + 1,
         confidence: 0.8,
       });
     }
+
+    // Django providers come from the graph Route nodes (includes composed by
+    // the ingestion route extractor), not a per-file source scan — see the note
+    // at the top of this file.
 
     // Providers: FastAPI @router.<verb>("/path") — must be joined
     // with the prefix(es) declared at the include_router site. When
@@ -858,6 +1107,34 @@ export const PYTHON_HTTP_PLUGIN: HttpLanguagePlugin = {
           method: httpMethod,
           path: p,
           name: null,
+          // Best-effort containment fallback — see the @app provider note above.
+          line: pathNode.startPosition.row + 1,
+          confidence: 0.8,
+        });
+      }
+    }
+
+    // Providers: Flask `app.add_url_rule('/path', view_func=handler, methods=[…])`.
+    // The handler is a `view_func` identifier, frequently an imported (possibly
+    // aliased) view, so resolve it through the file's imports to the declared
+    // symbol + its module for import-pinned resolution downstream.
+    for (const match of runCompiledPatterns(FLASK_ADD_URL_RULE_PATTERNS, tree)) {
+      const pathNode = match.captures.path;
+      const handlerNode = match.captures.handler;
+      const callNode = match.captures.call;
+      if (!pathNode || !handlerNode || !callNode) continue;
+      const path = unquoteLiteral(pathNode.text);
+      if (path === null) continue;
+      const imported = importMap.get(handlerNode.text);
+      for (const method of extractFlaskMethods(callNode)) {
+        out.push({
+          role: 'provider',
+          framework: 'flask',
+          method,
+          path,
+          name: imported ? imported.name : handlerNode.text,
+          handlerImport: imported,
+          line: (imported ? pathNode : handlerNode).startPosition.row + 1,
           confidence: 0.8,
         });
       }
@@ -876,6 +1153,25 @@ export const PYTHON_HTTP_PLUGIN: HttpLanguagePlugin = {
         method: methodNode.text.toUpperCase(),
         path,
         name: null,
+        line: pathNode.startPosition.row + 1,
+        confidence: 0.7,
+      });
+    }
+
+    // Consumers: requests.<verb>(url="literal") keyword
+    for (const match of runCompiledPatterns(REQUESTS_KEYWORD_URL_PATTERNS, tree)) {
+      const methodNode = match.captures.method;
+      const pathNode = match.captures.path;
+      if (!methodNode || !pathNode) continue;
+      const path = unquoteLiteral(pathNode.text);
+      if (path === null) continue;
+      out.push({
+        role: 'consumer',
+        framework: 'python-requests',
+        method: methodNode.text.toUpperCase(),
+        path,
+        name: null,
+        line: pathNode.startPosition.row + 1,
         confidence: 0.7,
       });
     }
@@ -894,6 +1190,7 @@ export const PYTHON_HTTP_PLUGIN: HttpLanguagePlugin = {
         method: methodRaw.toUpperCase(),
         path,
         name: null,
+        line: pathNode.startPosition.row + 1,
         confidence: 0.7,
       });
     }
@@ -913,6 +1210,7 @@ export const PYTHON_HTTP_PLUGIN: HttpLanguagePlugin = {
         method: methodNode.text.toUpperCase(),
         path,
         name: null,
+        line: pathNode.startPosition.row + 1,
         confidence: 0.7,
       });
     }
@@ -933,10 +1231,90 @@ export const PYTHON_HTTP_PLUGIN: HttpLanguagePlugin = {
         method: methodRaw.toUpperCase(),
         path,
         name: null,
+        line: pathNode.startPosition.row + 1,
         confidence: 0.7,
+      });
+    }
+
+    // Consumers: wrapper classes with uri= or url= keyword argument
+    //   obj.fetch(uri="api/v1/camera/info/")
+    //   obj.post(url="api/v1/config/update/")
+    const seenUriDetections = new Set<string>(); // node byte ranges, to avoid duplicates
+    for (const match of runCompiledPatterns(WRAPPER_URI_PATTERNS, tree)) {
+      const methodNode = match.captures.method;
+      const pathNode = match.captures.path;
+      if (!methodNode || !pathNode) continue;
+      const path = unquoteLiteral(pathNode.text);
+      if (path === null) continue;
+
+      // Deduplicate: the two pattern branches can match the same call. Key on
+      // node byte offsets, not line arithmetic (lineNum*1000+row can collide in
+      // files over 1000 lines, and miss a real dup when a node straddles a line).
+      const dedupKey = `${pathNode.startIndex}:${methodNode.startIndex}`;
+      if (seenUriDetections.has(dedupKey)) continue;
+      seenUriDetections.add(dedupKey);
+
+      const methodName = methodNode.text.toLowerCase();
+      // Map wrapper method name to HTTP verb (fetch, request → GET)
+      const httpMethod = WRAPPER_METHOD_TO_HTTP[methodName] ?? 'GET';
+
+      out.push({
+        role: 'consumer',
+        framework: 'python-http-wrapper',
+        method: httpMethod,
+        path,
+        name: null,
+        line: methodNode.startPosition.row + 1,
+        confidence: 0.65,
+      });
+    }
+
+    // Variable propagation: uri = "api/v1/endpoint/"; obj.fetch(uri=uri)
+    // Many repos assign URL paths to local vars then pass as keyword args.
+    const localStrings = buildLocalStringMap(tree);
+    const seenVarDetections = new Set<string>();
+    for (const match of runCompiledPatterns(WRAPPER_URI_VAR_PATTERNS, tree)) {
+      const methodNode = match.captures.method;
+      const pathVarNode = match.captures.path_var;
+      if (!methodNode || !pathVarNode) continue;
+      const dedupKey = `${pathVarNode.startPosition.row}:${methodNode.startPosition.row}`;
+      if (seenVarDetections.has(dedupKey)) continue;
+      seenVarDetections.add(dedupKey);
+      const resolved = localStrings.get(pathVarNode.text);
+      if (!resolved) continue;
+      const normalized = normalizeConsumerPath(resolved);
+      if (normalized === '/') continue;
+      const httpMethod = WRAPPER_METHOD_TO_HTTP[methodNode.text.toLowerCase()] ?? 'GET';
+      out.push({
+        role: 'consumer',
+        framework: 'python-http-wrapper',
+        method: httpMethod,
+        path: normalized,
+        name: null,
+        line: methodNode.startPosition.row + 1,
+        confidence: 0.6,
       });
     }
 
     return out;
   },
 };
+
+/** Normalize consumer path: strip host, template literals, numeric segments → {param} */
+function normalizeConsumerPath(url: string): string {
+  let s = url.replace(/\$\{[^}]+\}/g, '{param}').trim();
+  if (/^https?:\/\//i.test(s)) {
+    try {
+      s = new URL(s).pathname;
+    } catch {
+      s = s.replace(/^https?:\/\/[^/]+/i, '');
+    }
+  }
+  if (!s.startsWith('/')) s = '/' + s;
+  const segments = s
+    .split('/')
+    .filter(Boolean)
+    .map((seg) => (/^\d+$/.test(seg) ? '{param}' : seg));
+  s = '/' + segments.join('/');
+  return s.replace(/\/+$/, '') || '/';
+}

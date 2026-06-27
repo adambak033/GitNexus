@@ -16,6 +16,8 @@ import {
   javascriptClassConfig,
 } from '../class-extractors/configs/typescript-javascript.js';
 import type { SyntaxNode } from '../utils/ast-helpers.js';
+import { createLeadingDocDescriptionExtractor } from '../utils/ast-helpers.js';
+import { createTypeScriptCfgVisitor } from '../cfg/visitors/typescript.js';
 import { typeConfig as typescriptConfig } from '../type-extractors/typescript.js';
 import { tsExportChecker } from '../export-detection.js';
 import { createImportResolver } from '../import-resolvers/resolver-factory.js';
@@ -365,6 +367,11 @@ export const typescriptProvider = defineLanguage({
   }),
   variableExtractor: createVariableExtractor(typescriptVariableConfig),
   classExtractor: createClassExtractor(typescriptClassConfig),
+  // ── JSDoc → description (issue #2270). An exported decl is captured as the
+  //    inner declaration; its JSDoc precedes the wrapping `export_statement`. ──
+  descriptionExtractor: createLeadingDocDescriptionExtractor({
+    wrapperNodeTypes: ['export_statement'],
+  }),
   builtInNames: BUILT_INS,
 
   // ── RFC #909 Ring 3: scope-based resolution hooks (RFC §5) ──────────
@@ -373,6 +380,8 @@ export const typescriptProvider = defineLanguage({
   // canonical capture vocabulary in ./typescript/query.ts
   // (TYPESCRIPT_SCOPE_QUERY constant).
   emitScopeCaptures: emitTsScopeCaptures,
+  // CFG/PDG substrate (#2081 M1) — runs in the worker on a --pdg run.
+  cfgVisitor: createTypeScriptCfgVisitor(),
   interpretImport: interpretTsImport,
   interpretTypeBinding: interpretTsTypeBinding,
   bindingScopeFor: tsBindingScopeFor,
@@ -431,6 +440,11 @@ export const javascriptProvider = defineLanguage({
   }),
   variableExtractor: createVariableExtractor(javascriptVariableConfig),
   classExtractor: createClassExtractor(javascriptClassConfig),
+  // ── JSDoc → description (issue #2270). An exported decl is captured as the
+  //    inner declaration; its JSDoc precedes the wrapping `export_statement`. ──
+  descriptionExtractor: createLeadingDocDescriptionExtractor({
+    wrapperNodeTypes: ['export_statement'],
+  }),
   builtInNames: BUILT_INS,
 
   // ── RFC #909 Ring 3: scope-based resolution hooks (RFC §5) ──────────
@@ -440,6 +454,8 @@ export const javascriptProvider = defineLanguage({
   // JSDoc type bindings) live in ./javascript/captures.ts.
   // See ./javascript/index.ts for the full per-module rationale.
   emitScopeCaptures: emitJsScopeCaptures,
+  // CFG/PDG substrate (#2081 M1) — TS and JS share the same grammar family.
+  cfgVisitor: createTypeScriptCfgVisitor(),
   interpretImport: interpretJsImport,
   interpretTypeBinding: interpretJsTypeBinding,
   bindingScopeFor: jsBindingScopeFor,
