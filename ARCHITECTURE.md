@@ -38,13 +38,18 @@ Monorepo: **CLI/MCP** (`gitnexus/`) + **browser UI** (`gitnexus-web/`).
 | `detect_changes` | Map git diffs to affected symbols and processes |
 | `rename` | Graph-assisted multi-file rename with `dry_run` preview |
 | `api_impact` | Pre-change impact report for an API route handler |
+| `trace` | Shortest directed path between two symbols (call + class-member edges); group-aware (`repo: "@<group>"`) for cross-repo traces |
 | `route_map` | API route → handler → consumer mappings |
 | `tool_map` | MCP/RPC tool definitions and handlers |
 | `shape_check` | Response shape vs consumer property access mismatches |
+| `explain` | Persisted taint findings (source→sink data flows) — needs `analyze --pdg` |
+| `pdg_query` | Control/data dependence — CDG (`mode: controls`) / REACHING_DEF (`mode: flows`) — needs `analyze --pdg` |
 | `group_list` | List repo groups or details for one group |
 | `group_sync` | Rebuild group Contract Registry (`contracts.json`) and bridge graph |
 
-`query`, `context`, and `impact` are group-aware: pass `repo: "@<groupName>"` (or `"@<groupName>/<memberPath>"` to scope to one member) plus optional `service: "<monorepo/path>"`. Group-mode `query` merges per-repo results via Reciprocal Rank Fusion; group-mode `impact` runs the local walk in the chosen member and fans out across boundaries via the Contract Bridge (`gitnexus/src/core/group/cross-impact.ts`). The previously-planned `group_query`, `group_context`, `group_impact`, `group_contracts`, `group_status` MCP tools are intentionally not introduced — group-level state is exposed via resources instead:
+`query`, `context`, and `impact` are group-aware: pass `repo: "@<groupName>"` (or `"@<groupName>/<memberPath>"` to scope to one member) plus optional `service: "<monorepo/path>"`. Group-mode `query` merges per-repo results via Reciprocal Rank Fusion; group-mode `impact` runs the local walk in the chosen member and fans out across boundaries via the Contract Bridge (`gitnexus/src/core/group/cross-impact.ts`). `trace` is also group-aware via `repo: "@<groupName>"` — but, unlike the others, it resolves `from`/`to` across **all** members (a `@<groupName>/<memberPath>` suffix is advisory for trace, not a scope); pass `from_uid`/`to_uid` to disambiguate a symbol name that occurs in more than one member.
+
+Group-mode `trace` (`gitnexus/src/core/group/cross-trace.ts`) stitches a path that crosses repositories: it resolves `from`/`to` across all members, and when they live in different repos it joins the home-repo segment to the target-repo segment over a single `ContractLink` boundary (an HTTP consumer→provider link, joined on `Contract.symbolUid`), reported as a `CONTRACT_LINK` hop in `crossings[]`. The crossing is clamped to one boundary (`MAX_SUPPORTED_CROSS_DEPTH`, shared with cross-impact); deeper `crossDepth` is reported via `notes[]`. With `pdg: true` (experimental, opt-in), each boundary-adjacent segment is enriched with its intra-procedural REACHING_DEF data-flow when that repo was indexed with `--pdg` (reusing the same anchored `flows` query as `pdg_query`); data flow never crosses the repo boundary, and a missing PDG layer degrades to call-level hops with a note. Two stores meet only at the `symbolUid` grain — the per-repo PDG/call graph and the group bridge — so this is the documented join; full cross-program (SDG-like) data flow across the boundary remains deferred (see `docs/plans/2026-06-18-002-feat-unified-pdg-impact-evaluation-plan.md`). The previously-planned `group_query`, `group_context`, `group_impact`, `group_contracts`, `group_status` MCP tools are intentionally not introduced — group-level state is exposed via resources instead:
 
 | Resource URI | Purpose |
 |--------------|---------|
@@ -204,6 +209,19 @@ Language-agnostic scope-resolution resolver. This is the resolution path for eve
 Orchestrator: `runScopeResolution(input, provider)` in `scope-resolution/pipeline/run.ts`.
 Pipeline phase: `scopeResolutionPhase` in `scope-resolution/pipeline/phase.ts` — iterates the registered `SCOPE_RESOLVERS` over the worker-serialized `ParsedFile`s. (Per-language `emitScopeCaptures` hooks may reuse a cached Tree via the orchestrator's `treeCache`, but in worker-pool runs that cache is empty — Trees can't cross MessageChannels — so they consume the pre-extracted `ParsedFile` instead; § Performance notes.)
 
+### Optional CFG/PDG emission (`--pdg`, #2081–#2086)
+
+On a `--pdg` run the parse worker builds a per-function control-flow graph from the tree-sitter AST (`LanguageProvider.cfgVisitor`; TypeScript/JavaScript today) and serializes it onto `ParsedFile.cfgSideChannel` as plain data. Scope-resolution then emits the program-dependence layers from that side-channel **inside Phase 4 of `runScopeResolution`, while the disk-backed ParsedFile store is still live** — the only window where the worker-built CFGs are loaded (the store is cleared right after the phase returns). A standalone post-`mro` phase would read an empty store, so the emit deliberately lives in-phase, mirroring the `applyCaptureSideChannel` pattern. The opt-in is off by default (graph byte-identical), folded into the parse-cache key (a pdg-off warm cache is never reused on a `--pdg` run), and each layer is bounded by a per-function edge cap that logs any dropped edges. All layers are `BasicBlock → BasicBlock` edges in the single `CodeRelation` table, keyed by `type`; there is **no** `Function → BasicBlock` edge — the symbol↔block join is reconstructed from the BasicBlock id prefix + line span. The layers build on each other:
+
+- **M1 — CFG** (#2081): `BasicBlock` nodes + `CFG` edges. Edge *kind* (`seq`/`cond-true`/`loop-back`/…) rides the `reason` column (CFG is one `CodeRelation` type, not one per kind).
+- **M2 — REACHING_DEF** (#2082): GEN/KILL def→use data dependence from a pure fixpoint solver; the variable name rides `reason`.
+- **M3/M4 — TAINTED / SANITIZES / TAINT_PATH** (#2083–#2084): intra- and inter-procedural taint (source→sink) — the `explain` tool's data.
+- **M5 — CDG** (#2085): Ferrante control dependence over a Cooper–Harvey–Kennedy post-dominator tree (the EXIT-rooted reverse CFG); branch sense (`'T'`/`'F'`) rides `reason`. A CFG whose EXIT is unreachable from some block is skipped for CDG (post-dominance would be unsound) while its CFG/REACHING_DEF layers are kept.
+- **M6 — read surface** (#2086): the `pdg_query` MCP tool answers "what gates X?" (CDG, `mode: controls`) and "where does Y flow?" (REACHING_DEF, `mode: flows`); `explain` is the taint consumer. Both are always anchored + `LIMIT`-bounded (LadybugDB has no rel-property index) and share one `resolveBlockAnchor` helper. These PDG edge types are deliberately kept out of the default `VALID_RELATION_TYPES` / web schema.
+- **Cross-repo trace enrichment**: group-mode `trace` (`pdg: true`) reuses the same anchored REACHING_DEF `flows` query to annotate a boundary-adjacent segment with how a value reaches the cross-repo call — strictly intra-procedural (data flow never crosses the repo boundary). See the group-aware tools note above.
+
+See `core/ingestion/cfg/` (emit + the pure CFG / post-dominator / control-dependence / reaching-defs / taint passes) and `mcp/local/local-backend.ts` (`_pdgQueryImpl`, `_explainImpl`, the shared `resolveBlockAnchor`).
+
 ### `ScopeResolver` contract
 
 Single interface a language implements to plug into the pipeline. Contract fully documented in `scope-resolution/contract/scope-resolver.ts`.
@@ -285,6 +303,7 @@ Each language implements `LanguageProvider` (`language-provider.ts`). Key fields
 | `exportChecker` | Public/exported symbol detection |
 | `typeConfig` | Type annotation extraction rules |
 | `mroStrategy` | `first-wins` / `c3` / `none` |
+| `descriptionExtractor` | Optional hook returning a symbol's doc-comment text as its `description`; feeds the embedding metadata header so doc-only terms are semantically searchable (issue #2270). Most languages register `createLeadingDocDescriptionExtractor` (shared, language-neutral; per-language comment/wrapper config passed at the call site) |
 
 16 providers in `languages/index.ts` via `satisfies Record<SupportedLanguages, LanguageProvider>` — missing a language is a compile error.
 
@@ -378,6 +397,8 @@ Defined in `lbug/schema.ts`. Separate node tables per type, single `CodeRelation
 **Node tables:** File, Folder, Function, Class, Interface, Method, Constructor, CodeElement, Struct, Enum, Macro, Typedef, Union, Namespace, Trait, Impl, TypeAlias, Const, Static, Property, Record, Delegate, Annotation, Template, Module, Community, Process, Route, Tool, Section, Embedding.
 
 **Relation types** (`CodeRelation.type`): CONTAINS, DEFINES, CALLS, IMPORTS, EXTENDS, IMPLEMENTS, HAS_METHOD, HAS_PROPERTY, ACCESSES, METHOD_OVERRIDES, METHOD_IMPLEMENTS, MEMBER_OF, STEP_IN_PROCESS, HANDLES_ROUTE, FETCHES, HANDLES_TOOL, ENTRY_POINT_OF.
+
+**Optional `--pdg` additions** (off by default, opt-in via `gitnexus analyze --pdg`; see _Optional CFG/PDG emission_ above): a `BasicBlock` node table, plus the PDG relation types `CFG`, `REACHING_DEF`, `CDG`, `TAINTED`, `SANITIZES`, and `TAINT_PATH` on the same `CodeRelation` table. These are deliberately kept out of the default `VALID_RELATION_TYPES` / web graph schema — query them via `cypher`, `explain`, or `pdg_query`.
 
 ## Embeddings and search
 

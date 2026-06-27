@@ -267,6 +267,7 @@ import type {
   Callsite,
   ConstraintContext,
   ParsedFile,
+  ReferenceSite,
   ScopeId,
   SupportedLanguages,
   SymbolDefinition,
@@ -290,6 +291,10 @@ export type LinearizeStrategy = (
 
 /** Result of `ScopeResolver.arityCompatibility` — mirrors `RegistryProviders.arityCompatibility`. */
 export type ArityVerdict = 'compatible' | 'unknown' | 'incompatible';
+
+export type ReceiverMemberResolution =
+  | { readonly kind: 'resolved'; readonly definition: SymbolDefinition }
+  | { readonly kind: 'ambiguous'; readonly candidateIds: readonly string[] };
 
 /** Re-exported for ScopeResolver consumers — same shape as
  *  `RegistryProviders.constraintCompatibility`'s third parameter. */
@@ -407,7 +412,7 @@ export interface ScopeResolver {
    * for the Tier-A predicate registry and Kleene 3-valued evaluator.
    */
   readonly constraintCompatibility?: (
-    callsite: Callsite,
+    callsite: ReferenceSite,
     def: SymbolDefinition,
     ctx: ConstraintContext,
   ) => ArityVerdict;
@@ -702,6 +707,16 @@ export interface ScopeResolver {
   readonly conversionRankFn?: ConversionRankFn;
 
   /**
+   * Optional per-language argument-type prefixes for conversion-only
+   * argument sentinels. When ranking cannot find any viable candidate
+   * for a multi-overload set containing one of these sentinels, shared
+   * narrowing suppresses the ambiguous set instead of falling back to
+   * arity-only candidates. Languages without such sentinels leave this
+   * undefined.
+   */
+  readonly conversionOnlyArgTypePrefixes?: readonly string[];
+
+  /**
    * Optional predicate to identify definitions with file-local linkage
    * (e.g. C `static` functions). When provided, `pickUniqueGlobalCallable`
    * excludes defs where `isFileLocalDef(def) === true` and the def lives
@@ -833,6 +848,21 @@ export interface ScopeResolver {
     parsedFiles: readonly ParsedFile[],
     callsite?: Callsite,
   ) => SymbolDefinition | 'ambiguous' | undefined;
+
+  /**
+   * Optional language-specific member-lattice lookup. Runs for a resolved
+   * simple receiver type before the generic flattened-MRO walk. Languages
+   * with lookup-set semantics that cannot be represented by one linear MRO
+   * may resolve a member, report ambiguity (which suppresses fallback), or
+   * return undefined to retain the shared behavior.
+   */
+  readonly resolveReceiverMember?: (
+    ownerDef: SymbolDefinition,
+    memberName: string,
+    callsite: Callsite,
+    scopes: ScopeResolutionIndexes,
+    model: SemanticModel,
+  ) => ReceiverMemberResolution | undefined;
 
   /**
    * Enable the receiver-bound Case 0.5 fallback for explicit `this`

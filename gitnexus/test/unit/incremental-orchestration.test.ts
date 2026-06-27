@@ -20,10 +20,8 @@
  * (Windows LadybugDB handle release can lag; `cleanupTempDir` retries).
  */
 
-import { execSync } from 'child_process';
-import { writeFile, readFile, copyFile, mkdir } from 'fs/promises';
+import { writeFile, readFile } from 'fs/promises';
 import path from 'path';
-import { fileURLToPath } from 'url';
 import { describe, it, expect } from 'vitest';
 import {
   getStoragePaths,
@@ -32,43 +30,9 @@ import {
   INCREMENTAL_SCHEMA_VERSION,
   type RepoMeta,
 } from '../../src/storage/repo-manager.js';
-import { createTempDir } from '../helpers/test-db.js';
+import { setupMiniRepo as setupSharedMiniRepo } from '../helpers/mini-repo.js';
 
-const HERE = path.dirname(fileURLToPath(import.meta.url));
-const FIXTURE_SRC = path.resolve(HERE, '..', 'fixtures', 'mini-repo', 'src');
-
-/**
- * Copy the mini-repo fixture into a fresh git-initialized temp directory.
- * Returns the temp handle so the caller owns cleanup.
- */
-async function setupMiniRepo(): Promise<{ dbPath: string; cleanup: () => Promise<void> }> {
-  const tmp = await createTempDir('gitnexus-incr-orch-');
-  const dest = path.join(tmp.dbPath, 'src');
-  await mkdir(dest, { recursive: true });
-  // Copy mini-repo fixture files
-  const names = [
-    'index.ts',
-    'handler.ts',
-    'validator.ts',
-    'formatter.ts',
-    'middleware.ts',
-    'logger.ts',
-    'db.ts',
-  ];
-  for (const n of names) {
-    await copyFile(path.join(FIXTURE_SRC, n), path.join(dest, n));
-  }
-  execSync('git init', { cwd: tmp.dbPath, stdio: 'pipe' });
-  execSync('git -c user.name=test -c user.email=t@t -c commit.gpgsign=false add -A', {
-    cwd: tmp.dbPath,
-    stdio: 'pipe',
-  });
-  execSync('git -c user.name=test -c user.email=t@t -c commit.gpgsign=false commit -q -m initial', {
-    cwd: tmp.dbPath,
-    stdio: 'pipe',
-  });
-  return tmp;
-}
+const setupMiniRepo = () => setupSharedMiniRepo('gitnexus-incr-orch-');
 
 describe('runFullAnalysis — incremental orchestration', () => {
   it('first run populates fileHashes + schemaVersion and clears incrementalInProgress on success', async () => {
@@ -256,6 +220,47 @@ describe('runFullAnalysis — incremental orchestration', () => {
 
       const after = await loadMeta(storagePath);
       expect(after!.incrementalInProgress).toBeUndefined();
+    } finally {
+      await repo.cleanup();
+    }
+  }, 300_000);
+
+  // Regression for #2289 review P1: a pre-v5 stamp (e.g. v4 with url-only
+  // Route ids) re-analyzed on the SAME commit must NOT early-return on the
+  // `alreadyUpToDate` fast path — otherwise the v5 schema bump's
+  // re-keyed-Route migration is silently bypassed and stale URL-only Route
+  // rows persist alongside any new composite-keyed writes. The schemaVersion
+  // gate (mirrors pdgModeMismatch's slot above the fast path) must force a
+  // full rebuild before lastCommit-equality short-circuits the pipeline.
+  it('a pre-v5 schemaVersion stamp forces a full rebuild on an unchanged-commit re-analyze', async () => {
+    const repo = await setupMiniRepo();
+    try {
+      const { runFullAnalysis } = await import('../../src/core/run-analyze.js');
+      // First run stamps schemaVersion = INCREMENTAL_SCHEMA_VERSION (v5).
+      await runFullAnalysis(repo.dbPath, { skipAgentsMd: true }, { onProgress: () => {} });
+      const { storagePath } = getStoragePaths(repo.dbPath);
+      const meta = await loadMeta(storagePath);
+      expect(meta).not.toBeNull();
+      expect(meta!.schemaVersion).toBe(INCREMENTAL_SCHEMA_VERSION);
+
+      // Simulate a repo indexed at the SAME commit by a pre-v5 GitNexus
+      // build: rewrite meta.json with schemaVersion = 4. lastCommit and
+      // working tree are untouched, so without the schemaVersion gate the
+      // run-analyze fast path would early-return `alreadyUpToDate=true`
+      // and never touch the stale Route rows.
+      const downgraded: RepoMeta = { ...meta!, schemaVersion: 4 };
+      await saveMeta(storagePath, downgraded);
+
+      const reanalyzed = await runFullAnalysis(
+        repo.dbPath,
+        { skipAgentsMd: true },
+        { onProgress: () => {} },
+      );
+      // Pipeline actually ran (schemaVersion mismatch → force=true).
+      expect(reanalyzed.alreadyUpToDate).toBeUndefined();
+      // And the meta is stamped back to v5 (the rebuild path runs saveMeta).
+      const restamped = await loadMeta(storagePath);
+      expect(restamped!.schemaVersion).toBe(INCREMENTAL_SCHEMA_VERSION);
     } finally {
       await repo.cleanup();
     }

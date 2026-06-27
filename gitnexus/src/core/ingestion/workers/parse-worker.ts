@@ -4,7 +4,6 @@ import JavaScript from 'tree-sitter-javascript';
 import TypeScript from 'tree-sitter-typescript';
 import Python from 'tree-sitter-python';
 import Java from 'tree-sitter-java';
-import C from 'tree-sitter-c';
 import CPP from 'tree-sitter-cpp';
 // Explicit subpath import — see parser-loader.ts for rationale (#1013).
 import CSharp from 'tree-sitter-c-sharp/bindings/node/index.js';
@@ -12,7 +11,7 @@ import Go from 'tree-sitter-go';
 import Rust from 'tree-sitter-rust';
 import PHP from 'tree-sitter-php';
 import Ruby from 'tree-sitter-ruby';
-import { createRequire } from 'node:module';
+import { requireVendoredGrammar } from '../../tree-sitter/vendored-grammars.js';
 import { SupportedLanguages } from 'gitnexus-shared';
 import { getProvider } from '../languages/index.js';
 import {
@@ -26,6 +25,9 @@ import {
   deriveDefaultExportHocName,
 } from '../ts-js-hoc-utils.js';
 import { parseSourceSafe } from '../../tree-sitter/safe-parse.js';
+import type { SkippedPath } from './clone-safety.js';
+import { postResultCloneSafe } from './post-result.js';
+import { mergeResult } from './result-merge.js';
 import type { SymbolTableReader } from '../model/symbol-table.js';
 import type {
   ExtractedRouterInclude,
@@ -36,23 +38,42 @@ import type {
 /** Language grammar type accepted by Parser.setLanguage(). */
 type TreeSitterLanguage = Parameters<typeof Parser.prototype.setLanguage>[0];
 
-// tree-sitter-swift is an optionalDependency — may not be installed
-const _require = createRequire(import.meta.url);
+// ── Worker grammar loading — enforcement boundary (#2091/#2093, #2101) ───────
+// The worker maintains its own grammar table (the guarded vendored-grammar
+// loads below + `languageMap`) and intentionally does NOT consult the runtime
+// `GITNEXUS_SKIP_OPTIONAL_GRAMMARS` opt-out. It does not need to: the MAIN
+// THREAD's `parseableScanned` filter (pipeline-phases/parse-impl.ts, gated on
+// `parser-loader.isLanguageAvailable`, which honors the runtime opt-out and a
+// genuinely-absent binding alike) excludes files of an unavailable/opted-out
+// language BEFORE any chunk is dispatched, so the worker never receives them.
+// That main-thread filter is the single enforcement point. Any future change
+// that dispatches files to the worker WITHOUT first passing them through
+// `isLanguageAvailable` must re-introduce the gate here. (The cleaner end-state
+// — routing this table through `parser-loader.getLanguageGrammar` so there is
+// one loader — is the deferred Tier-1 consolidation.)
+// Swift/Dart/Kotlin/C are vendored grammars loaded from `vendor/` by absolute
+// path (NEVER copied into node_modules — see vendored-grammars.ts / #2111). Each
+// may be absent on a platform without a prebuild or a toolchain-less /
+// `--ignore-scripts` install, so every load is guarded so a missing binding
+// cannot crash the worker at module-load (#2091/#2093, #2116).
 let Swift: TreeSitterLanguage | null = null;
 try {
-  Swift = _require('tree-sitter-swift');
+  Swift = requireVendoredGrammar('tree-sitter-swift') as TreeSitterLanguage;
 } catch {}
 
-// tree-sitter-dart is an optionalDependency — may not be installed
 let Dart: TreeSitterLanguage | null = null;
 try {
-  Dart = _require('tree-sitter-dart');
+  Dart = requireVendoredGrammar('tree-sitter-dart') as TreeSitterLanguage;
 } catch {}
 
-// tree-sitter-kotlin is an optionalDependency — may not be installed
 let Kotlin: TreeSitterLanguage | null = null;
 try {
-  Kotlin = _require('tree-sitter-kotlin');
+  Kotlin = requireVendoredGrammar('tree-sitter-kotlin') as TreeSitterLanguage;
+} catch {}
+
+let C: TreeSitterLanguage | null = null;
+try {
+  C = requireVendoredGrammar('tree-sitter-c') as TreeSitterLanguage;
 } catch {}
 import { getLanguageFromFilename } from 'gitnexus-shared';
 import {
@@ -110,6 +131,12 @@ import {
 } from '../../../storage/parsedfile-store.js';
 import { extractLaravelRoutes, type ExtractedRoute } from '../route-extractors/laravel.js';
 import { extractTrpcRoutes } from '../route-extractors/trpc.js';
+import type { SharedSpringType } from '../route-extractors/spring-shared.js';
+import {
+  collectFunctionCfgs,
+  DEFAULT_PDG_MAX_FUNCTION_LINES,
+  type CfgSkipCounts,
+} from '../cfg/collect.js';
 
 import { logger } from '../../logger.js';
 export type { ExtractedRoute } from '../route-extractors/laravel.js';
@@ -134,6 +161,19 @@ const DURABLE_PARSED_FILE_STORAGE_PATH: string | undefined = (
   workerData as { durableParsedFileStoragePath?: string } | undefined
 )?.durableParsedFileStoragePath;
 let shardSeq = 0;
+
+// ── PDG/CFG opt-in (#2081 M1) ───────────────────────────────────────────────
+// Read ONCE at worker init from `workerData` (the worker never sees
+// PipelineOptions — config arrives via the pool factory's `workerData`, see
+// KTD7 / U5). When `pdg` is set, the worker builds a per-function control-flow
+// graph from the tree-sitter AST (where it lives) and serializes it onto
+// `ParsedFile.cfgSideChannel`. Off ⇒ no CFG work and no field — the default for
+// every run today. `pdgMaxFunctionLines` bounds per-function CFG cost
+// (0/undefined ⇒ no cap; see collectFunctionCfgs).
+const PDG_ENABLED: boolean = (workerData as { pdg?: boolean } | undefined)?.pdg === true;
+const PDG_MAX_FUNCTION_LINES: number =
+  (workerData as { pdgMaxFunctionLines?: number } | undefined)?.pdgMaxFunctionLines ??
+  DEFAULT_PDG_MAX_FUNCTION_LINES;
 
 // ── Bootstrap-stage diagnostics (#1741) ────────────────────────────────────
 // When GITNEXUS_WORKER_BOOTSTRAP=1 (or --verbose sets GITNEXUS_VERBOSE), each
@@ -206,6 +246,7 @@ interface ParsedSymbol {
   isReadonly?: boolean;
   isAbstract?: boolean;
   isFinal?: boolean;
+  isDeleted?: boolean;
   annotations?: string[];
 }
 
@@ -278,6 +319,16 @@ export interface ExtractedDecoratorRoute {
    * absent ⇒ no prefix applies.
    */
   prefix?: string | null;
+  /**
+   * Name of the handler the route decorator sits on (the decorated
+   * method/function — e.g. `create` for `@PostMapping("/orders") Order create()`).
+   * Captured at extraction where the decorated definition node is in hand, so
+   * the routes phase can resolve it to a real handler symbol UID via the
+   * SemanticModel (same `(filePath, name) → nodeId` lookup Laravel routes use).
+   * Absent when the extractor could not identify the decorated definition;
+   * resolution then falls back (the Route node simply carries no handlerSymbolId).
+   */
+  handlerName?: string;
 }
 
 export interface ExtractedToolDef {
@@ -345,6 +396,15 @@ export interface ParseWorkerResult {
   routerIncludes: ExtractedRouterInclude[];
   routerImports: ExtractedRouterImport[];
   /**
+   * Optional. Project-wide `SharedSpringType` view of route-defining
+   * class/interface declarations, produced by the provider's
+   * `extractRouteInheritanceTypes` hook (Java/Spring). parse-impl aggregates
+   * these and runs a cross-file pass that resolves interface-inherited routes
+   * into additional `decoratorRoutes` (#2288). Optional for cache backward
+   * compatibility; consumers must guard with `?? []`.
+   */
+  springTypes?: SharedSpringType[];
+  /**
    * Optional. `from <pkg> import <module>` records from Python files
    * where `<module>` is later used as a Shape-A include receiver
    * (`<host>.include_router(<module>.router, prefix='/x')`). parse-impl
@@ -368,6 +428,26 @@ export interface ParseWorkerResult {
    */
   parsedFiles: ParsedFile[];
   skippedLanguages: Record<string, number>;
+  /**
+   * Files whose parse output carried a value the structured-clone algorithm
+   * couldn't serialize across the worker boundary (#2112). The clone-safety
+   * net stripped or dropped the offending value so the result could be
+   * delivered; these paths are surfaced to the operator so the (rare) data
+   * loss is visible. Optional for cache backward compatibility — older cache
+   * entries predate the field; consumers must guard with `?? []`.
+   */
+  skippedPaths?: SkippedPath[];
+  /**
+   * Per-language CFG-bearing functions skipped during the worker walk, bucketed
+   * by reason (#2195): too-many-lines, too-deeply-nested (the proactive
+   * depth-guard bail), or build-error. Survives the parse cache (a small number
+   * map, kept by `...result` in slimParseWorkerResultsForCache) and is merged +
+   * logged per-language in `dispatchChunkParse` (alongside `skippedLanguages`),
+   * so a CFG coverage gap is visible. Like that sibling telemetry the warn is
+   * emitted for freshly-parsed chunks, not re-emitted on a warm cache hit.
+   * Optional for cache backward-compatibility — older shards predate it.
+   */
+  cfgSkipped?: Record<string, CfgSkipCounts>;
   fileCount: number;
 }
 
@@ -392,7 +472,7 @@ const languageMap: Record<string, TreeSitterLanguage> = {
   [`${SupportedLanguages.TypeScript}:tsx`]: TypeScript.tsx,
   [SupportedLanguages.Python]: Python,
   [SupportedLanguages.Java]: Java,
-  [SupportedLanguages.C]: C,
+  ...(C ? { [SupportedLanguages.C]: C } : {}),
   [SupportedLanguages.CPlusPlus]: CPP,
   [SupportedLanguages.CSharp]: CSharp,
   [SupportedLanguages.Go]: Go,
@@ -834,6 +914,7 @@ const processBatch = (
     fileScopeBindings: [],
     parsedFiles: [],
     skippedLanguages: {},
+    cfgSkipped: {},
     fileCount: 0,
   };
 
@@ -906,8 +987,13 @@ const processBatch = (
         try {
           setLanguage(language, regularFiles[0].path);
           processFileGroup(regularFiles, language, queryString, result, onFileProcessed);
-        } catch {
-          // parser unavailable — skip this language group
+        } catch (err) {
+          // A throw here drops the whole language group — surface it to the pool
+          // (#2264) instead of silently skipping. The old empty catch hid real
+          // extractor/parser failures, not just an unavailable grammar.
+          reportWarning(
+            `Skipped ${regularFiles.length} ${language} file(s) after a processing error: ${err instanceof Error ? err.message : String(err)}`,
+          );
         }
       } else {
         result.skippedLanguages[language] =
@@ -921,8 +1007,12 @@ const processBatch = (
         try {
           setLanguage(language, tsxFiles[0].path);
           processFileGroup(tsxFiles, language, queryString, result, onFileProcessed);
-        } catch {
-          // parser unavailable — skip this language group
+        } catch (err) {
+          // See above — surface a tsx-group processing failure rather than
+          // silently dropping every file in it (#2264).
+          reportWarning(
+            `Skipped ${tsxFiles.length} ${language} (tsx) file(s) after a processing error: ${err instanceof Error ? err.message : String(err)}`,
+          );
         }
       } else {
         result.skippedLanguages[language] =
@@ -1014,6 +1104,7 @@ const ROUTE_DECORATOR_NAMES = new Set([
   'PostMapping',
   'PutMapping',
   'DeleteMapping',
+  'PatchMapping',
 ]);
 
 // ============================================================================
@@ -1081,6 +1172,23 @@ export function extractORMQueries(
 
 import { extractFastAPIRouterBindings } from '../route-extractors/fastapi-router-bindings.js';
 
+/**
+ * Report a non-fatal worker issue to the pool over IPC so a caught error is not
+ * invisible to the operator (#2264). The pool logs it on the main thread AND
+ * resets the worker idle timer (so a worker grinding through failing files isn't
+ * falsely idle-evicted). Falls back to the local logger when there's no parent —
+ * this code also runs on the main thread in tests / the non-worker path. Fatal,
+ * group-aborting errors go through the message handler's
+ * `{ type: 'error', errorStack }` channel instead.
+ */
+function reportWarning(message: string): void {
+  if (parentPort) {
+    parentPort.postMessage({ type: 'warning', message });
+  } else {
+    logger.warn(message);
+  }
+}
+
 const processFileGroup = (
   files: ParseWorkerInput[],
   language: SupportedLanguages,
@@ -1093,12 +1201,9 @@ const processFileGroup = (
     const lang = parser.getLanguage();
     query = new Parser.Query(lang, queryString);
   } catch (err) {
-    const message = `Query compilation failed for ${language}: ${err instanceof Error ? err.message : String(err)}`;
-    if (parentPort) {
-      parentPort.postMessage({ type: 'warning', message });
-    } else {
-      logger.warn(message);
-    }
+    reportWarning(
+      `Query compilation failed for ${language}: ${err instanceof Error ? err.message : String(err)}`,
+    );
     return;
   }
 
@@ -1142,7 +1247,7 @@ const processFileGroup = (
         bufferSize: getTreeSitterBufferSize(parseContent),
       });
     } catch (err) {
-      logger.warn(
+      reportWarning(
         `Failed to parse file ${file.path}: ${err instanceof Error ? err.message : String(err)}`,
       );
       continue;
@@ -1155,7 +1260,7 @@ const processFileGroup = (
     try {
       matches = query.matches(tree.rootNode);
     } catch (err) {
-      logger.warn(
+      reportWarning(
         `Query execution failed for ${file.path}: ${err instanceof Error ? err.message : String(err)}`,
       );
       continue;
@@ -1176,13 +1281,7 @@ const processFileGroup = (
       provider,
       parseContent,
       file.path,
-      (message) => {
-        if (parentPort) {
-          parentPort.postMessage({ type: 'warning', message });
-        } else {
-          logger.warn(message);
-        }
-      },
+      reportWarning,
       tree,
       scopeSourceKind,
     );
@@ -1202,9 +1301,56 @@ const processFileGroup = (
       // copy — scopes/defs are carried by reference) to attach the field rather
       // than mutate the frozen object.
       const sideChannel = provider.collectCaptureSideChannel?.(file.path);
-      result.parsedFiles.push(
-        sideChannel !== undefined ? { ...parsedFile, captureSideChannel: sideChannel } : parsedFile,
-      );
+      let withChannels =
+        sideChannel !== undefined ? { ...parsedFile, captureSideChannel: sideChannel } : parsedFile;
+
+      // CFG side-channel (#2081 M1): build the per-function control-flow graph
+      // here, where the tree-sitter AST is still in hand, and attach it as plain
+      // serializable data. Only on a --pdg run and only for languages with a
+      // cfgVisitor (TS/JS in M1). The same disk-store/warm-cache machinery that
+      // carries captureSideChannel carries this — its coherence rests on the
+      // SCHEMA_BUMP + the pdg-folded chunk-hash key (see parse-cache.ts).
+      if (PDG_ENABLED && provider.cfgVisitor) {
+        // Isolate the CFG build per file: a throw here (an unexpected tree-sitter
+        // node shape) must NOT propagate — it would escape processFileGroup to the
+        // language-group catch, which treats any throw as "parser unavailable" and
+        // silently drops EVERY remaining file in the group. Skip CFG for this one
+        // file; parsing + scope resolution proceed unaffected (CFG is a
+        // strictly-additive opt-in). collectFunctionCfgs ALSO isolates per
+        // FUNCTION now (#2195) — a deep-nesting bail or a single malformed function
+        // is counted in `skipped` and skipped, not allowed to lose the whole file.
+        try {
+          const { cfgs, skipped } = collectFunctionCfgs(
+            tree.rootNode,
+            provider.cfgVisitor,
+            file.path,
+            PDG_MAX_FUNCTION_LINES,
+            // Embedded scripts (Vue SFC <script>) parse at row 0 but live at
+            // `lineOffset` in the file — shift the CFG into file coordinates so
+            // it joins its graph node and BasicBlock lines map to source.
+            lineOffset,
+          );
+          if (cfgs.length) withChannels = { ...withChannels, cfgSideChannel: cfgs };
+          // Surface per-function CFG skips per-language (#2195): merged + logged
+          // in mergeChunkResults. Only accumulate when something was skipped so
+          // the common (nothing-skipped) case stays a no-op.
+          if (skipped.tooManyLines || skipped.tooDeeplyNested || skipped.buildError) {
+            const agg = (result.cfgSkipped ??= {});
+            const prev = agg[language] ?? { tooManyLines: 0, tooDeeplyNested: 0, buildError: 0 };
+            agg[language] = {
+              tooManyLines: prev.tooManyLines + skipped.tooManyLines,
+              tooDeeplyNested: prev.tooDeeplyNested + skipped.tooDeeplyNested,
+              buildError: prev.buildError + skipped.buildError,
+            };
+          }
+        } catch (err) {
+          reportWarning(
+            `CFG build failed for ${file.path}: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }
+
+      result.parsedFiles.push(withChannels);
     }
 
     // Build per-file type environment + constructor bindings in a single AST walk.
@@ -1256,6 +1402,21 @@ const processFileGroup = (
     // patterns overlap with the same source range.
     const processedDefinitionNodes = new Set<string>();
     const variableInfoCache = new Map<number, Map<string, VariableInfo>>();
+
+    // Pre-pass: tree-sitter .matches() yields captures in document byte order,
+    // so @definition.const (anchored on lexical_declaration/export_statement,
+    // byte 0) arrives BEFORE @definition.function (anchored on the inner
+    // arrow_function at byte ~30) for the same code like `const fn = () => {}`.
+    // Pre-populate the set with all higher-priority definition startIndexes so
+    // Const/Static/Variable captures are correctly skipped in the main loop.
+    for (const m of matches) {
+      const cm: Record<string, SyntaxNode> = {};
+      for (const c of m.captures) cm[c.name] = c.node;
+      const dn = getDefinitionNodeFromCaptures(cm);
+      if (dn && !cm['definition.const'] && !cm['definition.static'] && !cm['definition.variable']) {
+        processedDefinitionNodes.add(`${dn.startIndex}`);
+      }
+    }
 
     for (const match of matches) {
       const captureMap: Record<string, SyntaxNode> = {};
@@ -2001,7 +2162,12 @@ const processFileGroup = (
           if (parsedTemplateConstraints !== undefined) {
             constraintsTag = templateConstraintsIdTag(parsedTemplateConstraints);
           }
-        } catch {
+        } catch (err) {
+          // Optional C++ template-constraint enrichment: fall back to no tag, but
+          // surface the failure (#2264) — matches the CFG-build warning above.
+          reportWarning(
+            `Template-constraint extraction failed for ${file.path}: ${err instanceof Error ? err.message : String(err)}`,
+          );
           parsedTemplateConstraints = undefined;
           constraintsTag = '';
         }
@@ -2011,7 +2177,20 @@ const processFileGroup = (
         `${file.path}:${qualifiedName}${classTemplateTag}${arityTag}${parameterShapeTag}${constraintsTag}`,
       );
 
-      const description = provider.descriptionExtractor?.(nodeLabel, nodeName, captureMap);
+      let description: string | undefined;
+      try {
+        description = provider.descriptionExtractor?.(nodeLabel, nodeName, captureMap);
+      } catch (err) {
+        // A throw here (an unexpected tree-sitter node shape, a provider bug) must
+        // NOT propagate — it would escape processFileGroup to the language-group
+        // catch, which treats any throw as "parser unavailable" and silently drops
+        // every remaining file in the group. Mirrors the extractTemplateConstraints
+        // guard above (#2286 review).
+        reportWarning(
+          `Description extraction failed for ${file.path}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        description = undefined;
+      }
 
       let frameworkHint = definitionNode
         ? detectFrameworkFromAST(language, (definitionNode.text || '').slice(0, 300))
@@ -2177,6 +2356,9 @@ const processFileGroup = (
         isReadonly: methodProps.isReadonly as boolean | undefined,
         isAbstract: methodProps.isAbstract as boolean | undefined,
         isFinal: methodProps.isFinal as boolean | undefined,
+        ...(methodProps.isDeleted !== undefined
+          ? { isDeleted: methodProps.isDeleted as boolean }
+          : {}),
         ...(methodProps.isVirtual !== undefined
           ? { isVirtual: methodProps.isVirtual as boolean }
           : {}),
@@ -2271,6 +2453,23 @@ const processFileGroup = (
       );
     }
 
+    // Language-specific decorator route extraction via provider hook.
+    // The provider's extractDecoratorRoutes walks the AST for framework-specific
+    // route patterns (e.g., Java Spring class-level prefix joining). Routes are
+    // appended to decoratorRoutes for the routes phase to emit as Route nodes.
+    if (provider.extractDecoratorRoutes) {
+      const frameworkRoutes = provider.extractDecoratorRoutes(tree, file.path, lineOffset);
+      for (const r of frameworkRoutes) result.decoratorRoutes.push(r);
+    }
+
+    // Project-wide route-inheritance type collection via provider hook (#2288).
+    // The per-file SharedSpringType views are aggregated by the parse phase,
+    // which then resolves interface-inherited routes cross-file.
+    if (provider.extractRouteInheritanceTypes) {
+      const springTypes = provider.extractRouteInheritanceTypes(tree, file.path);
+      if (springTypes.length > 0) (result.springTypes ??= []).push(...springTypes);
+    }
+
     // Vue: emit CALLS edges for components used in <template>
     if (language === SupportedLanguages.Vue) {
       const templateComponents = extractTemplateComponents(file.content);
@@ -2310,43 +2509,12 @@ let accumulated: ParseWorkerResult = {
   fileScopeBindings: [],
   parsedFiles: [],
   skippedLanguages: {},
+  cfgSkipped: {},
   fileCount: 0,
 };
 let cumulativeProcessed = 0;
-
-// Use a loop instead of push(...spread) to avoid hitting V8's argument limit
-// when merging large result sets (push(...arr) calls apply() under the hood
-// and blows the stack when arr has >~65k elements).
-const appendAll = <T>(target: T[], src: T[]) => {
-  for (let i = 0; i < src.length; i++) target.push(src[i]);
-};
-
-const mergeResult = (target: ParseWorkerResult, src: ParseWorkerResult) => {
-  appendAll(target.nodes, src.nodes);
-  appendAll(target.relationships, src.relationships);
-  appendAll(target.symbols, src.symbols);
-  appendAll(target.calls, src.calls);
-  appendAll(target.assignments, src.assignments);
-  appendAll(target.routes, src.routes);
-  appendAll(target.fetchCalls, src.fetchCalls);
-  appendAll(target.fetchWrapperDefs, src.fetchWrapperDefs);
-  appendAll(target.decoratorRoutes, src.decoratorRoutes);
-  if (src.routerIncludes) appendAll(target.routerIncludes, src.routerIncludes);
-  if (src.routerImports) appendAll(target.routerImports, src.routerImports);
-  if (src.routerModuleAliases) {
-    target.routerModuleAliases ??= [];
-    appendAll(target.routerModuleAliases, src.routerModuleAliases);
-  }
-  appendAll(target.toolDefs, src.toolDefs);
-  appendAll(target.ormQueries, src.ormQueries);
-  appendAll(target.constructorBindings, src.constructorBindings);
-  appendAll(target.fileScopeBindings, src.fileScopeBindings);
-  appendAll(target.parsedFiles, src.parsedFiles);
-  for (const [lang, count] of Object.entries(src.skippedLanguages)) {
-    target.skippedLanguages[lang] = (target.skippedLanguages[lang] || 0) + count;
-  }
-  target.fileCount += src.fileCount;
-};
+// `mergeResult` (+ its `appendAll`) lives in ./result-merge.ts (extracted so it
+// can be unit-tested without importing this entry module).
 
 // Signal the pool that worker-side initialization (parser imports, language
 // grammars, type-env setup, all helper modules) is complete and the message
@@ -2460,7 +2628,7 @@ parentPort!.on('message', (msg: WorkerIncomingMessage) => {
           accumulated.parsedFiles = [];
         }
       }
-      parentPort!.postMessage({ type: 'result', data: accumulated });
+      postResultCloneSafe(accumulated);
       // Reset for potential reuse
       accumulated = {
         nodes: [],
@@ -2481,6 +2649,7 @@ parentPort!.on('message', (msg: WorkerIncomingMessage) => {
         fileScopeBindings: [],
         parsedFiles: [],
         skippedLanguages: {},
+        cfgSkipped: {},
         fileCount: 0,
       };
       cumulativeProcessed = 0;
