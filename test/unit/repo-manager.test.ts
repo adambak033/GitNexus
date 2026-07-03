@@ -24,6 +24,7 @@ import {
   loadCLIConfig,
   registerRepo,
   removeBranchIndex,
+  adoptFlatBranchLabel,
   listRegisteredRepos,
   resolveRegistryEntry,
   canonicalizePath,
@@ -133,6 +134,9 @@ describe('branchSlug (#2106)', () => {
 });
 
 // ─── resolveBranchPlacement (#2106 KTD2) ─────────────────────────────
+// Since #2354 only explicit `--branch` runs consult this (a plain analyze
+// always targets the flat workspace slot); these cases pin the explicit-run
+// contract.
 
 describe('resolveBranchPlacement (#2106)', () => {
   let tmpRepo: Awaited<ReturnType<typeof createTempDir>>;
@@ -172,7 +176,7 @@ describe('resolveBranchPlacement (#2106)', () => {
     expect(await resolveBranchPlacement(tmpRepo.dbPath, 'main')).toEqual({});
   });
 
-  it('non-primary checked-out branch → its own sub-directory', async () => {
+  it('explicit label differing from the recorded flat branch → its own sub-directory', async () => {
     const { storagePath } = getStoragePaths(tmpRepo.dbPath);
     await saveMeta(storagePath, baseMeta('main'));
     expect(await resolveBranchPlacement(tmpRepo.dbPath, 'feature')).toEqual({ branch: 'feature' });
@@ -965,6 +969,50 @@ describe('registerRepo branch nesting (#2106)', () => {
     await removeBranchIndex(tmpRepo.dbPath, 'feature/x');
     const [entry] = await listRegisteredRepos();
     expect(entry.branches?.map((b) => b.branch)).toEqual(['feature/y']);
+  });
+
+  // ─── adoptFlatBranchLabel (#2354) ───────────────────────────────────
+
+  it('adoptFlatBranchLabel relabels the entry and removes a shadowed sub-index', async () => {
+    await registerRepo(tmpRepo.dbPath, metaFor('main', 'aaa1111'));
+    await registerRepo(tmpRepo.dbPath, metaFor('feature/x', 'bbb2222'), { branch: 'feature/x' });
+    // Materialize the pinned sub-index on disk so the shadow cleanup has a
+    // real directory to remove.
+    const { metaPath } = getStoragePaths(tmpRepo.dbPath, 'feature/x');
+    await saveMeta(path.dirname(metaPath), metaFor('feature/x', 'bbb2222'));
+
+    await adoptFlatBranchLabel(tmpRepo.dbPath, 'feature/x');
+
+    const [entry] = await listRegisteredRepos();
+    expect(entry.branch).toBe('feature/x');
+    expect(entry.branches).toBeUndefined(); // shadowed summary dropped
+    await expect(fs.access(path.dirname(metaPath))).rejects.toThrow(); // dir deleted
+  });
+
+  it('adoptFlatBranchLabel keeps other pinned branch summaries', async () => {
+    await registerRepo(tmpRepo.dbPath, metaFor('main', 'aaa1111'));
+    await registerRepo(tmpRepo.dbPath, metaFor('feature/x', 'bbb2222'), { branch: 'feature/x' });
+    await registerRepo(tmpRepo.dbPath, metaFor('feature/y', 'ccc3333'), { branch: 'feature/y' });
+
+    await adoptFlatBranchLabel(tmpRepo.dbPath, 'feature/x');
+
+    const [entry] = await listRegisteredRepos();
+    expect(entry.branch).toBe('feature/x');
+    expect(entry.branches?.map((b) => b.branch)).toEqual(['feature/y']);
+  });
+
+  it('adoptFlatBranchLabel never self-heals an unregistered repo', async () => {
+    // No registerRepo call — the registry has no entry for this path (#2264/#1169).
+    // The no-op must cover the disk too: a materialized pinned sub-index
+    // survives, because the shadow rm only runs for registered repos
+    // (#2364 review F2 — the rm used to fire before the registry check).
+    const { metaPath } = getStoragePaths(tmpRepo.dbPath, 'feature/x');
+    await saveMeta(path.dirname(metaPath), metaFor('feature/x', 'bbb2222'));
+
+    await adoptFlatBranchLabel(tmpRepo.dbPath, 'feature/x');
+
+    expect(await listRegisteredRepos()).toHaveLength(0);
+    await expect(fs.access(path.dirname(metaPath))).resolves.toBeUndefined(); // dir survives
   });
 
   // ─── re-read-before-write merge (#2106 R9) ──────────────────────────

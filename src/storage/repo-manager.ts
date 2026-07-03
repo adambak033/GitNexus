@@ -657,7 +657,7 @@ export const findRepo = async (startPath: string): Promise<IndexedRepo | null> =
   return null;
 };
 
-function isReadOnlyFilesystemError(err: unknown): boolean {
+export function isReadOnlyFilesystemError(err: unknown): boolean {
   const code = (err as NodeJS.ErrnoException)?.code;
   return code === 'EROFS' || code === 'EACCES' || code === 'EPERM';
 }
@@ -1118,6 +1118,90 @@ export const removeBranchIndex = async (repoPath: string, branch: string): Promi
   entries[idx] = entry;
   await writeRegistry(entries);
   return true;
+};
+
+/**
+ * Record that the flat workspace slot now serves `branch` (#2354).
+ *
+ * The flat index follows the checked-out working tree, so when a plain
+ * analyze lands on a branch that also has a pinned `branches/<slug>/`
+ * sub-index, that sub-index becomes permanently shadowed — explicit
+ * `--branch` runs re-resolve to the flat slot and query-side branch scoping
+ * serves the flat handle first. Delete the shadowed directory and drop its
+ * registry summary in the same pass (leaving either half behind would strand
+ * un-cleanable disk bloat), and refresh the entry's top-level `branch` label
+ * so `list`/`list_repos`/branch-scoped queries stay coherent.
+ *
+ * Deliberately narrow for the analyze fast path: a missing registry entry is
+ * a no-op — including the sub-index deletion, which only runs for registered
+ * repos (never self-heals an unregistered repo, per #2264/#1169; the registry
+ * check precedes the rm per #2364 review F2) — and no subprocess is spawned.
+ */
+export const adoptFlatBranchLabel = async (repoPath: string, branch: string): Promise<void> => {
+  const canonicalInput = canonicalizePath(repoPath);
+  const isRegistered = (list: RegistryEntry[]): number =>
+    list.findIndex((e) => registryPathEquals(canonicalizePath(e.path), canonicalInput));
+  // Cheap membership gate only (#2364 review F2): never touch the disk for an
+  // unregistered repo. The mutate below re-reads its own fresh snapshot.
+  if (isRegistered(await readRegistry()) < 0) return; // no-op, disk included (no self-heal)
+
+  const resolved = path.resolve(repoPath);
+  const { storagePath } = getStoragePaths(resolved);
+  // Remove a shadowed sub-index directory, mirroring `clean --branch`'s
+  // containment guard: the target MUST live under .gitnexus/branches/.
+  const branchDir = path.join(storagePath, BRANCHES_DIR, branchSlug(branch));
+  const branchesRoot = path.join(storagePath, BRANCHES_DIR) + path.sep;
+  let dirGone = false;
+  if (branchDir.startsWith(branchesRoot)) {
+    let rmError: NodeJS.ErrnoException | undefined;
+    await fs.rm(branchDir, { recursive: true, force: true }).catch((err: unknown) => {
+      rmError = err as NodeJS.ErrnoException;
+    });
+    // The registry summary may be dropped only for a verifiably-gone
+    // directory: `clean --branch` resolves its target solely via the
+    // recorded summary, so dropping it while the dir survives (e.g. Windows
+    // EBUSY on an lbug held open by a live MCP server) would strand
+    // un-cleanable disk bloat (#2364 review F4). A resolved force:true rm
+    // proves absence; on failure, probe the disk and treat only
+    // provably-absent errno as gone — EACCES/EIO are "not provably absent",
+    // the same polarity as listRegisteredRepos({ validate: true }).
+    if (!rmError) {
+      dirGone = true;
+    } else {
+      const probeCode = await fs.access(branchDir).then(
+        () => null,
+        (e: unknown) => (e as NodeJS.ErrnoException)?.code ?? 'UNKNOWN',
+      );
+      dirGone = probeCode === 'ENOENT' || probeCode === 'ENOTDIR';
+    }
+    if (dirGone) {
+      // Non-recursive by design: only removes the parent when no other pinned
+      // sub-index remains, so an empty branches/ dir doesn't read as "pinned".
+      await fs.rmdir(path.join(storagePath, BRANCHES_DIR)).catch(() => {});
+    } else {
+      logger.warn(
+        { path: branchDir, code: rmError?.code },
+        'Could not remove the shadowed branch sub-index; keeping its registry summary so `gitnexus clean --branch` can still target it.',
+      );
+    }
+  }
+
+  // Re-read AFTER the potentially slow recursive rm: the registry is a
+  // multi-writer whole-file overwrite, and writing a pre-rm snapshot would
+  // silently clobber concurrent registerRepo/removeBranchIndex writers —
+  // the #2106 R9 re-read-before-write discipline registerRepo follows.
+  const entries = await readRegistry();
+  const idx = isRegistered(entries);
+  if (idx < 0) return; // unregistered concurrently → still a no-op
+  const entry = entries[idx];
+  const remaining = dirGone ? entry.branches?.filter((b) => b.branch !== branch) : entry.branches;
+  const droppedSummary = (entry.branches?.length ?? 0) !== (remaining?.length ?? 0);
+  if (entry.branch === branch && !droppedSummary) return; // already coherent
+  entry.branch = branch;
+  if (remaining && remaining.length > 0) entry.branches = remaining;
+  else delete entry.branches;
+  entries[idx] = entry;
+  await writeRegistry(entries);
 };
 
 /**

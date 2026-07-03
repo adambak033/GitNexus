@@ -396,7 +396,7 @@ interface RepoHandle {
   stats?: RegistryEntry['stats'];
   /** Primary/flat branch name, when known (#2106). */
   branch?: string;
-  /** Non-primary branch indexes available for this repo (#2106). */
+  /** Pinned `--branch` sub-indexes available for this repo, distinct from the flat workspace slot (#2106/#2354). */
   branches?: BranchSummary[];
 }
 
@@ -584,7 +584,7 @@ export interface RepoListing {
   siblings?: Array<{ name: string; path: string; lastCommit: string }>;
   /** Primary/flat branch name, when known (#2106). */
   branch?: string;
-  /** Non-primary branch indexes available for this repo (#2106). */
+  /** Pinned `--branch` sub-indexes available for this repo, distinct from the flat workspace slot (#2106/#2354). */
   branches?: Array<Omit<BranchSummary, 'stats'>>;
 }
 
@@ -1120,45 +1120,118 @@ export class LocalBackend {
   /**
    * Re-point a resolved repo handle at a specific branch index (#2106).
    *
-   * - No `branch` (default) → the primary/flat handle, unchanged (backward
+   * - No `branch` (default) → the flat workspace handle, unchanged (backward
    *   compatible: every existing caller passes no branch).
-   * - `branch` equal to the known primary → the flat handle.
-   * - `branch` matching an indexed non-primary branch → a handle whose
+   * - `branch` equal to the flat slot's **on-disk** recorded branch → the
+   *   flat handle. The disk meta is read before any cached state is trusted
+   *   (#2364 review F1): the flat slot follows the checked-out working tree
+   *   (#2354), so a plain analyze after a branch switch restamps the meta
+   *   without any repo-resolution miss that would refresh a long-lived
+   *   server's cached handle — the cached label can otherwise serve another
+   *   branch's content under the old name (the pool staleness reinit
+   *   hot-swaps content without updating `handle.branch`).
+   * - `branch` matching an indexed pinned branch → a handle whose
    *   `lbugPath` points at `branches/<slug>/lbug`; the connection pool keys by
-   *   `lbugPath`, so this is the only change needed to scope every tool.
-   * - `branch` that was never indexed → a clear error (never a silently-empty
-   *   result against the wrong DB).
+   *   `lbugPath`, so this is the only change needed to scope every tool. The
+   *   sub-index lbug must actually exist on disk — `adoptFlatBranchLabel`
+   *   deletes the whole dir when the flat slot takes ownership, and a stale
+   *   cached summary must not route to the deleted path.
+   * - Cached `handle.branch` is trusted only when there is no readable flat
+   *   meta to contradict it (legacy shapes, #2106 R4).
+   * - Any miss → a clear error (never a silently-empty result against the
+   *   wrong DB), after exactly one `refreshRepos()` so newly-pinned branches
+   *   and restamped labels the cached handle predates resolve on the next
+   *   call.
    */
   private async applyBranchScope(handle: RepoHandle, branch?: string): Promise<RepoHandle> {
     if (!branch) return handle;
-    if (handle.branch && handle.branch === branch) return handle;
-    const summary = handle.branches?.find((b) => b.branch === branch);
-    if (summary) {
-      const { lbugPath } = getStoragePaths(handle.repoPath, branch);
+    // At most one cache refresh per resolution: enough for the NEXT call to
+    // see fresh handles, without paying two registry re-scans when several
+    // stale arms fire in one degraded resolution.
+    let refreshed = false;
+    const refreshOnce = async (): Promise<void> => {
+      if (refreshed) return;
+      refreshed = true;
+      await this.refreshRepos().catch(() => {});
+    };
+    // One small JSON read per scoped call; mid-run meta writes preserve the
+    // old label until the end-of-run atomic stamp (run-analyze dirty stamps
+    // spread the existing meta), so this read never runs ahead of the DB.
+    const flatMeta = await loadMeta(path.dirname(handle.lbugPath));
+    if (flatMeta?.branch && flatMeta.branch === branch) {
+      // The disk meta decides routing, so it also supplies the metadata —
+      // the cached handle's label/commit/stats can predate the restamp.
       return {
         ...handle,
-        lbugPath,
-        indexedAt: summary.indexedAt,
-        lastCommit: summary.lastCommit,
-        stats: summary.stats,
+        branch: flatMeta.branch,
+        indexedAt: flatMeta.indexedAt ?? handle.indexedAt,
+        lastCommit: flatMeta.lastCommit ?? handle.lastCommit,
+        stats: flatMeta.stats ?? handle.stats,
       };
     }
-    // Legacy entry (pre-#2106): the registry has no recorded primary `branch`,
-    // so a `--branch <primary>` request misses the checks above. Read the flat
-    // meta.json (next to the flat handle's lbug) to learn the primary and serve
-    // the flat handle only when it actually matches — never serve flat for an
-    // arbitrary unindexed branch (#2106 R4).
-    if (!handle.branch) {
-      const flatMeta = await loadMeta(path.dirname(handle.lbugPath));
-      if (flatMeta?.branch && flatMeta.branch === branch) return handle;
+
+    // A registry entry claiming `branch` both as the flat label AND as a
+    // pinned summary is an adopt-degraded state (rm kept the summary while
+    // the label restamped) — never serve the possibly stale-vintage pin for
+    // a label the flat slot claims; fall through to the honest error.
+    const summary =
+      handle.branch !== branch ? handle.branches?.find((b) => b.branch === branch) : undefined;
+    if (summary) {
+      const { lbugPath } = getStoragePaths(handle.repoPath, branch);
+      // The lbug is the artifact the pool opens, so its presence is the
+      // serviceability truth — a half-deleted dir can outlive its meta.json
+      // while the lbug is gone, and vice versa (#2364 review F1 arm ii).
+      // Only provably-absent errno counts as missing: a transient EACCES/EIO
+      // on a healthy pinned sub-index must serve the handle (the pool open
+      // surfaces the real error) rather than a false "not indexed".
+      const probeCode = await fs.access(lbugPath).then(
+        () => null,
+        (e: unknown) => (e as NodeJS.ErrnoException)?.code ?? 'UNKNOWN',
+      );
+      const subIndexMissing = probeCode === 'ENOENT' || probeCode === 'ENOTDIR';
+      if (!subIndexMissing) {
+        return {
+          ...handle,
+          lbugPath,
+          indexedAt: summary.indexedAt,
+          lastCommit: summary.lastCommit,
+          stats: summary.stats,
+        };
+      }
+      // Stale summary (sub-index adopted/deleted): refresh so later calls see
+      // fresh handles, then fall through — the flat meta above is the truth.
+      await refreshOnce();
     }
-    const indexed = [handle.branch, ...(handle.branches?.map((b) => b.branch) ?? [])].filter(
-      Boolean,
+
+    if (handle.branch && handle.branch === branch) {
+      // No readable flat meta (missing/corrupt — loadMeta → null): keep the
+      // pre-#2354 trust in the cached label (#2106 R4 legacy shapes). A
+      // readable meta that names another branch means the label is stale.
+      if (!flatMeta?.branch) return handle;
+    }
+
+    // Every miss refreshes once before erroring: newly-pinned branches and
+    // restamped labels the cached handle predates become resolvable on the
+    // caller's next attempt (the cache otherwise only refreshes on repo-
+    // resolution misses and list_repos).
+    await refreshOnce();
+
+    // The flat slot's label comes from the authoritative meta when readable —
+    // never echo a cached label the meta just contradicted (a "not indexed:
+    // main / indexed: main" self-contradiction). Cached summaries may still
+    // lag; they are a hint, not a promise.
+    const flatLabel = flatMeta?.branch ?? handle.branch;
+    const indexed = [flatLabel, ...(handle.branches?.map((b) => b.branch) ?? [])].filter(
+      (b) => Boolean(b) && b !== branch,
     );
-    const available = indexed.length > 0 ? indexed.join(', ') : '(primary only)';
+    const available = indexed.length > 0 ? indexed.join(', ') : '(workspace only)';
+    // Post-#2354 a bare `analyze --branch <X>` refuses to run unless X is
+    // checked out, so the guidance must lead with the checkout (#2364 F6).
     throw new Error(
       `Branch "${branch}" is not indexed for "${handle.name}". ` +
-        `Indexed branches: ${available}. Run: gitnexus analyze --branch ${branch}`,
+        `Indexed branches: ${available}. The workspace index follows the ` +
+        `checked-out branch — check out "${branch}" and re-run: gitnexus analyze ` +
+        `(add --branch ${branch} while it is checked out to pin a separate sub-index).`,
     );
   }
 
