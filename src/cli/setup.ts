@@ -21,6 +21,7 @@ import {
   skillTarget,
   hookTarget,
   detectIndentation,
+  isEnoent,
   type EditorId,
 } from './editor-targets.js';
 
@@ -91,6 +92,8 @@ const CODING_AGENT_IDS = {
   claude: 'claude',
   antigravity: 'antigravity',
   opencode: 'opencode',
+  codebuddy: 'codebuddy',
+  qoder: 'qoder',
   codex: 'codex',
 } as const satisfies Record<EditorId, EditorId>;
 const SUPPORTED_CODING_AGENTS = Object.values(CODING_AGENT_IDS);
@@ -213,7 +216,12 @@ async function mergeJsoncFile(
   let raw: string;
   try {
     raw = await fs.readFile(filePath, 'utf-8');
-  } catch {
+  } catch (err) {
+    // Only an absent file means "start fresh". Any other read failure (EACCES,
+    // EIO, cloud-placeholder faults) must not be treated as empty — the write
+    // below would replace the user's existing config with a gitnexus-only
+    // document and report success. Rethrow into the per-editor catch instead.
+    if (!isEnoent(err)) throw err;
     raw = '';
   }
 
@@ -250,6 +258,39 @@ async function dirExists(dirPath: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+/**
+ * Detection probe: is there a non-empty regular file at this path?
+ * Swallows ALL errors (like dirExists) — detection gates run outside the
+ * per-editor try blocks, so a rethrowing probe would abort setup for every
+ * remaining editor. Size > 0 keeps detection aligned with the config-chain
+ * resolver: an empty config file is not evidence of an install, and treating
+ * it as one would route the write to a fresh file whose mkdir manufactures
+ * the editor's directory.
+ */
+async function isNonEmptyFile(filePath: string): Promise<boolean> {
+  try {
+    const stat = await fs.stat(filePath);
+    return stat.isFile() && stat.size > 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Detection probe: does any file in the target's MCP config chain look like an
+ * install trace? Always walks [file, ...legacyFiles] so an editor gaining
+ * legacyFiles later is automatically covered (CodeBuddy and Qoder share this —
+ * a per-editor copy is how the root-config-only detection gap crept in, see
+ * PR #2368 review I4).
+ */
+async function anyChainConfigFile(target: {
+  file: string;
+  legacyFiles?: string[];
+}): Promise<boolean> {
+  const hits = await Promise.all([target.file, ...(target.legacyFiles ?? [])].map(isNonEmptyFile));
+  return hits.includes(true);
 }
 
 // ─── Editor-specific setup ─────────────────────────────────────────
@@ -346,7 +387,11 @@ async function mergeHooksJsonc(
   let raw: string;
   try {
     raw = await fs.readFile(filePath, 'utf-8');
-  } catch {
+  } catch (err) {
+    // Same contract as mergeJsoncFile: an unreadable (non-ENOENT) settings
+    // file must not be rewritten as hooks-only — that would destroy every
+    // user setting in it. Rethrow into the hook installer's catch.
+    if (!isEnoent(err)) throw err;
     raw = '';
   }
 
@@ -787,6 +832,123 @@ async function setupOpenCode(result: SetupResult): Promise<void> {
 }
 
 /**
+ * Resolve which config file in a target's [file, ...legacyFiles] priority
+ * chain setup should write into: the first that exists, else the recommended
+ * `file`. CodeBuddy reads only the first existing file in its chain, so
+ * creating the recommended file above a populated deprecated one would shadow
+ * the user's existing MCP servers.
+ */
+async function resolveMcpConfigFile(target: {
+  file: string;
+  legacyFiles?: string[];
+}): Promise<string> {
+  for (const candidate of [target.file, ...(target.legacyFiles ?? [])]) {
+    try {
+      const stat = await fs.stat(candidate);
+      // Non-empty regular files only: a 0-byte recommended file must not
+      // shadow a populated deprecated one (mergeJsoncFile treats empty as a
+      // fresh document anyway), and directories are never config candidates.
+      if (stat.isFile() && stat.size > 0) return candidate;
+    } catch (err) {
+      // ENOENT = candidate absent — try the next one. Anything else (EACCES
+      // on the file or a parent) is surfaced: silently skipping could route
+      // the write to a lower-priority file the editor never reads.
+      if (!isEnoent(err)) throw err;
+    }
+  }
+  return target.file;
+}
+
+async function setupCodeBuddy(result: SetupResult): Promise<void> {
+  const codebuddyDir = path.join(os.homedir(), '.codebuddy');
+  const target = mcpTarget('codebuddy');
+  // Installed = the config dir exists OR any registered MCP config file does.
+  // A user whose only trace is a root-level config (e.g. a legacy
+  // ~/.codebuddy.json) still gets configured — uninstall already handles that
+  // shape, so setup skipping it was an asymmetry (PR #2368 review I4).
+  if (!(await dirExists(codebuddyDir)) && !(await anyChainConfigFile(target))) {
+    result.skipped.push('CodeBuddy (not installed)');
+    return;
+  }
+
+  try {
+    const configFile = await resolveMcpConfigFile(target);
+    const ok = await mergeJsoncFile(configFile, target.keyPath, getMcpEntry());
+    if (ok) {
+      result.configured.push('CodeBuddy');
+    } else {
+      result.errors.push(
+        `CodeBuddy: ${path.basename(configFile)} is corrupt — skipping to preserve existing content`,
+      );
+    }
+  } catch (err) {
+    result.errors.push(`CodeBuddy: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+async function setupQoder(result: SetupResult): Promise<void> {
+  const qoderDir = path.join(os.homedir(), '.qoder');
+  const target = mcpTarget('qoder');
+  const { file: mcpPath, keyPath } = target;
+  // Same chain-aware detection as CodeBuddy: ~/.qoder.json alone counts.
+  if (!(await dirExists(qoderDir)) && !(await anyChainConfigFile(target))) {
+    result.skipped.push('Qoder (not installed)');
+    return;
+  }
+
+  try {
+    const ok = await mergeJsoncFile(mcpPath, keyPath, getMcpEntry());
+    if (ok) {
+      result.configured.push('Qoder');
+    } else {
+      result.errors.push('Qoder: .qoder.json is corrupt — skipping to preserve existing content');
+    }
+  } catch (err) {
+    result.errors.push(`Qoder: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/**
+ * Install global CodeBuddy skills to ~/.codebuddy/skills/
+ * (https://www.codebuddy.ai/docs/cli/skills — same SKILL.md layout as Claude Code).
+ */
+async function installCodeBuddySkills(result: SetupResult): Promise<void> {
+  const codebuddyDir = path.join(os.homedir(), '.codebuddy');
+  if (!(await dirExists(codebuddyDir))) return;
+
+  const skillsDir = skillTarget('codebuddy').dir;
+  try {
+    const installed = await installSkillsTo(skillsDir);
+    if (installed.length > 0) {
+      result.configured.push(
+        `CodeBuddy skills (${installed.length} skills → ~/.codebuddy/skills/)`,
+      );
+    }
+  } catch (err) {
+    result.errors.push(`CodeBuddy skills: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/**
+ * Install global Qoder skills to ~/.qoder/skills/
+ * (https://docs.qoder.com/extensions/skills — same SKILL.md layout as Claude Code).
+ */
+async function installQoderSkills(result: SetupResult): Promise<void> {
+  const qoderDir = path.join(os.homedir(), '.qoder');
+  if (!(await dirExists(qoderDir))) return;
+
+  const skillsDir = skillTarget('qoder').dir;
+  try {
+    const installed = await installSkillsTo(skillsDir);
+    if (installed.length > 0) {
+      result.configured.push(`Qoder skills (${installed.length} skills → ~/.qoder/skills/)`);
+    }
+  } catch (err) {
+    result.errors.push(`Qoder skills: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/**
  * Build a TOML section for Codex MCP config (~/.codex/config.toml).
  */
 function getCodexMcpTomlSection(): string {
@@ -803,7 +965,11 @@ async function upsertCodexConfigToml(configPath: string): Promise<void> {
   let existing = '';
   try {
     existing = await fs.readFile(configPath, 'utf-8');
-  } catch {
+  } catch (err) {
+    // TOML variant of the mergeJsoncFile contract: treating a non-ENOENT read
+    // failure as an empty config would rewrite config.toml with only the
+    // gitnexus section. Rethrow into setupCodex's catch.
+    if (!isEnoent(err)) throw err;
     existing = '';
   }
 
@@ -1025,6 +1191,8 @@ export const setupCommand = async (options?: { codingAgent?: string[] | string }
   if (selected.has('claude')) await setupClaudeCode(result);
   if (selected.has('antigravity')) await setupAntigravity(result);
   if (selected.has('opencode')) await setupOpenCode(result);
+  if (selected.has('codebuddy')) await setupCodeBuddy(result);
+  if (selected.has('qoder')) await setupQoder(result);
   if (selected.has('codex')) await setupCodex(result);
 
   // Install global skills for platforms that support them
@@ -1038,6 +1206,8 @@ export const setupCommand = async (options?: { codingAgent?: string[] | string }
   }
   if (selected.has('cursor')) await installCursorSkills(result);
   if (selected.has('opencode')) await installOpenCodeSkills(result);
+  if (selected.has('codebuddy')) await installCodeBuddySkills(result);
+  if (selected.has('qoder')) await installQoderSkills(result);
   if (selected.has('codex')) await installCodexSkills(result);
 
   // Print results

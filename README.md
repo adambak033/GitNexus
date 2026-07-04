@@ -2,7 +2,7 @@
 
 **Graph-powered code intelligence for AI agents.** Index any codebase into a knowledge graph, then query it via MCP or CLI.
 
-Works with **Cursor**, **Claude Code**, **Antigravity** (Google), **Codex**, **Windsurf**, **Cline**, **OpenCode**, and any MCP-compatible tool.
+Works with **Cursor**, **Claude Code**, **Antigravity** (Google), **Codex**, **Windsurf**, **Cline**, **OpenCode**, **CodeBuddy** (Tencent), **Qoder** (Alibaba), and any MCP-compatible tool.
 
 [![npm version](https://img.shields.io/npm/v/gitnexus.svg)](https://www.npmjs.com/package/gitnexus)
 [![License: PolyForm Noncommercial](https://img.shields.io/badge/License-PolyForm%20Noncommercial-blue.svg)](https://polyformproject.org/licenses/noncommercial/1.0.0/)
@@ -45,6 +45,8 @@ To configure MCP for your editor, run `npx gitnexus setup` once — or set it up
 | **Antigravity** (Google) | Yes | Yes    | Yes (AfterTool, [Gemini CLI hooks schema](https://geminicli.com/docs/hooks/reference/))    | **Full**     |
 | **Codex**                | Yes | Yes    | —                                                                                          | MCP + Skills |
 | **OpenCode**             | Yes | Yes    | —                                                                                          | MCP + Skills |
+| **CodeBuddy** (Tencent)  | Yes | Yes    | —                                                                                          | MCP + Skills |
+| **Qoder** (Alibaba)      | Yes | Yes    | —                                                                                          | MCP + Skills |
 | **Windsurf**             | Yes | —      | —                                                                                          | MCP          |
 
 > **Claude Code** gets the deepest integration: MCP tools + agent skills + PreToolUse hooks that automatically enrich grep/glob/bash calls with knowledge graph context + PostToolUse hooks that detect a stale index after commits and prompt the agent to reindex.
@@ -105,6 +107,36 @@ Add to `~/.config/opencode/config.json`:
 }
 ```
 
+### CodeBuddy
+
+CodeBuddy reads only the **first existing file** in its config priority chain: `~/.codebuddy/.mcp.json` (recommended) → `~/.codebuddy/mcp.json` (deprecated) → `~/.codebuddy.json` (legacy). Edit the first non-empty file that exists — creating a higher-priority file would hide the servers in the ones below it. If none exist, create `~/.codebuddy/.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "gitnexus": {
+      "command": "npx",
+      "args": ["-y", "gitnexus@latest", "mcp"]
+    }
+  }
+}
+```
+
+### Qoder
+
+Add to `~/.qoder.json`:
+
+```json
+{
+  "mcpServers": {
+    "gitnexus": {
+      "command": "npx",
+      "args": ["-y", "gitnexus@latest", "mcp"]
+    }
+  }
+}
+```
+
 ## How It Works
 
 GitNexus builds a complete knowledge graph of your codebase through a multi-phase indexing pipeline:
@@ -125,24 +157,24 @@ The result is a **LadybugDB graph database** stored locally in `.gitnexus/` with
 Your AI agent gets **17 tools** (15 per-repo + 2 group) automatically:
 
 | Tool             | What It Does                                                           |
-| ---------------- | ----------------------------------------------------------------------- |
-| `list_repos`     | Discover all indexed repositories (paginated — `limit`/`offset`)        |
-| `query`          | Process-grouped hybrid search (BM25 + semantic + RRF)                   |
-| `context`        | 360-degree symbol view — categorized refs, process participation        |
-| `impact`         | Blast radius analysis with depth grouping and confidence                |
-| `trace`          | Shortest directed path between two symbols (call + class-member edges)  |
-| `detect_changes` | Git-diff impact — maps changed lines to affected processes              |
-| `check`          | Read-only structural checks against the indexed graph                   |
-| `rename`         | Multi-file coordinated rename with graph + text search                  |
-| `cypher`         | Raw Cypher graph queries                                                |
-| `route_map`      | API route map — which components fetch which endpoints, and handlers    |
-| `tool_map`       | MCP/RPC tool definitions — where they're defined and handled            |
-| `shape_check`    | Validate API response shapes against consumers' property accesses       |
-| `api_impact`     | Pre-change impact report for an API route handler                       |
-| `explain`        | Explain persisted taint findings (source→sink flows, `--pdg` indexes)   |
-| `pdg_query`      | Query control/data dependence at statement level (`--pdg` indexes)      |
-| `group_list`     | List configured repository groups                                       |
-| `group_sync`     | Rebuild a group's Contract Registry and cross-repo links                |
+| ---------------- | ---------------------------------------------------------------------- |
+| `list_repos`     | Discover all indexed repositories (paginated — `limit`/`offset`)       |
+| `query`          | Process-grouped hybrid search (BM25 + semantic + RRF)                  |
+| `context`        | 360-degree symbol view — categorized refs, process participation       |
+| `impact`         | Blast radius analysis with depth grouping and confidence               |
+| `trace`          | Shortest directed path between two symbols (call + class-member edges) |
+| `detect_changes` | Git-diff impact — maps changed lines to affected processes             |
+| `check`          | Read-only structural checks against the indexed graph                  |
+| `rename`         | Multi-file coordinated rename with graph + text search                 |
+| `cypher`         | Raw Cypher graph queries                                               |
+| `route_map`      | API route map — which components fetch which endpoints, and handlers   |
+| `tool_map`       | MCP/RPC tool definitions — where they're defined and handled           |
+| `shape_check`    | Validate API response shapes against consumers' property accesses      |
+| `api_impact`     | Pre-change impact report for an API route handler                      |
+| `explain`        | Explain persisted taint findings (source→sink flows, `--pdg` indexes)  |
+| `pdg_query`      | Query control/data dependence at statement level (`--pdg` indexes)     |
+| `group_list`     | List configured repository groups                                      |
+| `group_sync`     | Rebuild a group's Contract Registry and cross-repo links               |
 
 > With one indexed repo, the `repo` param is optional. With multiple, specify which: `query({search_query: "auth", repo: "my-app"})`. Per-repo tools also take an optional `branch` for indexes pinned with `gitnexus analyze --branch`; omitting it queries the workspace index, which follows your checked-out working tree. `explain` and `pdg_query` need an index built with `gitnexus analyze --pdg`.
 
@@ -383,13 +415,13 @@ GitNexus uses optional DuckDB extensions for BM25 and vector search. The `gitnex
 
 Configure the behavior with these environment variables:
 
-| Variable                                     | Values                       | Default             | Effect                                                                                                                                                                                                                                                                                   |
-| -------------------------------------------- | ---------------------------- | ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `GITNEXUS_LBUG_EXTENSION_INSTALL`            | `auto`, `load-only`, `never` | `auto`              | `auto` runs one bounded INSTALL if LOAD fails. `load-only` only uses already-installed extensions (recommended for offline / firewalled environments). `never` skips optional extensions entirely.                                                                                       |
-| `GITNEXUS_LBUG_EXTENSION_INSTALL_TIMEOUT_MS` | positive integer             | `15000`             | Wall-clock budget for the out-of-process `INSTALL` child before it is killed.                                                                                                                                                                                                            |
-| `GITNEXUS_FTS_STEMMER`                       | supported LadybugDB stemmer  | `porter`            | Stemmer used when rebuilding BM25/FTS indexes. Use `none` for CJK-heavy repositories, or a language stemmer such as `german`, `french`, or `spanish` when that better matches repository comments and identifiers. Re-run `gitnexus analyze --repair-fts` after changing it.              |
+| Variable                                     | Values                       | Default             | Effect                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| -------------------------------------------- | ---------------------------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GITNEXUS_LBUG_EXTENSION_INSTALL`            | `auto`, `load-only`, `never` | `auto`              | `auto` runs one bounded INSTALL if LOAD fails. `load-only` only uses already-installed extensions (recommended for offline / firewalled environments). `never` skips optional extensions entirely.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `GITNEXUS_LBUG_EXTENSION_INSTALL_TIMEOUT_MS` | positive integer             | `15000`             | Wall-clock budget for the out-of-process `INSTALL` child before it is killed.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `GITNEXUS_FTS_STEMMER`                       | supported LadybugDB stemmer  | `porter`            | Stemmer used when rebuilding BM25/FTS indexes. Use `none` for CJK-heavy repositories, or a language stemmer such as `german`, `french`, or `spanish` when that better matches repository comments and identifiers. Re-run `gitnexus analyze --repair-fts` after changing it.                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | `GITNEXUS_FTS_CJK_SEGMENTATION`              | `none`, `bigram`             | `none`              | `bigram` inserts overlapping character-bigram boundaries into Chinese/Japanese Han-ideograph spans in `content`/`description` before FTS indexing, so LadybugDB's space-only tokenizer can see sub-phrase word boundaries. Scoped to CJK Unified Ideographs only — Japanese Hiragana/Katakana and Korean Hangul are not currently segmented. Unlike `GITNEXUS_FTS_STEMMER`, this rewrites stored text — enabling it on an already-indexed repo requires a full `gitnexus analyze --force`; neither `--repair-fts` nor a plain incremental `analyze` applies it to previously-indexed files. Set the same value wherever `analyze` and search-serving processes (CLI query, MCP server, web server) run. |
-| `GITNEXUS_WAL_CHECKPOINT_THRESHOLD`          | integer `>= -1`              | `67108864` (64 MiB) | LadybugDB WAL auto-checkpoint threshold during analyze (bytes). Auto-checkpoint remains enabled; `-1` keeps Ladybug's stock ~16 MiB. Larger thresholds reduce checkpoint frequency but increase the WAL size at rotation time — choose a smaller value on disk-constrained environments. |
+| `GITNEXUS_WAL_CHECKPOINT_THRESHOLD`          | integer `>= -1`              | `67108864` (64 MiB) | LadybugDB WAL auto-checkpoint threshold during analyze (bytes). Auto-checkpoint remains enabled; `-1` keeps Ladybug's stock ~16 MiB. Larger thresholds reduce checkpoint frequency but increase the WAL size at rotation time — choose a smaller value on disk-constrained environments.                                                                                                                                                                                                                                                                                                                                                                                                                |
 
 ```bash
 # Offline/airgapped: never reach the network for extensions
@@ -464,9 +496,9 @@ Three env vars expose the pool's resilience layers (respawn budget, cumulative-t
 
 After scope resolution, analyze prunes inert block-local value symbols (a function-local `const`/`let`/`var` that ends up with only its structural `File→DEFINES` edge) to keep the graph focused on cross-symbol relationships. Module/file-scope symbols, class members, and any local with a real edge are always kept.
 
-| Variable                             | Default | Effect                                                                                                  |
-| ------------------------------------ | ------- | ------------------------------------------------------------------------------------------------------- |
-| `GITNEXUS_KEEP_LOCAL_VALUE_SYMBOLS`  | unset   | Set to `1`/`true` to keep inert block-local value symbols instead of pruning them.                      |
+| Variable                            | Default | Effect                                                                             |
+| ----------------------------------- | ------- | ---------------------------------------------------------------------------------- |
+| `GITNEXUS_KEEP_LOCAL_VALUE_SYMBOLS` | unset   | Set to `1`/`true` to keep inert block-local value symbols instead of pruning them. |
 
 Programmatic callers can pass `keepLocalValueSymbols: true` in `PipelineOptions` instead of setting the env var.
 
