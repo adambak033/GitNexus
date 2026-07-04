@@ -10,6 +10,13 @@ const PKG_VERSION = (createRequire(import.meta.url)('../../package.json') as { v
   .version;
 const MCP_PINNED_REF = `gitnexus@${PKG_VERSION}`;
 
+/** Flatten the spied console.log calls into one searchable string. */
+const logLines = () =>
+  vi
+    .mocked(console.log)
+    .mock.calls.map((call) => call.join(' '))
+    .join('\n');
+
 const execFileMock = vi.fn((...args: any[]) => {
   const callback = args.at(-1);
   if (typeof callback === 'function') {
@@ -708,6 +715,107 @@ describe('setupQoder', () => {
   });
 });
 
+describe('Codex hooks (installClaudeSchemaHooks)', () => {
+  let tempHome: string;
+  let originalHome: string | undefined;
+  let originalUserProfile: string | undefined;
+
+  const hooksJsonPath = () => path.join(tempHome, '.codex', 'hooks.json');
+
+  beforeEach(async () => {
+    vi.resetModules();
+    vi.clearAllMocks();
+
+    originalHome = process.env.HOME;
+    originalUserProfile = process.env.USERPROFILE;
+    tempHome = await fs.mkdtemp(path.join(os.tmpdir(), 'gn-codex-hooks-'));
+    process.env.HOME = tempHome;
+    process.env.USERPROFILE = tempHome;
+
+    // Only create ~/.codex — no other editor directories so their
+    // setup functions skip and don't pollute assertions.
+    await fs.mkdir(path.join(tempHome, '.codex'), { recursive: true });
+
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    process.env.HOME = originalHome;
+    process.env.USERPROFILE = originalUserProfile;
+    await fs.rm(tempHome, { recursive: true, force: true });
+  });
+
+  it('registers PreToolUse + PostToolUse in ~/.codex/hooks.json and installs the adapter', async () => {
+    const { setupCommand } = await import('../../src/cli/setup.js');
+    await setupCommand();
+
+    const hooks = JSON.parse(await fs.readFile(hooksJsonPath(), 'utf-8')).hooks;
+    expect(hooks).toMatchObject({
+      PreToolUse: [{ matcher: 'Grep|Glob|Bash' }],
+      PostToolUse: [{ matcher: 'Bash' }],
+    });
+    for (const event of ['PreToolUse', 'PostToolUse']) {
+      expect(hooks[event][0].hooks[0].command).toContain('gitnexus-hook');
+    }
+    await expect(
+      fs.access(path.join(tempHome, '.codex', 'hooks', 'gitnexus', 'gitnexus-hook.cjs')),
+    ).resolves.toBeUndefined();
+  });
+
+  it('is idempotent — a second setup run adds no duplicate entries', async () => {
+    const { setupCommand } = await import('../../src/cli/setup.js');
+    await setupCommand();
+    await setupCommand();
+
+    const hooks = JSON.parse(await fs.readFile(hooksJsonPath(), 'utf-8')).hooks;
+    expect(hooks.PreToolUse).toHaveLength(1);
+    expect(hooks.PostToolUse).toHaveLength(1);
+  });
+
+  it('preserves a user-owned hook already present in hooks.json', async () => {
+    await fs.writeFile(
+      hooksJsonPath(),
+      JSON.stringify({
+        hooks: {
+          PreToolUse: [{ matcher: 'Read', hooks: [{ type: 'command', command: 'my-own-hook' }] }],
+        },
+      }),
+      'utf-8',
+    );
+
+    const { setupCommand } = await import('../../src/cli/setup.js');
+    await setupCommand();
+
+    const hooks = JSON.parse(await fs.readFile(hooksJsonPath(), 'utf-8')).hooks;
+    const commands: string[] = hooks.PreToolUse.flatMap((e: { hooks: { command: string }[] }) =>
+      e.hooks.map((h) => h.command),
+    );
+    expect(commands).toContain('my-own-hook');
+    expect(commands.some((c: string) => c.includes('gitnexus-hook'))).toBe(true);
+  });
+
+  it('does not write hooks.json when ~/.codex is absent', async () => {
+    await fs.rm(path.join(tempHome, '.codex'), { recursive: true, force: true });
+
+    const { setupCommand } = await import('../../src/cli/setup.js');
+    await setupCommand();
+
+    await expect(fs.access(hooksJsonPath())).rejects.toThrow();
+  });
+
+  it('leaves a corrupt hooks.json untouched and reports it (fail closed)', async () => {
+    const corrupt = '{ this is not valid json !!!';
+    await fs.writeFile(hooksJsonPath(), corrupt, 'utf-8');
+
+    const { setupCommand } = await import('../../src/cli/setup.js');
+    await setupCommand();
+
+    expect(await fs.readFile(hooksJsonPath(), 'utf-8')).toBe(corrupt);
+    expect(logLines()).toContain('Codex hooks: hooks.json is corrupt');
+  });
+});
+
 describe('setup — non-ENOENT read/stat failures are surfaced, not masked', () => {
   let tempHome: string;
   let originalHome: string | undefined;
@@ -715,12 +823,6 @@ describe('setup — non-ENOENT read/stat failures are surfaced, not masked', () 
 
   const errnoError = (code: string) =>
     Object.assign(new Error(`${code}: simulated failure`), { code });
-
-  const logLines = () =>
-    vi
-      .mocked(console.log)
-      .mock.calls.map((call) => call.join(' '))
-      .join('\n');
 
   beforeEach(async () => {
     vi.resetModules();
@@ -839,6 +941,30 @@ describe('setup — non-ENOENT read/stat failures are surfaced, not masked', () 
     vi.mocked(fs.readFile).mockRestore();
     expect(await fs.readFile(configPath, 'utf-8')).toBe(raw);
     expect(logLines()).toContain('Codex: EACCES');
+  });
+
+  it('does not rewrite an unreadable ~/.codex/hooks.json as hooks-only (fail closed)', async () => {
+    await fs.mkdir(path.join(tempHome, '.codex'), { recursive: true });
+    const hooksPath = path.join(tempHome, '.codex', 'hooks.json');
+    const raw = JSON.stringify({
+      hooks: { PreToolUse: [{ matcher: 'Read', hooks: [{ type: 'command', command: 'mine' }] }] },
+    });
+    await fs.writeFile(hooksPath, raw, 'utf-8');
+
+    const realReadFile = fs.readFile;
+    vi.spyOn(fs, 'readFile').mockImplementation(((file: any, ...rest: any[]) => {
+      if (String(file) === hooksPath) return Promise.reject(errnoError('EACCES'));
+      return (realReadFile as any)(file, ...rest);
+    }) as typeof fs.readFile);
+
+    const { setupCommand } = await import('../../src/cli/setup.js');
+    await setupCommand();
+
+    vi.mocked(fs.readFile).mockRestore();
+    // The user's hooks survive; the installer reports instead of replacing
+    // the whole file with a gitnexus-only document.
+    expect(await fs.readFile(hooksPath, 'utf-8')).toBe(raw);
+    expect(logLines()).toContain('Codex hooks: EACCES');
   });
 });
 
