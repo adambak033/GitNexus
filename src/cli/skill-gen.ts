@@ -13,6 +13,7 @@ import { PipelineResult } from '../types/pipeline.js';
 import { CommunityNode, CommunityMembership } from '../core/ingestion/community-processor.js';
 import { ProcessNode } from '../core/ingestion/process-processor.js';
 import { KnowledgeGraph } from '../core/graph/types.js';
+import { shouldMirrorSkillsToAgents } from './ai-context.js';
 
 // ============================================================================
 // TYPES
@@ -69,6 +70,12 @@ export const generateSkillFiles = async (
 ): Promise<{ skills: GeneratedSkillInfo[]; outputPath: string }> => {
   const { communityResult, processResult, graph } = pipelineResult;
   const outputDir = path.join(repoPath, '.claude', 'skills', 'generated');
+  // Some agents prioritize repo-local .agents/skills over the global
+  // ~/.agents/skills install (see shouldMirrorSkillsToAgents). When .agents/
+  // exists, mirror the generated community skills there too so those agents
+  // serve the up-to-date copies.
+  const agentsOutputDir = path.join(repoPath, '.agents', 'skills', 'generated');
+  const mirrorToAgents = await shouldMirrorSkillsToAgents(repoPath);
 
   if (!communityResult || !communityResult.memberships.length) {
     console.log('\n  Skills: no communities detected, skipping skill generation');
@@ -114,6 +121,17 @@ export const generateSkillFiles = async (
     /* may not exist */
   }
   await fs.mkdir(outputDir, { recursive: true });
+
+  // Keep the .agents-facing mirror in lockstep with .claude/skills/generated/:
+  // clear stale community skills before writing the fresh set.
+  if (mirrorToAgents) {
+    try {
+      await fs.rm(agentsOutputDir, { recursive: true, force: true });
+    } catch {
+      /* may not exist */
+    }
+    await fs.mkdir(agentsOutputDir, { recursive: true });
+  }
 
   // Step 5: Generate skill files
   const skills: GeneratedSkillInfo[] = [];
@@ -163,6 +181,14 @@ export const generateSkillFiles = async (
     await fs.mkdir(skillDir, { recursive: true });
     await fs.writeFile(path.join(skillDir, 'SKILL.md'), content, 'utf-8');
 
+    // Mirror to .agents/skills/generated/ for agents that read .agents/
+    // (see mirrorToAgents above).
+    if (mirrorToAgents) {
+      const agentsSkillDir = path.join(agentsOutputDir, kebabName);
+      await fs.mkdir(agentsSkillDir, { recursive: true });
+      await fs.writeFile(path.join(agentsSkillDir, 'SKILL.md'), content, 'utf-8');
+    }
+
     const info: GeneratedSkillInfo = {
       name: kebabName,
       label: community.label,
@@ -177,6 +203,9 @@ export const generateSkillFiles = async (
   }
 
   console.log(`\n  ${skills.length} skills generated \u2192 .claude/skills/generated/`);
+  if (mirrorToAgents) {
+    console.log(`  ${skills.length} skills mirrored \u2192 .agents/skills/generated/ (.agents)`);
+  }
 
   return { skills, outputPath: outputDir };
 };

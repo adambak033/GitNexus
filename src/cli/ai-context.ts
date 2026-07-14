@@ -364,12 +364,31 @@ async function upsertGitNexusSection(
 }
 
 /**
- * Install GitNexus skills to .claude/skills/gitnexus/
- * Works natively with Claude Code, Cursor, and GitHub Copilot
+ * Some agents read skills from a repo-local `.agents/skills/` directory and
+ * prefer it over the global `~/.agents/skills/` install. When the repo contains
+ * an `.agents/` directory, skills written to `.claude/skills/` are mirrored
+ * there too so those agents serve the up-to-date copies.
  */
-async function installSkills(repoPath: string): Promise<string[]> {
+export async function shouldMirrorSkillsToAgents(repoPath: string): Promise<boolean> {
+  try {
+    const stat = await fs.stat(path.join(repoPath, '.agents'));
+    return stat.isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Install GitNexus skills to .claude/skills/gitnexus/
+ * Works natively with Claude Code, Cursor, and GitHub Copilot.
+ * Mirrored to .agents/skills/gitnexus/ when .agents/ exists.
+ */
+async function installSkills(
+  repoPath: string,
+): Promise<{ skills: string[]; agentsMirror: boolean }> {
   const skillsDir = path.join(repoPath, '.claude', 'skills', 'gitnexus');
   const installedSkills: string[] = [];
+  const agentsMirror = await shouldMirrorSkillsToAgents(repoPath);
 
   // Skill definitions bundled with the package
   const skills = [
@@ -435,6 +454,18 @@ Use GitNexus tools to accomplish this task.
       }
 
       await fs.writeFile(skillPath, skillContent, 'utf-8');
+
+      // Mirror to .agents/skills/ for agents that read repo-local skills
+      if (agentsMirror) {
+        try {
+          const agentsSkillDir = path.join(repoPath, '.agents', 'skills', 'gitnexus', skill.name);
+          await fs.mkdir(agentsSkillDir, { recursive: true });
+          await fs.writeFile(path.join(agentsSkillDir, 'SKILL.md'), skillContent, 'utf-8');
+        } catch (err) {
+          logger.warn({ err }, `Warning: Could not mirror skill ${skill.name} to .agents/skills:`);
+        }
+      }
+
       installedSkills.push(skill.name);
     } catch (err) {
       // Skip on error, don't fail the whole process
@@ -442,7 +473,7 @@ Use GitNexus tools to accomplish this task.
     }
   }
 
-  return installedSkills;
+  return { skills: installedSkills, agentsMirror };
 }
 
 /**
@@ -520,9 +551,14 @@ export async function generateAIContextFiles(
 
   // Install skills to .claude/skills/gitnexus/ (unless --skip-skills)
   if (!options?.skipSkills) {
-    const installedSkills = await installSkills(repoPath);
+    const { skills: installedSkills, agentsMirror } = await installSkills(repoPath);
     if (installedSkills.length > 0) {
       createdFiles.push(`.claude/skills/gitnexus/ (${installedSkills.length} skills)`);
+      if (agentsMirror) {
+        createdFiles.push(
+          `.agents/skills/gitnexus/ (${installedSkills.length} skills mirrored for .agents)`,
+        );
+      }
     }
   } else {
     createdFiles.push('.claude/skills/gitnexus/ (skipped via --skip-skills)');

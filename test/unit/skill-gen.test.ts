@@ -598,6 +598,70 @@ describe('generateSkillFiles — file output', () => {
   });
 
   /**
+   * When the repo contains an .agents/ directory, generated community skills
+   * must be mirrored to .agents/skills/generated/ so agents that prefer
+   * repo-local .agents/skills over the global ~/.agents/skills install serve
+   * the up-to-date set. The mirror content must match the .claude copy.
+   */
+  it('mirrors generated skills to .agents/skills/generated/ when .agents/ exists', async () => {
+    const { graph, communities, memberships } = twoCommSetup();
+    await fs.mkdir(path.join(tmpDir, '.agents'), { recursive: true });
+
+    await generateSkillFiles(
+      tmpDir,
+      'TestProject',
+      buildPipelineResult({
+        graph,
+        repoPath: tmpDir,
+        communities,
+        memberships,
+      }),
+    );
+
+    const claudeAlpha = await fs.readFile(
+      path.join(tmpDir, '.claude', 'skills', 'generated', 'alpha', 'SKILL.md'),
+      'utf-8',
+    );
+    const agentsAlpha = await fs.readFile(
+      path.join(tmpDir, '.agents', 'skills', 'generated', 'alpha', 'SKILL.md'),
+      'utf-8',
+    );
+    const agentsBeta = await fs.readFile(
+      path.join(tmpDir, '.agents', 'skills', 'generated', 'beta', 'SKILL.md'),
+      'utf-8',
+    );
+    expect(agentsAlpha).toBe(claudeAlpha);
+    expect(agentsBeta.length).toBeGreaterThan(0);
+  });
+
+  /**
+   * Without an .agents/ opt-in, no .agents/skills/ tree should be created —
+   * only the canonical .claude/skills/generated/ copy is written.
+   */
+  it('does not mirror generated skills to .agents/ when the directory is absent', async () => {
+    const { graph, communities, memberships } = twoCommSetup();
+
+    await generateSkillFiles(
+      tmpDir,
+      'TestProject',
+      buildPipelineResult({
+        graph,
+        repoPath: tmpDir,
+        communities,
+        memberships,
+      }),
+    );
+
+    // Canonical copy exists, mirror does not.
+    const claudeAlpha = await fs.readFile(
+      path.join(tmpDir, '.claude', 'skills', 'generated', 'alpha', 'SKILL.md'),
+      'utf-8',
+    );
+    expect(claudeAlpha.length).toBeGreaterThan(0);
+    await expect(fs.access(path.join(tmpDir, '.agents'))).rejects.toThrow();
+  });
+
+  /**
    * SKILL.md files should start with YAML frontmatter containing
    * name and description fields.
    */
