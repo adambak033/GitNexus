@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -7,6 +7,7 @@ import {
   isEvalServerBearerAuthorized,
   isEvalServerLoopbackHost,
   resolveEvalServerAuthToken,
+  resolveEvalServerAuthTokenForHost,
   resolveEvalServerBindHost,
 } from '../../src/cli/eval-server.js';
 
@@ -36,6 +37,28 @@ describe('eval-server bearer authentication', () => {
       'from-shell',
     );
     expect(resolveEvalServerAuthToken({ GITNEXUS_AUTH_TOKEN: '' }, cwd)).toBeUndefined();
+  });
+
+  it('defers an unreadable env file on loopback and stays fail-closed for remote binds', () => {
+    const cwd = mkdtempSync(path.join(os.tmpdir(), 'gitnexus-eval-auth-'));
+    tempDirs.push(cwd);
+    mkdirSync(path.join(cwd, '.env.local'));
+
+    const loopback = resolveEvalServerAuthTokenForHost('127.0.0.1', {}, cwd);
+    expect(loopback.token).toBeUndefined();
+    expect(loopback.warning).toMatch(/Unable to read eval-server authentication/i);
+    expect(loopback.warning).toMatch(/loopback/i);
+
+    expect(() => resolveEvalServerAuthTokenForHost('0.0.0.0', {}, cwd)).toThrow(
+      /Unable to read eval-server authentication/i,
+    );
+  });
+
+  it('resolves the token for a host without touching files when the shell provides it', () => {
+    const resolved = resolveEvalServerAuthTokenForHost('0.0.0.0', {
+      GITNEXUS_AUTH_TOKEN: 'from-shell',
+    });
+    expect(resolved).toEqual({ token: 'from-shell' });
   });
 
   it('falls back to .env when .env.local is absent', () => {

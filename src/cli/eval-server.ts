@@ -126,6 +126,28 @@ export function isEvalServerLoopbackHost(host: string): boolean {
   return host === 'localhost' || host === '::1' || (isIPv4(host) && host.startsWith('127.'));
 }
 
+/**
+ * Resolve the bearer token for a concrete bind host. An unreadable `.env` /
+ * `.env.local` only matters when the binding actually requires a token, so
+ * loopback binds degrade to a warning instead of refusing to start; any
+ * non-loopback bind keeps the fail-closed error.
+ */
+export function resolveEvalServerAuthTokenForHost(
+  host: string,
+  env: NodeJS.ProcessEnv,
+  cwd: string = process.cwd(),
+): { token?: string; warning?: string } {
+  try {
+    return { token: resolveEvalServerAuthToken(env, cwd) };
+  } catch (error) {
+    if (isEvalServerLoopbackHost(host)) {
+      const reason = error instanceof Error ? error.message : String(error);
+      return { warning: `${reason} Continuing without authentication on loopback host ${host}.` };
+    }
+    throw error;
+  }
+}
+
 /** Refuse exposure of the eval-server query surface without authentication. */
 export function assertSecureEvalServerBinding(host: string, authToken: string | undefined): void {
   if (!authToken && !isEvalServerLoopbackHost(host)) {
@@ -756,7 +778,9 @@ export async function evalServerCommand(options?: EvalServerOptions): Promise<vo
 
   let authToken: string | undefined;
   try {
-    authToken = resolveEvalServerAuthToken(process.env);
+    const resolved = resolveEvalServerAuthTokenForHost(host, process.env);
+    authToken = resolved.token;
+    if (resolved.warning) cliWarn(resolved.warning);
   } catch (error) {
     cliError(
       error instanceof Error
