@@ -151,7 +151,11 @@ describe('MCP read-only mode', () => {
     }
   });
 
-  it('omits group resource templates and rejects direct group resource reads', async () => {
+  it.each([
+    'gitnexus://group/acme/status',
+    'GITNEXUS://GROUP/acme/status',
+    'gitnexus://user@group/acme/status',
+  ])('omits group resource templates and rejects disguised group resource read %s', async (uri) => {
     enableReadOnly();
     const session = await connect();
     try {
@@ -163,10 +167,31 @@ describe('MCP read-only mode', () => {
         'gitnexus://group/{name}/status',
       );
 
-      const resource = await session.client.readResource({ uri: 'gitnexus://group/acme/status' });
+      const resource = await session.client.readResource({ uri });
       expect(resource.contents[0]).toMatchObject({ mimeType: 'text/plain' });
       expect((resource.contents[0] as { text: string }).text).toMatch(/group.*read-only mode/i);
       expect(session.backend.readGroupStatusResource).not.toHaveBeenCalled();
+    } finally {
+      await session.close();
+    }
+  });
+
+  it('leaves normal-mode discovery and dispatch unchanged', async () => {
+    const session = await connect();
+    try {
+      const tools = await session.client.listTools();
+      expect(tools.tools.map((tool) => tool.name)).toEqual(
+        expect.arrayContaining(['cypher', 'rename', 'group_list', 'group_sync']),
+      );
+
+      const response = await session.client.callTool({
+        name: 'cypher',
+        arguments: { statement: 'MATCH (n) RETURN n LIMIT 1' },
+      });
+      expect(response.isError).not.toBe(true);
+      expect(session.backend.callTool).toHaveBeenCalledWith('cypher', {
+        statement: 'MATCH (n) RETURN n LIMIT 1',
+      });
     } finally {
       await session.close();
     }

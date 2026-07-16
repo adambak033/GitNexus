@@ -42,11 +42,24 @@ export function assertMcpReadOnlyToolCall(
 }
 
 export function readOnlyResourceTemplateAllowed(uriTemplate: string, readOnly: boolean): boolean {
-  return !readOnly || !uriTemplate.startsWith('gitnexus://group/');
+  return !readOnly || !/^gitnexus:\/\/group\//iu.test(uriTemplate);
 }
 
 export function assertMcpReadOnlyResource(uri: string, readOnly: boolean): void {
-  if (readOnly && uri.startsWith('gitnexus://group/')) {
+  if (!readOnly) return;
+
+  let isGroupResource = false;
+  try {
+    const parsed = new URL(uri);
+    isGroupResource =
+      parsed.protocol.toLowerCase() === 'gitnexus:' && parsed.hostname.toLowerCase() === 'group';
+  } catch {
+    // Invalid resource URIs are rejected by the normal parser. This fallback
+    // keeps obviously group-shaped malformed inputs fail-closed as well.
+    isGroupResource = /^gitnexus:\/\/group(?:\/|$)/iu.test(uri);
+  }
+
+  if (isGroupResource) {
     throw new Error('Group resources are not available in GitNexus MCP read-only mode.');
   }
 }
