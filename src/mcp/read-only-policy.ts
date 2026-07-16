@@ -90,7 +90,8 @@ export function filterMcpReadOnlyResourceContent(content: string, readOnly: bool
     .join('\n');
 }
 
-function scrubGroupDescription(description: string): string {
+/** Shared with repository-policy.ts so both policies scrub identically. */
+export function scrubGroupDescription(description: string): string {
   return description
     .replace(/\nGROUP MODE:[\s\S]*?(?=\n\n[A-Z][A-Z ()-]*:|$)/gu, '')
     .replace(/\nCROSS-REPO \(experimental\):[\s\S]*?(?=\n\n[A-Z][A-Z ()-]*:|$)/gu, '')
