@@ -51,6 +51,33 @@ describe('resolvePhpImportTargetInternal declaration selection', () => {
     ).toBe(factory);
   });
 
+  it('reuses directory selection without leaking candidates across namespaces', () => {
+    const models = '/repo/app/Models/functions.php';
+    const services = '/repo/app/Services/functions.php';
+    const parsedFiles = [
+      parsedFile(models, [definition(models, 'Function', 'getUser')]),
+      parsedFile(services, [definition(services, 'Function', 'getUser')]),
+    ];
+
+    const first = resolvePhpImportTargetInternal(
+      functionImport.targetRaw,
+      '/repo/app/Main.php',
+      new Set(parsedFiles.map((parsed) => parsed.filePath)),
+      composerConfig,
+      { parsedFiles, parsedImport: functionImport },
+    );
+    const second = resolvePhpImportTargetInternal(
+      functionImport.targetRaw,
+      '/repo/app/Main.php',
+      new Set(parsedFiles.map((parsed) => parsed.filePath)),
+      composerConfig,
+      { parsedFiles, parsedImport: functionImport },
+    );
+
+    expect(first).toBe(models);
+    expect(second).toBe(models);
+  });
+
   it('fails closed when the namespace has duplicate function declarations', () => {
     const first = '/repo/app/Models/First.php';
     const second = '/repo/app/Models/Second.php';

@@ -15,7 +15,7 @@
  * `linkStatus: 'unresolved'`.
  */
 
-import type { ParsedImport, WorkspaceIndex } from 'gitnexus-shared';
+import type { ParsedFile, ParsedImport, WorkspaceIndex } from 'gitnexus-shared';
 import type { ImportResolutionContext } from '../../scope-resolution/contract/scope-resolver.js';
 import { resolvePhpImportInternal } from '../../import-resolvers/php.js';
 import type { ComposerConfig } from '../../language-config.js';
@@ -72,13 +72,42 @@ function namespaceDirectories(
   return [...directories];
 }
 
-function isDirectChild(filePath: string, directory: string): boolean {
+// A scope-resolution pass shares one stable parsedFiles array across imports.
+const phpDirectoryIndexCache = new WeakMap<
+  readonly ParsedFile[],
+  ReadonlyMap<string, readonly ParsedFile[]>
+>();
+
+function directoryAliases(filePath: string): string[] {
   const normalizedPath = normalizePhpPath(filePath);
   const separator = normalizedPath.lastIndexOf('/');
-  if (separator < 0) return directory === '';
+  if (separator < 0) return [''];
+
   const parent = normalizedPath.slice(0, separator);
-  const normalizedDirectory = normalizePhpPath(directory);
-  return parent === normalizedDirectory || parent.endsWith(`/${normalizedDirectory}`);
+  const aliases = new Set([parent]);
+  const segments = parent.split('/').filter(Boolean);
+  for (let index = 0; index < segments.length; index++) {
+    aliases.add(segments.slice(index).join('/'));
+  }
+  return [...aliases];
+}
+
+function filesByDirectory(
+  parsedFiles: readonly ParsedFile[],
+): ReadonlyMap<string, readonly ParsedFile[]> {
+  const cached = phpDirectoryIndexCache.get(parsedFiles);
+  if (cached) return cached;
+
+  const mutable = new Map<string, ParsedFile[]>();
+  for (const parsed of parsedFiles) {
+    for (const directory of directoryAliases(parsed.filePath)) {
+      const files = mutable.get(directory) ?? [];
+      files.push(parsed);
+      mutable.set(directory, files);
+    }
+  }
+  phpDirectoryIndexCache.set(parsedFiles, mutable);
+  return mutable;
 }
 
 // ─── loadResolutionConfig ──────────────────────────────────────────────────
@@ -211,9 +240,12 @@ export function resolvePhpImportTargetInternal(
   if (importedName === undefined) return resolved;
 
   const directories = namespaceDirectories(targetRaw, composerConfig, resolved);
-  const candidateFiles = context.parsedFiles.filter((parsed) =>
-    directories.some((directory) => isDirectChild(parsed.filePath, directory)),
-  );
+  const directoryIndex = filesByDirectory(context.parsedFiles);
+  const candidateFiles = [
+    ...new Set(
+      directories.flatMap((directory) => directoryIndex.get(normalizePhpPath(directory)) ?? []),
+    ),
+  ];
   const expectedType = symbolKind === 'function' ? 'Function' : 'Variable';
   const declaringFiles = candidateFiles.filter((parsed) =>
     parsed.localDefs.some((def) => {
