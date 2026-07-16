@@ -212,6 +212,23 @@ describe('MCP output budgets', () => {
     expect(backend.callTool).not.toHaveBeenCalled();
   });
 
+  it('rejects an invalid environment default before backend execution', async () => {
+    const previous = process.env.GITNEXUS_MCP_DEFAULT_MAX_TOKENS;
+    process.env.GITNEXUS_MCP_DEFAULT_MAX_TOKENS = 'invalid';
+    try {
+      const backend = createMockBackend();
+      const { text, isError } = await callToolThroughServer(backend, 'query', {
+        search_query: 'auth',
+      });
+      expect(isError).toBe(true);
+      expect(text).toMatch(/GITNEXUS_MCP_DEFAULT_MAX_TOKENS.*positive integer/i);
+      expect(backend.callTool).not.toHaveBeenCalled();
+    } finally {
+      if (previous === undefined) delete process.env.GITNEXUS_MCP_DEFAULT_MAX_TOKENS;
+      else process.env.GITNEXUS_MCP_DEFAULT_MAX_TOKENS = previous;
+    }
+  });
+
   it('applies a valid budget to backend error text', async () => {
     const backend = createMockBackend({
       callTool: vi.fn().mockRejectedValue(new Error('😀'.repeat(100))),
