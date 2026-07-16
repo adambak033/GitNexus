@@ -18,7 +18,7 @@
  * format that downstream consumers (queries, edges, MCP) expect.
  */
 
-import type { GraphNode, NodeLabel, ParameterTypeClass } from 'gitnexus-shared';
+import type { NodeLabel, ParameterTypeClass } from 'gitnexus-shared';
 import type { KnowledgeGraph } from '../../../graph/types.js';
 import { isOverloadableCallable } from '../../utils/callable-labels.js';
 import { templateConstraintsIdTag } from '../../utils/template-arguments.js';
@@ -67,34 +67,9 @@ export function simpleKey(filePath: string, name: string): string {
   return `${filePath}::${name}`;
 }
 
-function compareText(left: string, right: string): number {
-  return left < right ? -1 : left > right ? 1 : 0;
-}
-
-function compareSourceOrder(left: GraphNode, right: GraphNode): number {
-  const fileOrder = compareText(left.properties.filePath, right.properties.filePath);
-  if (fileOrder !== 0) return fileOrder;
-
-  const leftLine = Number.isFinite(left.properties.startLine)
-    ? (left.properties.startLine ?? Number.MAX_SAFE_INTEGER)
-    : Number.MAX_SAFE_INTEGER;
-  const rightLine = Number.isFinite(right.properties.startLine)
-    ? (right.properties.startLine ?? Number.MAX_SAFE_INTEGER)
-    : Number.MAX_SAFE_INTEGER;
-  if (leftLine !== rightLine) return leftLine - rightLine;
-
-  return compareText(left.id, right.id);
-}
-
 export function buildGraphNodeLookup(graph: KnowledgeGraph): GraphNodeLookup {
   const lookup = new Map<string, string>();
-  const linkableNodes = Array.from(graph.iterNodes()).filter((node) => {
-    const props = node.properties as { filePath?: string; name?: string };
-    return props.filePath !== undefined && props.name !== undefined && isLinkableLabel(node.label);
-  });
-  linkableNodes.sort(compareSourceOrder);
-
-  for (const node of linkableNodes) {
+  for (const node of graph.iterNodes()) {
     const props = node.properties as {
       filePath?: string;
       name?: string;
@@ -102,6 +77,7 @@ export function buildGraphNodeLookup(graph: KnowledgeGraph): GraphNodeLookup {
       templateArguments?: readonly string[];
     };
     if (props.filePath === undefined || props.name === undefined) continue;
+    if (!isLinkableLabel(node.label)) continue;
 
     // Primary key: fully-qualified name + label, in a separate
     // keyspace from simple names. Class nodes carry `qualifiedName`
