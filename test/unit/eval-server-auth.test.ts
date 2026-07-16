@@ -1,18 +1,73 @@
-import { describe, expect, it } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { afterEach, describe, expect, it } from 'vitest';
 import {
   assertSecureEvalServerBinding,
   isEvalServerBearerAuthorized,
   isEvalServerLoopbackHost,
   resolveEvalServerAuthToken,
+  resolveEvalServerBindHost,
 } from '../../src/cli/eval-server.js';
 
 describe('eval-server bearer authentication', () => {
+  const tempDirs: string[] = [];
+
+  afterEach(() => {
+    for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
   it('resolves a trimmed token and treats blank values as absent', () => {
     expect(resolveEvalServerAuthToken({ GITNEXUS_AUTH_TOKEN: '  secret-value  ' })).toBe(
       'secret-value',
     );
     expect(resolveEvalServerAuthToken({ GITNEXUS_AUTH_TOKEN: '' })).toBeUndefined();
     expect(resolveEvalServerAuthToken({ GITNEXUS_AUTH_TOKEN: '   ' })).toBeUndefined();
+  });
+
+  it('loads .env.local before .env while preserving explicit shell values', () => {
+    const cwd = mkdtempSync(path.join(os.tmpdir(), 'gitnexus-eval-auth-'));
+    tempDirs.push(cwd);
+    writeFileSync(path.join(cwd, '.env'), 'GITNEXUS_AUTH_TOKEN=from-env\n');
+    writeFileSync(path.join(cwd, '.env.local'), 'GITNEXUS_AUTH_TOKEN=from-local\n');
+
+    expect(resolveEvalServerAuthToken({}, cwd)).toBe('from-local');
+    expect(resolveEvalServerAuthToken({ GITNEXUS_AUTH_TOKEN: 'from-shell' }, cwd)).toBe(
+      'from-shell',
+    );
+    expect(resolveEvalServerAuthToken({ GITNEXUS_AUTH_TOKEN: '' }, cwd)).toBeUndefined();
+  });
+
+  it('falls back to .env when .env.local is absent', () => {
+    const cwd = mkdtempSync(path.join(os.tmpdir(), 'gitnexus-eval-auth-'));
+    tempDirs.push(cwd);
+    writeFileSync(path.join(cwd, '.env'), 'GITNEXUS_AUTH_TOKEN="from env"\n');
+
+    expect(resolveEvalServerAuthToken({}, cwd)).toBe('from env');
+  });
+
+  it('resolves DNS bind names to the concrete IPv4 used for the security decision', async () => {
+    const resolveHostname = async (hostname: string) => {
+      expect(hostname).toBe('devbox.local');
+      return '192.168.1.50';
+    };
+
+    await expect(resolveEvalServerBindHost('devbox.local', resolveHostname)).resolves.toBe(
+      '192.168.1.50',
+    );
+    await expect(resolveEvalServerBindHost('devbox.local', async () => '::1')).resolves.toBeNull();
+    await expect(resolveEvalServerBindHost('not a hostname', resolveHostname)).resolves.toBeNull();
+  });
+
+  it('preserves literal IP addresses without a DNS lookup', async () => {
+    let lookupCalled = false;
+    await expect(
+      resolveEvalServerBindHost('10.0.0.2', async () => {
+        lookupCalled = true;
+        return '127.0.0.1';
+      }),
+    ).resolves.toBe('10.0.0.2');
+    expect(lookupCalled).toBe(false);
   });
 
   it.each(['127.0.0.1', '127.0.0.2', 'localhost', '::1'])('classifies %s as loopback', (host) => {

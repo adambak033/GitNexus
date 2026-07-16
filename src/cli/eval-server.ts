@@ -17,6 +17,7 @@
  *   gitnexus eval-server                        # default port 4848, binds 127.0.0.1
  *   gitnexus eval-server --port 4848            # explicit port
  *   GITNEXUS_AUTH_TOKEN=... gitnexus eval-server --host 0.0.0.0
+ *   GITNEXUS_AUTH_TOKEN=... gitnexus eval-server --host devbox.local
  *   gitnexus eval-server --idle-timeout 300     # auto-shutdown after 300s idle
  *
  * READY signal format: GITNEXUS_EVAL_SERVER_READY:<host>:<port>
@@ -31,8 +32,11 @@
 
 import http from 'http';
 import crypto from 'node:crypto';
+import { lookup } from 'node:dns/promises';
 import { isIPv4, isIPv6 } from 'node:net';
-import { writeSync } from 'node:fs';
+import { readFileSync, writeSync } from 'node:fs';
+import path from 'node:path';
+import { parseEnv } from 'node:util';
 import {
   LocalBackend,
   type RepoListing,
@@ -62,12 +66,62 @@ export function validateHost(raw: string): string | null {
   return null;
 }
 
-/** Resolve the eval-server bearer token without retaining surrounding shell whitespace. */
-export function resolveEvalServerAuthToken(env: NodeJS.ProcessEnv): string | undefined {
-  return env.GITNEXUS_AUTH_TOKEN?.trim() || undefined;
+type EvalServerHostLookup = (hostname: string) => Promise<string>;
+
+function isHostname(raw: string): boolean {
+  if (!raw || raw.length > 253 || /^[\d.]+$/.test(raw)) return false;
+  return raw
+    .split('.')
+    .every(
+      (label) =>
+        label.length > 0 &&
+        label.length <= 63 &&
+        /^[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?$/.test(label),
+    );
 }
 
-/** True only for bind hosts that are local to this machine. */
+/** Resolve a DNS bind name once so validation and listen() use the same concrete address. */
+export async function resolveEvalServerBindHost(
+  raw: string,
+  resolveHostname: EvalServerHostLookup = async (hostname) =>
+    (await lookup(hostname, { family: 4 })).address,
+): Promise<string | null> {
+  const directHost = validateHost(raw);
+  if (directHost && directHost !== 'localhost') return directHost;
+  if (directHost !== 'localhost' && !isHostname(raw)) return null;
+
+  try {
+    const address = await resolveHostname(raw);
+    return isIPv4(address) ? address : null;
+  } catch {
+    return null;
+  }
+}
+
+function readAuthTokenFile(filePath: string): string | undefined {
+  try {
+    return parseEnv(readFileSync(filePath, 'utf8')).GITNEXUS_AUTH_TOKEN?.trim() || undefined;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw new Error(`Unable to read eval-server authentication from ${filePath}`, { cause: error });
+  }
+}
+
+/** Resolve the bearer token from the shell, then .env.local, then .env. */
+export function resolveEvalServerAuthToken(
+  env: NodeJS.ProcessEnv,
+  cwd: string = process.cwd(),
+): string | undefined {
+  if (Object.hasOwn(env, 'GITNEXUS_AUTH_TOKEN')) {
+    return env.GITNEXUS_AUTH_TOKEN?.trim() || undefined;
+  }
+
+  return (
+    readAuthTokenFile(path.join(cwd, '.env.local')) ?? readAuthTokenFile(path.join(cwd, '.env'))
+  );
+}
+
+/** True only for literal loopback addresses; DNS names are resolved before this check. */
 export function isEvalServerLoopbackHost(host: string): boolean {
   return host === 'localhost' || host === '::1' || (isIPv4(host) && host.startsWith('127.'));
 }
@@ -684,22 +738,34 @@ export async function evalServerCommand(options?: EvalServerOptions): Promise<vo
   const idleTimeoutSec = parseInt(options?.idleTimeout || '0');
 
   const rawHost = options?.host ?? '127.0.0.1';
-  const host = validateHost(rawHost);
+  const host = await resolveEvalServerBindHost(rawHost);
   if (!host) {
     cliError(
       `Invalid --host value "${rawHost}":\n` +
-        `  Must be an IP address or "localhost".\n\n` +
+        `  Must be an IP address or a hostname that resolves to a local IPv4 address.\n\n` +
         `  Examples:\n` +
         `    gitnexus eval-server --host 127.0.0.1    (loopback only, default)\n` +
         `    GITNEXUS_AUTH_TOKEN=... gitnexus eval-server --host 0.0.0.0\n` +
         `    GITNEXUS_AUTH_TOKEN=... gitnexus eval-server --host 192.168.1.5\n` +
-        `    gitnexus eval-server --host localhost     (OS-resolved loopback)\n`,
+        `    gitnexus eval-server --host localhost     (resolved IPv4 loopback)\n` +
+        `    GITNEXUS_AUTH_TOKEN=... gitnexus eval-server --host devbox.local\n`,
       { flag: '--host', value: rawHost },
     );
     process.exit(1);
   }
 
-  const authToken = resolveEvalServerAuthToken(process.env);
+  let authToken: string | undefined;
+  try {
+    authToken = resolveEvalServerAuthToken(process.env);
+  } catch (error) {
+    cliError(
+      error instanceof Error
+        ? error.message
+        : 'Unable to read eval-server authentication configuration.',
+    );
+    process.exit(1);
+  }
+
   try {
     assertSecureEvalServerBinding(host, authToken);
   } catch (error) {
