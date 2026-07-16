@@ -167,6 +167,8 @@ function normalizeToolParams(
     for (const key of keys) {
       if (!Object.prototype.hasOwnProperty.call(input, key)) continue;
       const value = input[key];
+      // Internal CLI callers materialize omitted optional flags as undefined.
+      if (value === undefined) continue;
       if (typeof value !== 'string' || !value.trim()) {
         return { error: `MCP parameter ${method}.${key} must be a non-empty string.` };
       }

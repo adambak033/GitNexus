@@ -363,6 +363,21 @@ describe('LocalBackend.callTool', () => {
     expect(dispatched).not.toHaveProperty('file');
   });
 
+  it('treats undefined optional alias keys from CLI callers as absent', async () => {
+    const contextSpy = vi
+      .spyOn(backend as any, 'context')
+      .mockResolvedValue({ status: 'normalized' });
+
+    const result = await backend.callTool('context', {
+      name: 'validate',
+      file_path: undefined,
+      file: undefined,
+    });
+
+    expect(result).toEqual({ status: 'normalized' });
+    expect(contextSpy.mock.calls[0][1]).toMatchObject({ name: 'validate' });
+  });
+
   it('allows agreeing canonical and alias values after trimming', async () => {
     const impactSpy = vi
       .spyOn(backend as any, 'impact')
@@ -395,6 +410,7 @@ describe('LocalBackend.callTool', () => {
     ['impact', { target: '', direction: 'upstream' }],
     ['impact', { name: 42, direction: 'upstream' }],
     ['context', { name: 'validate', file: '   ' }],
+    ['context', { name: 'validate', file: null }],
   ])('rejects invalid %s aliases before repository resolution', async (method, params) => {
     const resolveSpy = vi.spyOn(backend, 'resolveRepo');
 
