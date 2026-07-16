@@ -211,6 +211,8 @@ export interface RepoMeta {
     chunksProcessed: number;
     model: string;
     dimensions: number;
+    /** `local` or a secret-free SHA-256 fingerprint of the HTTP endpoint identity. */
+    provider: string;
     /**
      * Nodes in the current checkpoint window. Any of these may have only a
      * subset of their chunks persisted after an abrupt process termination,

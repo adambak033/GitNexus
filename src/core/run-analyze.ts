@@ -53,6 +53,7 @@ import {
   type WalCheckpointDriver,
 } from './lbug/wal-checkpoint-driver.js';
 import { quarantineSidecarsForDirtyRecovery } from './lbug/sidecar-recovery.js';
+import type { EmbeddingIdentity } from './embeddings/embedding-identity.js';
 import {
   getStoragePaths,
   resolveBranchPlacement,
@@ -266,22 +267,6 @@ export interface AnalyzeOptions {
    * leave this unset so they get a real close. See `closeLbug`. */
   skipNativeCloseOnExit?: boolean;
 }
-
-interface EmbeddingIdentity {
-  model: string;
-  dimensions: number;
-}
-
-const resolveEmbeddingIdentity = async (): Promise<EmbeddingIdentity> => {
-  const [{ getEmbeddingDimensions }, { resolveEmbeddingConfig }] = await Promise.all([
-    import('./embeddings/embedder.js'),
-    import('./embeddings/config.js'),
-  ]);
-  return {
-    model: process.env.GITNEXUS_EMBEDDING_MODEL ?? resolveEmbeddingConfig().modelId,
-    dimensions: getEmbeddingDimensions(),
-  };
-};
 
 export interface AnalyzeResult {
   repoName: string;
@@ -784,8 +769,15 @@ export async function runFullAnalysis(
       log('Discarding the interrupted embedding checkpoint (--drop-embeddings).');
       options = { ...options, force: true };
     } else {
-      embeddingIdentityForRun = await resolveEmbeddingIdentity();
+      const { resolveEmbeddingIdentity } = await import('./embeddings/embedding-identity.js');
+      embeddingIdentityForRun = resolveEmbeddingIdentity();
       const checkpoint = existingMeta.embeddingCheckpoint;
+      if (checkpoint.provider !== embeddingIdentityForRun.provider) {
+        throw new Error(
+          'Cannot resume embedding checkpoint: the embedding provider configuration differs. ' +
+            'Restore the matching endpoint configuration or pass --drop-embeddings to rebuild without it.',
+        );
+      }
       if (
         checkpoint.model !== embeddingIdentityForRun.model ||
         checkpoint.dimensions !== embeddingIdentityForRun.dimensions
@@ -1855,7 +1847,10 @@ export async function runFullAnalysis(
         httpMode ? 'Connecting to embedding endpoint...' : 'Loading embedding model...',
       );
       const { runEmbeddingPipeline } = await import('./embeddings/embedding-pipeline.js');
-      embeddingIdentityForRun ??= await resolveEmbeddingIdentity();
+      if (!embeddingIdentityForRun) {
+        const { resolveEmbeddingIdentity } = await import('./embeddings/embedding-identity.js');
+        embeddingIdentityForRun = resolveEmbeddingIdentity();
+      }
       const embeddingIdentity = embeddingIdentityForRun;
       // Build a Map<nodeId, contentHash> from cached embeddings for incremental mode
       let existingEmbeddings: Map<string, string> | undefined;
@@ -1902,6 +1897,7 @@ export async function runFullAnalysis(
             ...checkpoint,
             model: embeddingIdentity.model,
             dimensions: embeddingIdentity.dimensions,
+            provider: embeddingIdentity.provider,
             pendingNodeIds,
           },
           pdg: resolvePdgConfig(options),

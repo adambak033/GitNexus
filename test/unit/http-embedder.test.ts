@@ -32,6 +32,27 @@ describe('HTTP embedding backend', () => {
     }
   });
 
+  it('fingerprints HTTP provider identity without confusing a model-only env with HTTP mode', async () => {
+    process.env.GITNEXUS_EMBEDDING_URL = 'https://user:secret@first.example/v1?token=hidden';
+    process.env.GITNEXUS_EMBEDDING_MODEL = 'shared-model-name';
+    process.env.GITNEXUS_EMBEDDING_DIMS = '384';
+    const { resolveEmbeddingIdentity } =
+      await import('../../src/core/embeddings/embedding-identity.js');
+
+    const first = resolveEmbeddingIdentity();
+    process.env.GITNEXUS_EMBEDDING_URL = 'https://second.example/v1';
+    const second = resolveEmbeddingIdentity();
+    delete process.env.GITNEXUS_EMBEDDING_URL;
+    const local = resolveEmbeddingIdentity();
+
+    expect(first.provider).toMatch(/^http:[0-9a-f]{64}$/u);
+    expect(first.provider).not.toContain('secret');
+    expect(first.provider).not.toContain('hidden');
+    expect(second.provider).not.toBe(first.provider);
+    expect(local.provider).toBe('local');
+    expect(local.model).not.toBe('shared-model-name');
+  });
+
   describe('MCP embedder', () => {
     it('returns 384 dimensions by default', () => {
       expect(getEmbeddingDims()).toBe(384);

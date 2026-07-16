@@ -124,6 +124,9 @@ describe('run-analyze module', () => {
       const completed = await loadMeta(storagePath);
       expect(completed).not.toBeNull();
       if (!completed) throw new Error('expected completed metadata');
+      const { resolveEmbeddingIdentity } =
+        await import('../../src/core/embeddings/embedding-identity.js');
+      const embeddingIdentity = resolveEmbeddingIdentity();
       await saveMeta(storagePath, {
         ...completed,
         embeddingCheckpoint: {
@@ -133,6 +136,7 @@ describe('run-analyze module', () => {
           chunksProcessed: 1,
           model: 'test-model',
           dimensions: 384,
+          provider: embeddingIdentity.provider,
         },
       } as RepoMeta);
       fetchMock.mockClear();
@@ -162,6 +166,7 @@ describe('run-analyze module', () => {
           chunksProcessed: 0,
           model: 'test-model',
           dimensions: 384,
+          provider: embeddingIdentity.provider,
           pendingNodeIds: [pendingNodeId],
         },
       });
@@ -186,8 +191,30 @@ describe('run-analyze module', () => {
           nodesProcessed: 1,
           totalNodes: 2,
           chunksProcessed: 1,
+          model: 'test-model',
+          dimensions: 384,
+          provider: 'http:different-provider-fingerprint',
+        },
+      });
+      await expect(
+        runFullAnalysis(
+          tmpRepo.dbPath,
+          { skipAgentsMd: true, skipSkills: true },
+          { onProgress: () => {} },
+        ),
+      ).rejects.toThrow(/provider configuration differs/i);
+      expect(fetchMock).not.toHaveBeenCalled();
+
+      await saveMeta(storagePath, {
+        ...resumedPending,
+        embeddingCheckpoint: {
+          at: new Date().toISOString(),
+          nodesProcessed: 1,
+          totalNodes: 2,
+          chunksProcessed: 1,
           model: 'different-model',
           dimensions: 384,
+          provider: embeddingIdentity.provider,
         },
       });
       await expect(

@@ -1796,19 +1796,19 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
             await withLbugDb(lbugPath, async () => {
               const { runEmbeddingPipeline } =
                 await import('../core/embeddings/embedding-pipeline.js');
-              const [{ getEmbeddingDimensions }, { resolveEmbeddingConfig }] = await Promise.all([
-                import('../core/embeddings/embedder.js'),
-                import('../core/embeddings/config.js'),
-              ]);
-              const embeddingIdentity = {
-                model: process.env.GITNEXUS_EMBEDDING_MODEL ?? resolveEmbeddingConfig().modelId,
-                dimensions: getEmbeddingDimensions(),
-              };
+              const { resolveEmbeddingIdentity } =
+                await import('../core/embeddings/embedding-identity.js');
+              const embeddingIdentity = resolveEmbeddingIdentity();
               let embeddingMeta = await loadMeta(entry.storagePath);
               if (!embeddingMeta) {
                 throw new Error('Repository metadata is missing; run gitnexus analyze first');
               }
               const priorCheckpoint = embeddingMeta.embeddingCheckpoint;
+              if (priorCheckpoint && priorCheckpoint.provider !== embeddingIdentity.provider) {
+                throw new Error(
+                  'Cannot resume embedding checkpoint: the embedding provider configuration differs.',
+                );
+              }
               if (
                 priorCheckpoint &&
                 (priorCheckpoint.model !== embeddingIdentity.model ||
