@@ -5,6 +5,7 @@ import type { LocalBackend, RepoListing } from '../../src/mcp/local/local-backen
 import { createMcpRepositoryPolicy } from '../../src/mcp/repository-policy.js';
 import { createMCPServer } from '../../src/mcp/server.js';
 import { createStreamableHttpHandler, startMcpHttpServer } from '../../src/mcp/http-transport.js';
+import { mountMCPEndpoints } from '../../src/server/mcp-http.js';
 
 const REPOS: RepoListing[] = [
   {
@@ -326,6 +327,16 @@ describe('MCP repository policy', () => {
     await expect(
       startMcpHttpServer(createBackend(), { host: '127.0.0.1', port: 0 }),
     ).rejects.toThrow(/invalid repository selection/i);
+  });
+
+  it('fails embedded HTTP startup before registering a route when policy is invalid', async () => {
+    vi.stubEnv('GITNEXUS_MCP_ALLOWED_REPOS', 'Missing');
+    const app = { all: vi.fn() };
+
+    await expect(mountMCPEndpoints(app as never, createBackend())).rejects.toThrow(
+      /invalid repository selection/i,
+    );
+    expect(app.all).not.toHaveBeenCalled();
   });
 
   it('rejects a custom HTTP server factory that would bypass configured policy', () => {
