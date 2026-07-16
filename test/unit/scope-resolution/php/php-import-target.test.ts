@@ -97,6 +97,44 @@ describe('resolvePhpImportTargetInternal declaration selection', () => {
     ).toBeNull();
   });
 
+  it('never resolves into a different root that shares a directory suffix', () => {
+    const app = '/repo/app/Models/functions.php';
+    const vendor = '/repo/vendor/pkg/app/Models/helpers.php';
+    const parsedFiles = [
+      parsedFile(app, []),
+      parsedFile(vendor, [definition(vendor, 'Function', 'getUser')]),
+    ];
+
+    const result = resolvePhpImportTargetInternal(
+      functionImport.targetRaw,
+      '/repo/app/Main.php',
+      new Set(parsedFiles.map((parsed) => parsed.filePath)),
+      composerConfig,
+      { parsedFiles, parsedImport: functionImport },
+    );
+
+    expect(result).not.toBe(vendor);
+  });
+
+  it('stays out of suffix-colliding roots even when both declare the function', () => {
+    const app = '/repo/app/Models/functions.php';
+    const vendor = '/repo/vendor/pkg/app/Models/helpers.php';
+    const parsedFiles = [
+      parsedFile(app, [definition(app, 'Function', 'getUser')]),
+      parsedFile(vendor, [definition(vendor, 'Function', 'getUser')]),
+    ];
+
+    const result = resolvePhpImportTargetInternal(
+      functionImport.targetRaw,
+      '/repo/app/Main.php',
+      new Set(parsedFiles.map((parsed) => parsed.filePath)),
+      composerConfig,
+      { parsedFiles, parsedImport: functionImport },
+    );
+
+    expect(result).not.toBe(vendor);
+  });
+
   it('resolves a constant only when its namespace directory has one candidate file', () => {
     const constants = '/repo/app/Config/constants.php';
     const parsedFiles = [parsedFile(constants, [])];

@@ -78,6 +78,12 @@ const phpDirectoryIndexCache = new WeakMap<
   ReadonlyMap<string, readonly ParsedFile[]>
 >();
 
+function parentDirectory(filePath: string): string {
+  const normalizedPath = normalizePhpPath(filePath);
+  const separator = normalizedPath.lastIndexOf('/');
+  return separator < 0 ? '' : normalizedPath.slice(0, separator);
+}
+
 function directoryAliases(filePath: string): string[] {
   const normalizedPath = normalizePhpPath(filePath);
   const separator = normalizedPath.lastIndexOf('/');
@@ -243,7 +249,14 @@ export function resolvePhpImportTargetInternal(
   const directoryIndex = filesByDirectory(context.parsedFiles);
   const candidateFiles = [
     ...new Set(
-      directories.flatMap((directory) => directoryIndex.get(normalizePhpPath(directory)) ?? []),
+      directories.flatMap((directory) => {
+        const files = directoryIndex.get(normalizePhpPath(directory)) ?? [];
+        // A suffix alias can match directories under different roots (for
+        // example app/Models and vendor/pkg/app/Models). Picking either root
+        // would be a guess, so fail closed to the composer resolution instead.
+        const distinctParents = new Set(files.map((file) => parentDirectory(file.filePath)));
+        return distinctParents.size > 1 ? [] : files;
+      }),
     ),
   ];
   const expectedType = symbolKind === 'function' ? 'Function' : 'Variable';
