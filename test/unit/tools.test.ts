@@ -144,17 +144,15 @@ describe('GITNEXUS_TOOLS', () => {
     expect(apiImpactTool.inputSchema.required).toEqual([]);
   });
 
-  it('impact tool requires direction and accepts target, name, or symbol', () => {
+  it('impact tool requires direction and advertises target, name, or symbol without combinators', () => {
     const impactTool = GITNEXUS_TOOLS.find((t) => t.name === 'impact')!;
     expect(impactTool.inputSchema.required).toContain('direction');
     expect(impactTool.inputSchema.required).not.toContain('target');
     expect(impactTool.inputSchema.properties.name).toMatchObject({ type: 'string' });
     expect(impactTool.inputSchema.properties.symbol).toMatchObject({ type: 'string' });
-    expect(impactTool.inputSchema.anyOf).toEqual([
-      { required: ['target'] },
-      { required: ['name'] },
-      { required: ['symbol'] },
-    ]);
+    expect(impactTool.inputSchema).not.toHaveProperty('anyOf');
+    expect(impactTool.inputSchema).not.toHaveProperty('oneOf');
+    expect(impactTool.inputSchema).not.toHaveProperty('allOf');
   });
 
   it('impact tool advertises the PDG-only `line` statement anchor (integer, min 0, not required)', () => {

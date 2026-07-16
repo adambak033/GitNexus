@@ -163,10 +163,15 @@ function normalizeToolParams(
   const normalized = { ...input };
   for (const { canonical, aliases } of definitions) {
     const keys = [canonical, ...aliases];
-    const supplied = keys.flatMap((key) => {
+    const supplied: Array<{ key: string; value: string }> = [];
+    for (const key of keys) {
+      if (!Object.prototype.hasOwnProperty.call(input, key)) continue;
       const value = input[key];
-      return typeof value === 'string' && value.trim() ? [{ key, value: value.trim() }] : [];
-    });
+      if (typeof value !== 'string' || !value.trim()) {
+        return { error: `MCP parameter ${method}.${key} must be a non-empty string.` };
+      }
+      supplied.push({ key, value: value.trim() });
+    }
     const distinctValues = new Set(supplied.map(({ value }) => value));
     if (distinctValues.size > 1) {
       return {
@@ -178,6 +183,14 @@ function normalizeToolParams(
 
     for (const alias of aliases) delete normalized[alias];
     if (supplied.length > 0) normalized[canonical] = supplied[0].value;
+  }
+
+  if (
+    method === 'impact' &&
+    typeof normalized.target !== 'string' &&
+    (typeof normalized.target_uid !== 'string' || !normalized.target_uid.trim())
+  ) {
+    return { error: 'MCP impact requires target, name, symbol, or target_uid.' };
   }
   return { params: normalized };
 }

@@ -391,6 +391,43 @@ describe('LocalBackend.callTool', () => {
     expect(resolveSpy).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ['impact', { target: '', direction: 'upstream' }],
+    ['impact', { name: 42, direction: 'upstream' }],
+    ['context', { name: 'validate', file: '   ' }],
+  ])('rejects invalid %s aliases before repository resolution', async (method, params) => {
+    const resolveSpy = vi.spyOn(backend, 'resolveRepo');
+
+    const result = await backend.callTool(method, params);
+
+    expect(result.error).toMatch(/non-empty string/i);
+    expect(resolveSpy).not.toHaveBeenCalled();
+  });
+
+  it('rejects a missing impact target before repository resolution', async () => {
+    const resolveSpy = vi.spyOn(backend, 'resolveRepo');
+
+    const result = await backend.callTool('impact', { direction: 'upstream' });
+
+    expect(result.error).toMatch(/requires target, name, symbol, or target_uid/i);
+    expect(resolveSpy).not.toHaveBeenCalled();
+  });
+
+  it('preserves target_uid-only impact dispatch', async () => {
+    const impactSpy = vi
+      .spyOn(backend as any, 'impact')
+      .mockResolvedValue({ status: 'normalized' });
+
+    await backend.callTool('impact', {
+      target_uid: 'Function:src/auth.ts:validate',
+      direction: 'upstream',
+    });
+
+    expect(impactSpy.mock.calls[0][1]).toMatchObject({
+      target_uid: 'Function:src/auth.ts:validate',
+    });
+  });
+
   it('normalizes impact aliases before @group forwarding', async () => {
     resolveAtMemberMock.mockResolvedValue({ ok: true, repoPath: '/tmp/test-project' });
     const groupImpactSpy = vi

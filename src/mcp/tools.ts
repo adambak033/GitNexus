@@ -591,7 +591,6 @@ SERVICE: optional monorepo path prefix (case-sensitive path segments). When "rep
         },
       },
       required: ['direction'],
-      anyOf: [{ required: ['target'] }, { required: ['name'] }, { required: ['symbol'] }],
     },
   },
   {
