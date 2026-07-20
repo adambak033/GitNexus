@@ -1381,10 +1381,11 @@ export async function runFullAnalysis(
   }
 
   // Size the buffer pool to the graph just built by the pipeline (a page cache
-  // over the on-disk index, which scales with node/edge count). A small repo
-  // opens with the fast 64 MiB floor instead of eagerly committing the full
-  // 2 GiB default; a large repo still reaches the cap. env override / no-hint
-  // paths are unchanged. See resolveBufferManagerSize / estimateBufferPool.
+  // over the on-disk index, which scales with node/edge count) instead of the
+  // fixed 2 GiB default, whose eager commit dominates large-repo analyze. The
+  // size is clamped to [COPY-safety floor, default], so it only ever shrinks
+  // the pool; env override / no-hint paths are unchanged. See
+  // resolveBufferManagerSize / estimateBufferPool.
   setBufferPoolSizeHint(
     estimateBufferPool(pipelineResult.graph.nodeCount + pipelineResult.graph.relationshipCount),
   );

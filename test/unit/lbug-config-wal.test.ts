@@ -263,7 +263,8 @@ describe('adaptive buffer pool hint', () => {
 
   describe('estimateBufferPool', () => {
     it.each([
-      ['tiny graph clamps up to the 64 MiB floor', 41, 64 * MiB],
+      ['tiny graph clamps up to the 256 MiB COPY-safety floor', 41, 256 * MiB],
+      ['a graph under the floor still clamps up to 256 MiB', 40_000, 256 * MiB],
       ['mid graph scales linearly (100k elements * 4 KiB = 400 MiB)', 100_000, 100_000 * 4 * 1024],
       ['huge graph caps at the 2 GiB / 80%-RAM default', 10_000_000, 2 * GiB],
     ])('%s', (_label, elements, expected) => {
@@ -277,8 +278,8 @@ describe('adaptive buffer pool hint', () => {
   });
 
   it.each([
-    ['a hint within range passes through', 128 * MiB, 128 * MiB],
-    ['a hint below the floor clamps up to 64 MiB', 1 * MiB, 64 * MiB],
+    ['a hint within range passes through', 512 * MiB, 512 * MiB],
+    ['a hint below the COPY-safety floor clamps up to 256 MiB', 100 * MiB, 256 * MiB],
     ['a hint above the default clamps down to the 2 GiB cap', 8 * GiB, 2 * GiB],
   ])(
     'createLbugDatabase uses the clamped hint when no env override is set: %s',
