@@ -346,8 +346,11 @@ const clampBufferPool = (bytes: number): number =>
  * The pool is only a page cache over the on-disk index, and the index scales
  * with node/edge count — so a per-element budget lets a small repo run with a
  * small, fast-to-commit pool while a large repo still reaches the 2 GiB cap.
- * Kept deliberately generous (holds the working set without thrash); tuned by
- * `bench/buffer-pool/measure.mjs` against a large-repo analyze.
+ * Kept deliberately generous (holds the working set without thrash): tuned by
+ * timing a full `analyze --force` of a large repo at this factor vs a forced
+ * 2 GiB pool and confirming no wall-time regression (the pool is a native
+ * eager allocation, so it is measured with a real analyze, not a build-free
+ * bench — see the emit-path `COPY` timing note in bench/emit-persistence).
  */
 const POOL_BYTES_PER_ELEMENT = 4 * 1024;
 
