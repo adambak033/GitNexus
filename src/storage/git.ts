@@ -9,10 +9,13 @@ const chompGitOutput = (value: Buffer): string => value.toString().replace(/\r?\
 /**
  * True when the working tree has uncommitted changes that analyze would
  * re-index, even at a matching HEAD. Excludes the paths GitNexus writes during
- * analyze (.gitnexus/, .claude/, .cursor/, AGENTS.md, CLAUDE.md) so its own
- * output never counts as dirty (regression vs PR #1233 behavior). Conservative
- * on any git failure. Shared so `analyze`'s fast-path gate and `status`'s
- * freshness report agree on what "dirty" means.
+ * analyze (.gitnexus/, .claude/, .cursor/, AGENTS.md, CLAUDE.md, and the
+ * repo-local .agents/ mirror) so its own output never counts as dirty
+ * (regression vs PR #1233 behavior). The entire .agents/ tree is excluded,
+ * matching the .claude/ treatment, because the skill mirror writes across
+ * .agents/skills/ and deeper paths. Conservative on any git failure. Shared
+ * so `analyze`'s fast-path gate and `status`'s freshness report agree on what
+ * "dirty" means.
  */
 export const isWorkingTreeDirty = (repoPath: string): boolean => {
   try {
@@ -31,6 +34,8 @@ export const isWorkingTreeDirty = (repoPath: string): boolean => {
         ':(exclude).cursor/**',
         ':(exclude)AGENTS.md',
         ':(exclude)CLAUDE.md',
+        ':(exclude).agents',
+        ':(exclude).agents/**',
       ],
       {
         cwd: repoPath,

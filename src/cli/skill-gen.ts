@@ -80,7 +80,7 @@ export const generateSkillFiles = async (
   // exists, mirror the generated community skills there too so those agents
   // serve the up-to-date copies.
   const agentsOutputDir = path.join(repoPath, '.agents', 'skills');
-  const mirrorToAgents = await shouldMirrorSkillsToAgents(repoPath);
+  let mirrorToAgents = await shouldMirrorSkillsToAgents(repoPath);
 
   // Community skills used to live under an undiscoverable `generated/`
   // grouping directory. Clear that GitNexus-owned legacy output and
@@ -160,8 +160,19 @@ export const generateSkillFiles = async (
   // Step 4: Ensure the shared project-skill root exists. Never clear it: it
   // also contains user-authored and standard GitNexus skills.
   await fs.mkdir(outputDir, { recursive: true });
+  // The .agents/ mirror is a side flow: keep it a weak dependency. If the
+  // mirror root cannot be created (e.g. `.agents/skills` exists as a file),
+  // warn and disable mirroring for this run instead of aborting canonical
+  // community-skill generation. Canonical writes below stay unaffected.
   if (mirrorToAgents) {
-    await fs.mkdir(agentsOutputDir, { recursive: true });
+    try {
+      await fs.mkdir(agentsOutputDir, { recursive: true });
+    } catch (err) {
+      console.log(
+        `Warning: Could not create mirror root ${agentsOutputDir} — .agents/skills mirroring disabled for this run: ${err}`,
+      );
+      mirrorToAgents = false;
+    }
   }
 
   // Step 5: Generate skill files
@@ -214,11 +225,16 @@ export const generateSkillFiles = async (
     await fs.writeFile(path.join(skillDir, 'SKILL.md'), content, 'utf-8');
 
     // Mirror to .agents/skills/ for agents that read repo-local skills
-    // (see mirrorToAgents above).
+    // (see mirrorToAgents above). Best-effort: a per-skill mirror failure
+    // must not abort canonical community-skill generation.
     if (mirrorToAgents) {
-      const agentsSkillDir = path.join(agentsOutputDir, skillName);
-      await fs.mkdir(agentsSkillDir, { recursive: true });
-      await fs.writeFile(path.join(agentsSkillDir, 'SKILL.md'), content, 'utf-8');
+      try {
+        const agentsSkillDir = path.join(agentsOutputDir, skillName);
+        await fs.mkdir(agentsSkillDir, { recursive: true });
+        await fs.writeFile(path.join(agentsSkillDir, 'SKILL.md'), content, 'utf-8');
+      } catch (err) {
+        console.log(`Warning: Could not mirror skill ${skillName} to .agents/skills: ${err}`);
+      }
     }
 
     const info: GeneratedSkillInfo = {
