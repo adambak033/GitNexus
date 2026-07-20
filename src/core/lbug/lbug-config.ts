@@ -333,16 +333,62 @@ const parseBufferPoolSize = (raw: string | undefined): number | undefined => {
 const defaultBufferPoolSize = (): number =>
   Math.min(DEFAULT_BUFFER_POOL_CAP, Math.max(BUFFER_POOL_FLOOR, Math.floor(os.totalmem() * 0.8)));
 
+/** Clamp a requested pool size to [floor, default] — never above the 2 GiB / 80%-RAM default. */
+const clampBufferPool = (bytes: number): number =>
+  Math.min(defaultBufferPoolSize(), Math.max(BUFFER_POOL_FLOOR, Math.floor(bytes)));
+
+/**
+ * Buffer-pool bytes to provision per graph element (node + relationship).
+ *
+ * LadybugDB eagerly commits the buffer pool at DB open, so an oversized pool
+ * costs a fixed penalty on every analyze regardless of repo size (measured:
+ * ~2.8 s extra for a pool ≥128 MiB vs the 64 MiB floor, on a 3-file repo).
+ * The pool is only a page cache over the on-disk index, and the index scales
+ * with node/edge count — so a per-element budget lets a small repo run with a
+ * small, fast-to-commit pool while a large repo still reaches the 2 GiB cap.
+ * Kept deliberately generous (holds the working set without thrash); tuned by
+ * `bench/buffer-pool/measure.mjs` against a large-repo analyze.
+ */
+const POOL_BYTES_PER_ELEMENT = 4 * 1024;
+
+/**
+ * Size the buffer pool to an estimated graph size (node + relationship count),
+ * clamped to [BUFFER_POOL_FLOOR, defaultBufferPoolSize()]. The estimate can
+ * only *shrink* the pool from the default — it never exceeds the 2 GiB / 80%-RAM
+ * cap — so a large repo is never under the default it gets today.
+ */
+export const estimateBufferPool = (graphElementCount: number): number =>
+  clampBufferPool(graphElementCount * POOL_BYTES_PER_ELEMENT);
+
+/**
+ * Optional per-run buffer-pool size hint (bytes). The analyze orchestrator sets
+ * it once the graph size is known (after the pipeline, before the DB open) so a
+ * small repo opens with a small pool, and clears it at run end. Non-analyze
+ * opens (MCP serve, `native-check` `:memory:`) never set it and keep the default.
+ */
+let bufferPoolSizeHint: number | undefined;
+
+/** Set (bytes) or clear (`undefined`) the per-run buffer-pool size hint. */
+export const setBufferPoolSizeHint = (bytes: number | undefined): void => {
+  bufferPoolSizeHint = bytes;
+};
+
 /**
  * Resolve the `bufferManagerSize` passed to every `new lbug.Database(...)`.
- * `GITNEXUS_LBUG_BUFFER_POOL_SIZE` (bytes) overrides the default; `0` is a
+ * `GITNEXUS_LBUG_BUFFER_POOL_SIZE` (bytes) overrides everything; `0` is a
  * deliberate escape hatch that restores LadybugDB's native unbounded
- * 80%-of-RAM default. Resolved at call time (not module load) so tests can
- * stub the env var and `os.totalmem`.
+ * 80%-of-RAM default. With no env override, a per-run `setBufferPoolSizeHint`
+ * (clamped to [floor, default]) sizes the pool to the repo; otherwise the
+ * default. Resolved at call time (not module load) so tests can stub the env
+ * var, the hint, and `os.totalmem`.
  */
 const resolveBufferManagerSize = (): number => {
   const raw = process.env.GITNEXUS_LBUG_BUFFER_POOL_SIZE;
-  if (raw === undefined) return defaultBufferPoolSize();
+  if (raw === undefined) {
+    return bufferPoolSizeHint !== undefined
+      ? clampBufferPool(bufferPoolSizeHint)
+      : defaultBufferPoolSize();
+  }
   const parsed = parseBufferPoolSize(raw);
   if (parsed !== undefined) return parsed;
   // Non-empty but unparseable input: warn the operator and fall back —
