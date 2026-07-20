@@ -34,6 +34,7 @@ import {
   LbugWipeError,
   DELETE_FILES_CHUNK_SIZE,
 } from './lbug/lbug-adapter.js';
+import { estimateBufferPool, setBufferPoolSizeHint } from './lbug/lbug-config.js';
 import { escapeCypherString } from './lbug/cypher-escape.js';
 import {
   buildSearchIndexesOrDegrade,
@@ -644,6 +645,11 @@ export async function runFullAnalysis(
   // (parse-cache, parsedfile-store) and the kuzu-migration cleanup live there
   // and are shared across branches (#2106 KTD7).
   const { storagePath } = getStoragePaths(repoPath);
+
+  // Start each analyze with a clean buffer-pool hint: any pre-pipeline DB open
+  // (e.g. the embeddings-cache open) falls back to the default until the hint is
+  // set from the built graph below, so a prior run's size can't leak in.
+  setBufferPoolSizeHint(undefined);
 
   // Clean up stale KuzuDB files from before the LadybugDB migration.
   const kuzuResult = await cleanupOldKuzuFiles(storagePath);
@@ -1373,6 +1379,15 @@ export async function runFullAnalysis(
     // a still-populated DB this run believes it wiped.
     await wipeLbugDbFiles(lbugPath);
   }
+
+  // Size the buffer pool to the graph just built by the pipeline (a page cache
+  // over the on-disk index, which scales with node/edge count). A small repo
+  // opens with the fast 64 MiB floor instead of eagerly committing the full
+  // 2 GiB default; a large repo still reaches the cap. env override / no-hint
+  // paths are unchanged. See resolveBufferManagerSize / estimateBufferPool.
+  setBufferPoolSizeHint(
+    estimateBufferPool(pipelineResult.graph.nodeCount + pipelineResult.graph.relationshipCount),
+  );
 
   await initLbug(lbugPath);
 
