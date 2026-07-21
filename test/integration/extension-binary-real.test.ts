@@ -2,21 +2,21 @@ import {
   copyFileSync,
   existsSync,
   mkdtempSync,
-  readdirSync,
   readFileSync,
   rmSync,
-  statSync,
   writeFileSync,
 } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
-import lbug from '@ladybugdb/core';
 import {
   diagnoseExtensionLoad,
   inspectExtensionBinary,
 } from '../../src/core/lbug/extension-load-error.js';
-import { requireFtsResourceOrSkip } from '../helpers/fts-availability.js';
+import {
+  findInstalledFtsExtension,
+  requireFtsResourceOrSkip,
+} from '../helpers/fts-availability.js';
 
 /**
  * #2374: exercise the language-independent structural classifier against REAL
@@ -49,17 +49,7 @@ function resolveLbugNative(): string | null {
 /** The actual installed FTS extension binary for the running lbug version. */
 function resolveInstalledFtsExtension(): string | null {
   const home = process.env.USERPROFILE ?? process.env.HOME ?? homedir();
-  const base = join(home, '.lbdb', 'extension', lbug.VERSION);
-  try {
-    const platformDir = readdirSync(base).find((entry) =>
-      statSync(join(base, entry)).isDirectory(),
-    );
-    if (!platformDir) return null;
-    const ext = join(base, platformDir, 'fts', 'libfts.lbug_extension');
-    return existsSync(ext) ? ext : null;
-  } catch {
-    return null;
-  }
+  return findInstalledFtsExtension(join(home, '.lbdb', 'extension'));
 }
 
 const lbugNative = resolveLbugNative();
