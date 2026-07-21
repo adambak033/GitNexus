@@ -11,14 +11,57 @@
 import { readFile, writeFile } from 'fs/promises';
 import { execSync } from 'child_process';
 import path from 'path';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { setupMiniRepo } from '../helpers/mini-repo.js';
 import { getStoragePaths } from '../../src/storage/repo-manager.js';
 import { FTS_INDEXES } from '../../src/core/search/fts-schema.js';
+import { createTempDir } from '../helpers/test-db.js';
+import { resolveAnalyzeInstallPolicy } from '../../src/core/lbug/extension-loader.js';
 
 const ftsMustBeAvailable = process.env.GITNEXUS_REQUIRE_FTS === '1';
 
 describe('runFullAnalysis incremental writeback — FTS drop-before-delete ordering (#2589)', () => {
+  let ftsAvailable = true;
+  let skipWarned = false;
+
+  beforeAll(async () => {
+    const lbugAdapter = await import('../../src/core/lbug/lbug-adapter.js');
+    // Cheap standalone probe — matches the withTestLbugDB/lbug-vector-extension
+    // convention of checking availability once, up front, rather than deep
+    // inside the (expensive) test body.
+    const probe = await createTempDir('gitnexus-2589-fts-probe-');
+    try {
+      await lbugAdapter.initLbug(probe.dbPath);
+      ftsAvailable = await lbugAdapter.loadFTSExtension(undefined, {
+        policy: resolveAnalyzeInstallPolicy(),
+      });
+    } finally {
+      await lbugAdapter.closeLbug();
+      await probe.cleanup();
+    }
+  }, 120_000);
+
+  // Skip VISIBLY (ctx.skip() marks the test as skipped, not passed) when the
+  // extension is unavailable — silently `return`ing from inside `it()` would
+  // report a false pass and hide a regression in the drop-before-delete
+  // ordering in exactly the environments least likely to have a human notice.
+  beforeEach((ctx) => {
+    if (!ftsAvailable) {
+      if (ftsMustBeAvailable) {
+        throw new Error(
+          'GITNEXUS_REQUIRE_FTS=1 but the FTS extension is unavailable — cannot verify the #2589 ordering fix.',
+        );
+      }
+      if (!skipWarned) {
+        skipWarned = true;
+        console.warn(
+          '[incremental-fts-drop-ordering] Skipping — the LadybugDB FTS extension is unavailable.',
+        );
+      }
+      ctx.skip();
+    }
+  });
+
   afterEach(() => {
     vi.doUnmock('../../src/core/lbug/lbug-adapter.js');
     vi.resetModules();
@@ -30,8 +73,7 @@ describe('runFullAnalysis incremental writeback — FTS drop-before-delete order
 
     const repo = await setupMiniRepo('gitnexus-2589-fts-order-');
     try {
-      // First run: full rebuild, builds every FTS index for real (skipped
-      // gracefully below if the extension isn't available on this machine).
+      // First run: full rebuild, builds every FTS index for real.
       await runFullAnalysis(repo.dbPath, { skipAgentsMd: true }, { onProgress: () => {} });
 
       // runFullAnalysis closes its own connection on return — open a fresh
@@ -48,16 +90,11 @@ describe('runFullAnalysis incremental writeback — FTS drop-before-delete order
       const beforeChange = await showIndexNames();
       await lbugAdapter.closeLbug();
 
-      if (!FTS_INDEXES.every(({ indexName }) => beforeChange.includes(indexName))) {
-        if (ftsMustBeAvailable) {
-          throw new Error(
-            'GITNEXUS_REQUIRE_FTS=1 but the first run did not build every FTS index — cannot verify the #2589 ordering fix.',
-          );
-        }
-        console.warn(
-          '[incremental-fts-drop-ordering] Skipping — FTS extension unavailable or indexes not built.',
-        );
-        return;
+      // Hard assertion, not a soft skip: the beforeEach gate already proved
+      // the extension loads, so every index failing to build here is a real
+      // bug in the full-rebuild FTS phase, not an environment gap.
+      for (const { indexName } of FTS_INDEXES) {
+        expect(beforeChange).toContain(indexName);
       }
 
       // Spy on the real deleteNodesForFiles, recording the FTS index list at

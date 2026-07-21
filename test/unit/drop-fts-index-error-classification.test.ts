@@ -42,6 +42,14 @@ describe('isBenignDropFtsIndexError', () => {
   it('is false for an unrelated failure', () => {
     expect(isBenignDropFtsIndexError('Connection Exception: database is closed')).toBe(false);
   });
+
+  it('is false for a genuine failure that merely mentions "Binder exception" mid-message (anchored, not a bare substring match)', () => {
+    expect(
+      isBenignDropFtsIndexError(
+        'Runtime exception: internal state corrupted while processing Binder exception: recovery failed.',
+      ),
+    ).toBe(false);
+  });
 });
 
 withTestLbugDB('drop-fts-index-benign-cases', (handle) => {

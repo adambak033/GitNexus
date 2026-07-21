@@ -2914,11 +2914,15 @@ export const queryFTS = async (
  * not defined...`). A real engine failure — e.g. the `Runtime exception:
  * FTS index '<name>' is inconsistent: ...` class from #2589 — is a
  * DIFFERENT exception class (an execution-time failure, not a catalog/bind
- * lookup miss), so this returns false for it. Pure string logic so it is
- * unit-testable without a native LadybugDB connection.
+ * lookup miss), so this returns false for it. Anchored to the START of the
+ * message (not a bare substring search): every probed LadybugDB error leads
+ * with its exception class, and anchoring means a future message that merely
+ * mentions "Binder exception" or "Catalog exception" further in in the body
+ * of an otherwise-genuine failure can't be misclassified as benign. Pure
+ * string logic so it is unit-testable without a native LadybugDB connection.
  */
 export const isBenignDropFtsIndexError = (message: string): boolean =>
-  message.includes('Binder exception:') || message.includes('Catalog exception:');
+  message.startsWith('Binder exception:') || message.startsWith('Catalog exception:');
 
 /**
  * Drop an FTS index. Tolerates only {@link isBenignDropFtsIndexError} —
