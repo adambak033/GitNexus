@@ -73,8 +73,8 @@ describe('CALL_SUMMARY relation-type exclusion (U-C1)', () => {
 });
 
 describe('CALL_SUMMARY incremental reuse gate (U-C5)', () => {
-  it('INCREMENTAL_SCHEMA_VERSION is bumped to 5 (multi-verb Route identity re-index window)', () => {
-    expect(INCREMENTAL_SCHEMA_VERSION).toBe(5);
+  it('INCREMENTAL_SCHEMA_VERSION is bumped to 10 (Java record container-node re-index window)', () => {
+    expect(INCREMENTAL_SCHEMA_VERSION).toBe(10);
   });
 
   it('a pre-current stamp fails the `=== INCREMENTAL_SCHEMA_VERSION` reuse gate → forces full re-analyze', () => {
@@ -91,7 +91,28 @@ describe('CALL_SUMMARY incremental reuse gate (U-C5)', () => {
     expect(passesReuseGate(4)).toBe(false);
     // A legacy stamp with no schemaVersion at all is likewise rejected.
     expect(passesReuseGate(undefined)).toBe(false);
+    // A pre-v6 (v5) index predates the uniform 0-based line-storage flip → its
+    // COBOL/JCL/markdown/scope rows are still 1-based, so an incremental top-up
+    // would mix bases → must NOT reuse.
+    expect(passesReuseGate(5)).toBe(false);
+    // A pre-v7 (v6) index predates the callable-value-flow edges (#2437/#2522)
+    // — new edges between unchanged files would never enter the incremental
+    // write set → must NOT reuse.
+    expect(passesReuseGate(6)).toBe(false);
+    // A pre-v8 (v7) index predates the Java anonymous-class instance model
+    // (#2550) — `Worker.run`-keyed Method nodes would be stranded alongside
+    // the re-keyed `Worker$N.run` ones on unchanged files → must NOT reuse.
+    expect(passesReuseGate(7)).toBe(false);
+    // A pre-v9 (v8) index predates enum constant bodies + JLS 13.1
+    // immediate-host naming (#2555) — `E.hook`-keyed Method nodes and
+    // topmost-anchored `EnumWrap$1`-style ids would be stranded alongside
+    // the re-keyed ones on unchanged files → must NOT reuse.
+    expect(passesReuseGate(8)).toBe(false);
+    // A pre-v10 (v9) index predates the Java record container-node fix
+    // (#2564) — a record's methods would keep being ownerless Method nodes
+    // with no HAS_METHOD edge on unchanged files → must NOT reuse.
+    expect(passesReuseGate(9)).toBe(false);
     // A current-version stamp passes the gate (incremental top-up eligible).
-    expect(passesReuseGate(5)).toBe(true);
+    expect(passesReuseGate(10)).toBe(true);
   });
 });

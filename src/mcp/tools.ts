@@ -6,6 +6,7 @@
  */
 
 import type { ToolAnnotations } from '@modelcontextprotocol/sdk/types.js';
+import { REL_TYPES } from 'gitnexus-shared';
 
 export interface ToolDefinition {
   name: string;
@@ -27,12 +28,6 @@ export interface ToolDefinition {
       }
     >;
     required: string[];
-    /**
-     * JSON-Schema `anyOf` for cross-property constraints `required` cannot express
-     * — e.g. "at least one of route/file". Forwarded verbatim to clients by the
-     * server's ListTools handler, so MCP clients see the constraint.
-     */
-    anyOf?: Array<{ required: string[] }>;
   };
 }
 
@@ -181,6 +176,12 @@ SERVICE: optional monorepo path prefix (POSIX-style, case-sensitive segments). W
           description: 'Include full symbol source code (default: false)',
           default: false,
         },
+        maxTokens: {
+          type: 'integer',
+          minimum: 1,
+          description:
+            'Maximum estimated tokens in the complete formatted MCP response. Explicit request overrides GITNEXUS_MCP_DEFAULT_MAX_TOKENS.',
+        },
         repo: {
           type: 'string',
           description:
@@ -207,7 +208,7 @@ SCHEMA:
 - Nodes: File, Folder, Function, Class, Interface, Method, CodeElement, Community, Process, Route, Tool
 - Multi-language nodes (use backticks): \`Struct\`, \`Enum\`, \`Trait\`, \`Impl\`, etc.
 - All edges via single CodeRelation table with 'type' property
-- Edge types: CONTAINS, DEFINES, CALLS, IMPORTS, EXTENDS, IMPLEMENTS, HAS_METHOD, HAS_PROPERTY, ACCESSES, METHOD_OVERRIDES, METHOD_IMPLEMENTS, MEMBER_OF, STEP_IN_PROCESS, HANDLES_ROUTE, FETCHES, HANDLES_TOOL, ENTRY_POINT_OF
+- Edge types: ${REL_TYPES.join(', ')} — CFG, REACHING_DEF, TAINTED, SANITIZES, TAINT_PATH, CDG, POST_DOMINATE are populated ONLY on indexes built with \`gitnexus analyze --pdg\` (zero rows on a default index); OVERRIDES is a legacy alias — rows are written as METHOD_OVERRIDES
 - Edge properties: type (STRING), confidence (DOUBLE), reason (STRING), step (INT32)
 
 EXAMPLES:
@@ -231,6 +232,9 @@ EXAMPLES:
 
 • Find method overrides (MRO resolution):
   MATCH (winner:Method)-[r:CodeRelation {type: 'METHOD_OVERRIDES'}]->(loser:Method) RETURN winner.name, winner.filePath, loser.filePath, r.reason
+
+• Find DI-injected implementations (beans injected into a consumer class):
+  MATCH (c:Class {name: 'OrderService'})-[r:CodeRelation]->(impl:Class) WHERE r.type = 'INJECTS' RETURN impl.name, r.reason
 
 • Detect diamond inheritance:
   MATCH (d:Class)-[:CodeRelation {type: 'EXTENDS'}]->(b1), (d)-[:CodeRelation {type: 'EXTENDS'}]->(b2), (b1)-[:CodeRelation {type: 'EXTENDS'}]->(a), (b2)-[:CodeRelation {type: 'EXTENDS'}]->(a) WHERE b1 <> b2 RETURN d.name, b1.name, b2.name, a.name
@@ -293,6 +297,10 @@ SERVICE: optional monorepo path prefix (case-sensitive path segments). When "rep
           description: 'Direct symbol UID from prior tool results (zero-ambiguity lookup)',
         },
         file_path: { type: 'string', description: 'File path to disambiguate common names' },
+        file: {
+          type: 'string',
+          description: 'Compatibility alias for file_path; values must agree when both are present',
+        },
         kind: {
           type: 'string',
           description:
@@ -302,6 +310,12 @@ SERVICE: optional monorepo path prefix (case-sensitive path segments). When "rep
           type: 'boolean',
           description: 'Include full symbol source code (default: false)',
           default: false,
+        },
+        maxTokens: {
+          type: 'integer',
+          minimum: 1,
+          description:
+            'Maximum estimated tokens in the complete formatted MCP response. Explicit request overrides GITNEXUS_MCP_DEFAULT_MAX_TOKENS.',
         },
         repo: {
           type: 'string',
@@ -423,7 +437,7 @@ MODE (opt-in): "callgraph" (default) walks symbol→symbol edges (CALLS/IMPORTS/
 
 STATEMENT-ANCHORED PDG SLICE: with mode:'pdg', pass "line" (1-based source line within the target symbol) to seed the dependence slice on the statement at that line and return what depends on it in affectedStatements (line + text). Inter-procedural symbols are still reported through interproceduralByDepth/pdgInterprocedural and the compatibility byDepth bucket. Without "line", pdg returns whole-symbol inter-procedural reach plus local whole-symbol PDG diagnostics.
 
-PDG OUTPUT CONTRACT: every mode:'pdg' result (success, empty, degraded, or error) carries pdgResultVersion:1 — a stable discriminator for external consumers that bumps on any breaking change to the PDG result shape (distinct from the DB schema version). Successful PDG results include mode:'pdg', a full target envelope (id/name/type/filePath), affectedStatements, affectedStatementCount, interproceduralByDepth/pdgInterprocedural for cross-function reach, compatibility byDepth/byDepthCounts, risk:'UNKNOWN', and a note describing the unified contract. Degraded PDG results (no-layer, sub-layer-missing, unknown) keep mode:'pdg', pdgResultVersion:1, target metadata when the target resolves, risk:'UNKNOWN', note/remediation, and empty byDepth parity fields — never a false-safe zero. If depth and limit both bound the slice, truncatedByReasons reports both causes while truncatedBy remains scalar.
+PDG OUTPUT CONTRACT: every mode:'pdg' result (success, empty, degraded, or error) carries pdgResultVersion:2 — a stable discriminator for external consumers that bumps on any breaking change to the PDG result shape (distinct from the DB schema version). Successful PDG results include mode:'pdg', a full target envelope (id/name/type/filePath), affectedStatements, affectedStatementCount, interproceduralByDepth/pdgInterprocedural for cross-function reach, compatibility byDepth/byDepthCounts, risk:'UNKNOWN', and a note describing the unified contract. Degraded PDG results (no-layer, sub-layer-missing, unknown) keep mode:'pdg', pdgResultVersion:2, target metadata when the target resolves, risk:'UNKNOWN', note/remediation, and empty byDepth parity fields — never a false-safe zero. If depth and limit both bound the slice, truncatedByReasons reports both causes while truncatedBy remains scalar.
 
 WHEN TO USE: Before making code changes — especially refactoring, renaming, or modifying shared code. Shows what would break.
 AFTER THIS: Review d=1 items (WILL BREAK). Use context() on high-risk symbols.
@@ -457,6 +471,14 @@ SERVICE: optional monorepo path prefix (case-sensitive path segments). When "rep
       type: 'object',
       properties: {
         target: { type: 'string', description: 'Name of function, class, or file to analyze' },
+        name: {
+          type: 'string',
+          description: 'Compatibility alias for target; all supplied target aliases must agree',
+        },
+        symbol: {
+          type: 'string',
+          description: 'Compatibility alias for target; all supplied target aliases must agree',
+        },
         target_uid: {
           type: 'string',
           description:
@@ -512,7 +534,7 @@ SERVICE: optional monorepo path prefix (case-sensitive path segments). When "rep
           type: 'array',
           items: { type: 'string' },
           description:
-            'Filter: CALLS, IMPORTS, EXTENDS, IMPLEMENTS, HAS_METHOD, HAS_PROPERTY, METHOD_OVERRIDES, METHOD_IMPLEMENTS, ACCESSES (default: usage-based, ACCESSES excluded by default)',
+            'Filter: CALLS, IMPORTS, EXTENDS, IMPLEMENTS, HAS_METHOD, HAS_PROPERTY, METHOD_OVERRIDES, METHOD_IMPLEMENTS, ACCESSES (default: usage-based, ACCESSES excluded by default). DI fan-out (consumer→implementer) requires explicitly including INJECTS.',
         },
         includeTests: { type: 'boolean', description: 'Include test files (default: false)' },
         minConfidence: {
@@ -560,6 +582,12 @@ SERVICE: optional monorepo path prefix (case-sensitive path segments). When "rep
             'When true, returns target, summary, risk, byDepthCounts, affected_processes, and affected_modules — omits byDepth. Single-repo only; ignored in group mode (@groupName). Use for hub symbols to get actionable signal without output explosion.',
           default: false,
         },
+        maxTokens: {
+          type: 'integer',
+          minimum: 1,
+          description:
+            'Maximum estimated tokens in the complete formatted MCP response. Explicit request overrides GITNEXUS_MCP_DEFAULT_MAX_TOKENS.',
+        },
         timeoutMs: {
           type: 'number',
           description:
@@ -574,7 +602,7 @@ SERVICE: optional monorepo path prefix (case-sensitive path segments). When "rep
           maximum: 3600000,
         },
       },
-      required: ['target', 'direction'],
+      required: ['direction'],
     },
   },
   {
@@ -762,9 +790,6 @@ Response shape is keyed on how many routes match, not on the data: exactly one m
         repo: { type: 'string', description: 'Repository name or path.' },
       },
       required: [],
-      // Exactly one lookup key is needed, but either works (route wins if both
-      // are passed) — so the structural constraint is "at least one of route/file".
-      anyOf: [{ required: ['route'] }, { required: ['file'] }],
     },
   },
   {
@@ -902,11 +927,12 @@ for (const tool of GITNEXUS_TOOLS) {
   if (!BRANCH_SCOPED_TOOLS.has(tool.name)) continue;
   if (tool.inputSchema.properties.branch) continue;
   // Optional — `required` is left unchanged so omitting `branch` keeps today's
-  // default/primary-branch behavior. Ignored in group mode (repo starts "@").
+  // workspace-index behavior. Ignored in group mode (repo starts "@").
   tool.inputSchema.properties.branch = {
     type: 'string',
     description:
-      'Optional: scope to a specific branch index (multi-branch repos, #2106). ' +
-      'Omit for the default/primary branch. Ignored in group mode.',
+      'Optional: scope to a pinned branch index (multi-branch repos, #2106). ' +
+      'Omit for the workspace index, which follows the checked-out working tree. ' +
+      'Ignored in group mode.',
   };
 }

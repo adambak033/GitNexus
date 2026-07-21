@@ -238,8 +238,15 @@ export function resolveNativeSafeStorageDir(storagePath: string, subdir: string)
  *    `true` (0.16.0). Existing call sites that relied on the positional
  *    default must now pass `false` explicitly to preserve behaviour.
  *
- * Putting both in one shared module guarantees every `new lbug.Database(...)`
- * call site agrees on the same ceiling and behaviour.
+ * 3. `bufferManagerSize` (not a 0.16.0 change, same pin-explicitly
+ *    principle): `0` means "native default", and the native default buffer
+ *    pool is 80% of physical RAM. A long-lived `gitnexus mcp` process or a
+ *    large incremental analyze can balloon to that ceiling and OOM-kill the
+ *    host session (#2557), so GitNexus pins an explicit bounded pool — see
+ *    `resolveBufferManagerSize`.
+ *
+ * Putting these in one shared module guarantees every `new lbug.Database(...)`
+ * call site agrees on the same ceilings and behaviour.
  */
 
 /**
@@ -299,6 +306,123 @@ const resolveCheckpointThreshold = (): number => {
   return DEFAULT_WAL_CHECKPOINT_THRESHOLD;
 };
 
+/**
+ * Default ceiling for the LadybugDB buffer pool in bytes (#2557).
+ *
+ * The pool is a page cache with eviction, so the ceiling trades throughput
+ * on very large working sets for a machine that stays alive: 2 GiB is
+ * ~40× the GitNexus self-index, while the native 80%-of-RAM default let a
+ * `detect_changes` call grow a 105 MiB on-disk index to 19.5 GiB RSS and
+ * OOM-kill the reporter's session. The `min` with 80% of `os.totalmem()`
+ * keeps sub-2.5-GiB machines at the native-equivalent bound (no regression
+ * there); the 64 MiB floor keeps tiny containers above any plausible
+ * native minimum pool size.
+ */
+const DEFAULT_BUFFER_POOL_CAP = 2 * 1024 * 1024 * 1024;
+const BUFFER_POOL_FLOOR = 64 * 1024 * 1024;
+
+// COPY-safety floor for the adaptive hint (below). LadybugDB's bulk COPY needs
+// working buffer-pool memory that scales with the repo: a 64 MiB pool fails
+// ("buffer pool is full and no memory could be freed") on any non-trivial repo,
+// and even the ~1800-file GitNexus checkout needs ≥256 MiB. So the adaptive
+// size never drops a repo below this — a distinct, higher floor than
+// BUFFER_POOL_FLOOR, which only guards defaultBufferPoolSize on tiny-RAM
+// machines. It is still clamped up to defaultBufferPoolSize, so a machine whose
+// default is below this floor keeps its default rather than over-committing.
+const ADAPTIVE_POOL_FLOOR = 256 * 1024 * 1024;
+
+const parseBufferPoolSize = (raw: string | undefined): number | undefined => {
+  if (raw === undefined) return undefined;
+  const normalized = raw.trim();
+  if (normalized.length === 0) return undefined;
+  const parsed = Number(normalized);
+  if (!Number.isFinite(parsed) || parsed < 0) return undefined;
+  return Math.floor(parsed);
+};
+
+const defaultBufferPoolSize = (): number =>
+  Math.min(DEFAULT_BUFFER_POOL_CAP, Math.max(BUFFER_POOL_FLOOR, Math.floor(os.totalmem() * 0.8)));
+
+/**
+ * Clamp an adaptive pool request to [ADAPTIVE_POOL_FLOOR, default]. The lower
+ * bound keeps LadybugDB's COPY viable; the upper bound (defaultBufferPoolSize)
+ * means the hint can only shrink the pool from today's default and can never
+ * exceed the 2 GiB / 80%-RAM cap — and on a machine whose default is below the
+ * COPY floor, the default wins, so the pool is never over-committed.
+ */
+const clampBufferPool = (bytes: number): number =>
+  Math.min(defaultBufferPoolSize(), Math.max(ADAPTIVE_POOL_FLOOR, Math.floor(bytes)));
+
+/**
+ * Buffer-pool bytes to provision per graph element (node + relationship).
+ *
+ * The fixed 2 GiB default is far larger than most repos' working set, and
+ * LadybugDB eagerly commits the pool at DB open — measured: a full
+ * `analyze --force` of the GitNexus checkout takes ~51 s with the 2 GiB pool
+ * vs ~35 s with the ~414 MiB this factor yields (31% faster; the oversized
+ * pool's commit dominates). The pool is a page cache over the on-disk index,
+ * which scales with node/edge count, so a per-element budget sizes it to the
+ * repo. Kept generous so the whole index stays resident (no COPY thrash) and
+ * always clamped to at least ADAPTIVE_POOL_FLOOR; tuned by timing a real
+ * large-repo `analyze --force` at this factor vs a forced 2 GiB pool (the pool
+ * is a native eager allocation, measured with a real analyze, not a build-free
+ * bench — see the emit-path COPY timing note in bench/emit-persistence).
+ */
+const POOL_BYTES_PER_ELEMENT = 4 * 1024;
+
+/**
+ * Size the buffer pool to an estimated graph size (node + relationship count),
+ * clamped to [ADAPTIVE_POOL_FLOOR, defaultBufferPoolSize()]. The estimate can
+ * only *shrink* the pool from the default — never above the 2 GiB / 80%-RAM cap,
+ * never below the COPY-safety floor — so no repo is under-sized or gets more
+ * than the default it would have today.
+ */
+export const estimateBufferPool = (graphElementCount: number): number =>
+  clampBufferPool(graphElementCount * POOL_BYTES_PER_ELEMENT);
+
+/**
+ * Optional per-run buffer-pool size hint (bytes). The analyze orchestrator sets
+ * it once the graph size is known (after the pipeline, before the DB open) so
+ * the pool is sized to the repo instead of the fixed 2 GiB default, and clears
+ * it at run end. Non-analyze opens (MCP serve, `native-check` `:memory:`) never
+ * set it and keep the default.
+ */
+let bufferPoolSizeHint: number | undefined;
+
+/** Set (bytes) or clear (`undefined`) the per-run buffer-pool size hint. */
+export const setBufferPoolSizeHint = (bytes: number | undefined): void => {
+  bufferPoolSizeHint = bytes;
+};
+
+/**
+ * Resolve the `bufferManagerSize` passed to every `new lbug.Database(...)`.
+ * `GITNEXUS_LBUG_BUFFER_POOL_SIZE` (bytes) overrides everything; `0` is a
+ * deliberate escape hatch that restores LadybugDB's native unbounded
+ * 80%-of-RAM default. With no env override, a per-run `setBufferPoolSizeHint`
+ * (clamped to [floor, default]) sizes the pool to the repo; otherwise the
+ * default. Resolved at call time (not module load) so tests can stub the env
+ * var, the hint, and `os.totalmem`.
+ */
+const resolveBufferManagerSize = (): number => {
+  const raw = process.env.GITNEXUS_LBUG_BUFFER_POOL_SIZE;
+  if (raw === undefined) {
+    return bufferPoolSizeHint !== undefined
+      ? clampBufferPool(bufferPoolSizeHint)
+      : defaultBufferPoolSize();
+  }
+  const parsed = parseBufferPoolSize(raw);
+  if (parsed !== undefined) return parsed;
+  // Non-empty but unparseable input: warn the operator and fall back —
+  // mirrors the GITNEXUS_WAL_CHECKPOINT_THRESHOLD env path above.
+  if (raw.trim().length > 0) {
+    logger.warn(
+      { rawValue: raw, fallback: defaultBufferPoolSize() },
+      `Ignoring invalid GITNEXUS_LBUG_BUFFER_POOL_SIZE=${raw}; expected integer >= 0 (bytes; 0 restores the native 80%-of-RAM default); falling back to min(2 GiB, 80% of RAM).`,
+    );
+  }
+  return defaultBufferPoolSize();
+};
+
 /** Matches WAL corruption errors from the LadybugDB engine. */
 const WAL_CORRUPTION_RE = /corrupt(ed)?\s+wal|invalid\s+wal\s+record|wal.*corrupt|checksum.*wal/i;
 
@@ -313,7 +437,7 @@ export function isWalCorruptionError(err: unknown): boolean {
 
 // ─── Ladybug WAL checkpoint IO error matchers ───────────────────────────────
 //
-// Matched against LadybugDB v0.16.1 (see `gitnexus/package.json`
+// Matched against LadybugDB v0.18.0 (see `gitnexus/package.json`
 // @ladybugdb/core). Strict regexes encode local_file_system.cpp wording
 // verified at that version. Two-tier strategy: strict matchers first so we
 // only fire on real checkpoint-rotation shapes; a permissive fallback
@@ -355,6 +479,107 @@ export const isLbugCheckpointIoError = (err: unknown): boolean => {
   return LBUG_CHECKPOINT_PERMISSIVE_RE.test(msg);
 };
 
+// ─── Ladybug non-4K page-size frame-release matcher (#1231) ─────────────────
+//
+// LadybugDB <= 0.17.x hardcoded a 4 KiB OS-page assumption in its buffer
+// manager: evicting a frame released physical memory with
+// `madvise(frame, frameSize, MADV_DONTNEED)` on 4 KiB-aligned frame
+// addresses (verified by disassembling `VMRegion::releaseFrame` in
+// @ladybugdb/core-linux-arm64 0.17.1 — `mov w2, #0x4` = MADV_DONTNEED,
+// throw on non-zero return). On kernels with 16 KiB pages (Raspberry Pi 5
+// default 2712 kernel, Asahi Linux) or 64 KiB pages (some enterprise arm64
+// distros), madvise rejects addresses that are not multiples of the real
+// page size with EINVAL, surfacing as:
+//   "Buffer manager exception: Releasing physical memory associated with a
+//    frame failed with error code -1: Invalid argument."
+// which aborts `gitnexus analyze` mid-COPY.
+//
+// @ladybugdb/core 0.18.0 rewrote the release path with runtime OS-page-size
+// detection and discard-granule-aligned madvise (new binary strings:
+// "Failed to detect the operating system page size.", "Unsupported page
+// size combination: frame size {}, discard granule size {}, frame group
+// size {}."), so upgrading is the fix. The residual 0.18.0 guard
+// ("Unsupported page size combination") is matched here too so exotic
+// configurations receive the same actionable guidance instead of a raw
+// native message.
+const LBUG_FRAME_RELEASE_RE = /releasing physical memory associated with a frame failed/i;
+const LBUG_PAGE_COMBO_RE = /unsupported page size combination/i;
+
+/**
+ * True when `err` looks like the LadybugDB buffer manager failing to release
+ * frame memory — the failure mode of a 4 KiB page-size assumption on a
+ * 16 KiB/64 KiB-page kernel (#1231). Deliberately does NOT match the
+ * generic "buffer pool is full" exhaustion error, which is a sizing
+ * problem, not a page-size one.
+ */
+export const isLbugPageSizeFrameError = (err: unknown): boolean => {
+  if (!err) return false;
+  const msg = err instanceof Error ? err.message : String(err);
+  return LBUG_FRAME_RELEASE_RE.test(msg) || LBUG_PAGE_COMBO_RE.test(msg);
+};
+
+/**
+ * True when the given `@ladybugdb/core` version contains the runtime
+ * OS-page-size detection introduced in 0.18.0 (see the matcher comment
+ * above). Unknown/unparseable versions return false so callers err on the
+ * side of showing the upgrade hint.
+ */
+export const isPageSizeAwareLadybug = (version: string | undefined): boolean => {
+  if (!version) return false;
+  const m = /^(\d+)\.(\d+)/.exec(version.trim());
+  if (!m) return false;
+  const major = Number(m[1]);
+  const minor = Number(m[2]);
+  return major > 0 || minor >= 18;
+};
+
+// `undefined` = not probed yet; `null` = probed and unavailable. Cached
+// because analyze error paths and doctor may both ask, and getconf forks.
+let cachedOsPageSize: number | null | undefined;
+
+/**
+ * OS memory page size in bytes, or `undefined` when it cannot be determined
+ * (Windows, missing getconf, sandboxed exec). Node exposes no page-size API,
+ * so this shells out to POSIX `getconf PAGE_SIZE` — same execFileSync shape
+ * as the Windows 8.3 short-path probe above, but with a tighter timeout and
+ * an explicit killSignal (see the options comment below).
+ */
+export const getOsPageSize = (): number | undefined => {
+  if (cachedOsPageSize !== undefined) return cachedOsPageSize ?? undefined;
+  if (process.platform === 'win32') {
+    // Windows allocation granularity is not what madvise alignment is about;
+    // the #1231 failure mode is POSIX-only.
+    cachedOsPageSize = null;
+    return undefined;
+  }
+  try {
+    // killSignal SIGKILL (first use in this repo): the default SIGTERM is
+    // catchable, so a signal-trapping child held the "5s" timeout for 9s in
+    // review reproduction — SIGKILL makes the timeout real for everything
+    // except a child stuck in uninterruptible I/O (D state). 2000ms, not
+    // 5000: doctor runs this probe on its happy path and real getconf
+    // answers in ~2ms, but keep margin for loaded Pi-class hardware — a
+    // too-tight ceiling would silently drop the very #1231 diagnostics this
+    // probe exists to provide (the catch caches the failure). (#2424 review)
+    const out = execFileSync('getconf', ['PAGE_SIZE'], {
+      encoding: 'utf-8',
+      timeout: 2000,
+      killSignal: 'SIGKILL',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const parsed = Number(out.trim());
+    cachedOsPageSize = Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+  } catch {
+    cachedOsPageSize = null;
+  }
+  return cachedOsPageSize ?? undefined;
+};
+
+/** Exported only for unit tests — clears the getconf probe cache. */
+export const _resetOsPageSizeCacheForTest = (): void => {
+  cachedOsPageSize = undefined;
+};
+
 type LbugModule = typeof lbug;
 
 export interface LbugDatabaseOptions {
@@ -368,10 +593,13 @@ export interface LbugConnectionHandle {
 }
 
 /**
- * Return true when the error message indicates that a LadybugDB file lock
- * could not be acquired — either at construction time
- * (`new lbug.Database(...)` raises from `local_file_system.cpp`) or during
- * a query (another writer holds the exclusive lock).
+ * Return true when the error message indicates that a LadybugDB write
+ * transaction could not proceed due to lock contention — either a file
+ * lock that could not be acquired (either at construction time,
+ * `new lbug.Database(...)` raising from `local_file_system.cpp`, or during
+ * a query, another writer holds the exclusive lock), or a same-process
+ * write transaction rejected because another write transaction is already
+ * active on the connection.
  *
  * Lives here (not in `lbug-adapter.ts`) so both the construction-time
  * retry (`openWithLockRetry` in this file) and the query-time retry
@@ -383,10 +611,49 @@ export const isDbBusyError = (err: unknown): boolean => {
   // `lock` already subsumes `could not set lock`; the broader term is kept
   // because graph-DB transient errors include "deadlock", "lock contention",
   // and the LadybugDB native module's "could not set lock on file" — all of
-  // which deserve a retry. If a non-transient lock-shaped error ever
-  // surfaces (e.g., "lock file missing" during recovery), tighten this
-  // matcher rather than raising the retry budget.
-  return msg.includes('busy') || msg.includes('lock') || msg.includes('already in use');
+  // which deserve a retry. LadybugDB also reports same-process writer
+  // contention without the words "busy" or "lock".
+  //
+  // "only one write transaction at a time" was observed against LadybugDB
+  // 0.18.0 (see gitnexus/package.json @ladybugdb/core).
+  //
+  // If a non-transient lock-shaped error ever surfaces (e.g., "lock file
+  // missing" during recovery), tighten this matcher rather than raising the
+  // retry budget.
+  return (
+    msg.includes('busy') ||
+    msg.includes('lock') ||
+    msg.includes('already in use') ||
+    msg.includes('only one write transaction at a time')
+  );
+};
+
+/** See {@link classifyDeleteAllError}. */
+export type DeleteAllErrorClass = 'benign-missing-table' | 'rethrow';
+
+/**
+ * Classify an error thrown while clearing all relationships of one type
+ * before an incremental re-write (`deleteAllRelationshipsOfType` in
+ * `lbug-adapter.ts` — the `deleteAllInjects` / `deleteAllCallSummaries` /
+ * `deleteAllInterprocTaintPaths` family).
+ *
+ * - `'benign-missing-table'`: the CodeRelation table does not exist yet
+ *   (freshly-initialized DB) — the delete-all is a no-op, stay silent.
+ * - `'rethrow'`: ANY other failure (lock, disk, closed connection, native
+ *   error) leaves stale rows that the subsequent re-extract then DUPLICATES
+ *   (CodeRelation has no PK), so the caller must abort the writeback
+ *   (#2084 review P2-5).
+ *
+ * Pure classification, extracted here (next to the other error matchers) so
+ * the load-bearing regex/branch is unit-testable without a native DB —
+ * driving a synthetic failure through the real singleton connection would
+ * break every later test in the shared integration suite (#2200 review).
+ */
+export const classifyDeleteAllError = (err: unknown): DeleteAllErrorClass => {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /no table|not exist|not found|does not exist|Table .* does not exist/i.test(msg)
+    ? 'benign-missing-table'
+    : 'rethrow';
 };
 
 export function createLbugDatabase(
@@ -397,7 +664,7 @@ export function createLbugDatabase(
   // .d.ts declares fewer args than the native constructor accepts.
   return new (lbugModule.Database as any)(
     databasePath,
-    0, // bufferManagerSize
+    resolveBufferManagerSize(), // bufferManagerSize (#2557: default min(2 GiB, 80% RAM); GITNEXUS_LBUG_BUFFER_POOL_SIZE overrides; 0 restores the native 80%-of-RAM default)
     false, // enableCompression (pinned for v0.16.0)
     options.readOnly ?? false,
     LBUG_MAX_DB_SIZE,
@@ -417,7 +684,10 @@ export function createLbugDatabase(
 //   1. OPEN_LOCK_RETRY_ATTEMPTS / OPEN_LOCK_RETRY_DELAY_MS  (this file)
 //      → `new lbug.Database()` constructor lock failures
 //   2. HANDLE_RELEASE_PROBE_ATTEMPTS / HANDLE_RELEASE_PROBE_DELAY_MS  (this file)
-//      → post-close fs.open probe to absorb Windows handle-release lag
+//      → post-close fs.open probe to absorb Windows handle-release lag; also
+//        the shared budget for wipeLbugDbFiles' ENOENT-verified removal
+//        (lbug-adapter.ts) and the dirty-recovery sidecar park's
+//        rename/rm retries (sidecar-recovery.ts) — same lock class
 //   3. DB_LOCK_RETRY_ATTEMPTS / DB_LOCK_RETRY_DELAY_MS  (lbug-adapter.ts withLbugDb)
 //      → query-time busy/lock retry around already-open connections
 //
@@ -429,12 +699,20 @@ export function createLbugDatabase(
 // of 10–50ms each = ~1.0–1.2s worst case) clears the typical
 // AV-scanner hold without masking real cross-process conflicts.
 //
-// Source: https://github.com/LadybugDB/ladybug/blob/v0.16.1/src/common/file_system/local_file_system.cpp#L126
+// Source: https://github.com/LadybugDB/ladybug/blob/v0.18.0/src/common/file_system/local_file_system.cpp#L127
+// (v0.18.0 appends " (Error: <code>)" / " (Lock is held by PID X)" on POSIX,
+// but the "Could not set lock on file : " prefix `isDbBusyError` substring-
+// matches on is unchanged.)
 const OPEN_LOCK_RETRY_ATTEMPTS = 5;
 const OPEN_LOCK_RETRY_DELAY_MS = 100;
 
-const HANDLE_RELEASE_PROBE_ATTEMPTS = 5;
-const HANDLE_RELEASE_PROBE_DELAY_MS = 50;
+// Exported (this shipping review, FIX 1/2): the dirty-recovery sidecar park
+// (sidecar-recovery.ts) and the ENOENT-verified wipe (lbug-adapter.ts
+// wipeLbugDbFiles) retry the SAME Windows handle-release/AV lock class, and
+// their previous private mirror constants were documentation-coupled copies
+// that could drift from this tuning-knob registry silently.
+export const HANDLE_RELEASE_PROBE_ATTEMPTS = 5;
+export const HANDLE_RELEASE_PROBE_DELAY_MS = 50;
 const HANDLE_RELEASE_LOCK_CODES = new Set(['EBUSY', 'EPERM', 'EACCES']);
 
 /**
@@ -501,7 +779,10 @@ const isTestFixturePath = (dbPath: string): boolean => {
 /** Exported only for direct unit testing — production callers use `openWithLockRetry`. */
 export const _isTestFixturePathForTest = isTestFixturePath;
 
-const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+// Exported alongside HANDLE_RELEASE_PROBE_* (this shipping review, FIX 1/2)
+// so the consumers of the shared retry budget do not each grow a private copy.
+export const sleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
  * Attempt to remove stale `.wal` / `.lock` sidecars that a previous aborted
