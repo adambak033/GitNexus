@@ -1175,6 +1175,41 @@ describe('Java chained method call resolution', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Chained call on a new-expression receiver: new Local().inner()
+// The receiver of inner() is an object_creation_expression, not a variable.
+// Regression test for #2564: without treating `new Local()` as a typed
+// receiver, the call falls back to name-only resolution and can pick an
+// unrelated same-named method (Other.inner) instead of Local.inner.
+// ---------------------------------------------------------------------------
+
+describe('Java chained call on a new-expression receiver (#2564)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'java-new-expr-chain-call'), () => {});
+  }, 60000);
+
+  it('detects LocalChain and Other classes', () => {
+    const classes = getNodesByLabel(result, 'Class');
+    expect(classes).toContain('LocalChain');
+    expect(classes).toContain('Other');
+  });
+
+  it('resolves new Local().inner() to the local Local#inner, NOT Other#inner', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const localInner = calls.find(
+      (c) =>
+        c.target === 'inner' && c.source === 'm' && c.targetFilePath.includes('LocalChain.java'),
+    );
+    const otherInner = calls.find(
+      (c) => c.target === 'inner' && c.source === 'm' && c.targetFilePath.includes('Other.java'),
+    );
+    expect(localInner).toBeDefined();
+    expect(otherInner).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Java record: container node + HAS_METHOD edges
 // Regression test for #2564: JAVA_QUERIES previously had no @definition.record
 // capture, so a record never got a Class/Record graph node — its methods
