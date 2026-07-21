@@ -3055,3 +3055,43 @@ describe('Java enum constant bodies (#2555)', () => {
     expect(misattributed).toBeUndefined();
   }, 60000);
 });
+
+// ---------------------------------------------------------------------------
+// #2561: E.CONST.method() emits no CALLS edge — the receiver-side follow-up
+// to #2555. A bodied constant's receiver must resolve to its synthesized
+// E$N class; a body-less constant's receiver must resolve to the host enum
+// itself.
+// ---------------------------------------------------------------------------
+
+describe('Java enum-constant receiver dispatch (#2561)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'java-enum-constant-body'), () => {});
+  }, 60000);
+
+  it('resolves EnumConst.A.hook() to the bodied constant override (EnumConst$1.hook#0)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const dispatch = calls.find((c) => c.source === 'dispatchToConstant' && c.target === 'hook');
+    expect(dispatch).toBeDefined();
+    expect(dispatch!.rel.targetId).toBe('Method:src/EnumConst.java:EnumConst$1.hook#0');
+  });
+
+  it("resolves EnumConst.A.log() to the host enum's inherited method via E$N's MRO (EnumConst.log#0)", () => {
+    // A's body overrides hook() but NOT log(); log() lives only on the enum.
+    // The bodied constant's receiver binds to EnumConst$1, whose MRO includes
+    // EnumConst (via @reference.inherits), so the qualified call reaches the
+    // host enum's own method — the inherited-dispatch capability the fix enables.
+    const calls = getRelationships(result, 'CALLS');
+    const dispatch = calls.find((c) => c.source === 'dispatchInherited' && c.target === 'log');
+    expect(dispatch).toBeDefined();
+    expect(dispatch!.rel.targetId).toBe('Method:src/EnumConst.java:EnumConst.log#0');
+  });
+
+  it("resolves Plain.A.m() to the body-less constant's inherited enum method (Plain.m#0)", () => {
+    const calls = getRelationships(result, 'CALLS');
+    const dispatch = calls.find((c) => c.source === 'callPlain' && c.target === 'm');
+    expect(dispatch).toBeDefined();
+    expect(dispatch!.rel.targetId).toBe('Method:src/Plain.java:Plain.m#0');
+  });
+});
