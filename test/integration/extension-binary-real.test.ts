@@ -46,10 +46,14 @@ function resolveLbugNative(): string | null {
   return null;
 }
 
-/** The actual installed FTS extension binary for the running lbug version. */
+/**
+ * The actual installed FTS extension binary for the running lbug version.
+ * `os.homedir()` already honors `$HOME` (POSIX) / `%USERPROFILE%` (Windows) —
+ * the same resolution LadybugDB's native layer uses — so it stays correct
+ * under the hermetic-home overrides other tests in this suite set via env vars.
+ */
 function resolveInstalledFtsExtension(): string | null {
-  const home = process.env.USERPROFILE ?? process.env.HOME ?? homedir();
-  return findInstalledFtsExtension(join(home, '.lbdb', 'extension'));
+  return findInstalledFtsExtension(join(homedir(), '.lbdb', 'extension'));
 }
 
 const lbugNative = resolveLbugNative();

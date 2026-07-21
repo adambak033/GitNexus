@@ -18,20 +18,27 @@ const MIN_VALID_FTS_EXTENSION_BYTES = 1024 * 1024;
  * actually just resolved), or null when nothing is installed.
  */
 export const findInstalledFtsExtension = (extensionRoot: string): string | null => {
-  if (!existsSync(extensionRoot)) return null;
-  let best: { path: string; mtimeMs: number } | null = null;
-  for (const versionEntry of readdirSync(extensionRoot)) {
-    const versionDir = join(extensionRoot, versionEntry);
-    if (!statSync(versionDir).isDirectory()) continue;
-    for (const platformEntry of readdirSync(versionDir)) {
-      const candidate = join(versionDir, platformEntry, 'fts', 'libfts.lbug_extension');
-      if (!existsSync(candidate)) continue;
-      const stat = statSync(candidate);
-      if (stat.size < MIN_VALID_FTS_EXTENSION_BYTES) continue;
-      if (!best || stat.mtimeMs > best.mtimeMs) best = { path: candidate, mtimeMs: stat.mtimeMs };
+  // Fail closed on any FS error (permission quirks, AV file locks on Windows,
+  // a directory vanishing mid-scan) — same contract as the callers this
+  // replaces: "not found" is a valid outcome, a thrown exception is not.
+  try {
+    if (!existsSync(extensionRoot)) return null;
+    let best: { path: string; mtimeMs: number } | null = null;
+    for (const versionEntry of readdirSync(extensionRoot)) {
+      const versionDir = join(extensionRoot, versionEntry);
+      if (!statSync(versionDir).isDirectory()) continue;
+      for (const platformEntry of readdirSync(versionDir)) {
+        const candidate = join(versionDir, platformEntry, 'fts', 'libfts.lbug_extension');
+        if (!existsSync(candidate)) continue;
+        const stat = statSync(candidate);
+        if (stat.size < MIN_VALID_FTS_EXTENSION_BYTES) continue;
+        if (!best || stat.mtimeMs > best.mtimeMs) best = { path: candidate, mtimeMs: stat.mtimeMs };
+      }
     }
+    return best?.path ?? null;
+  } catch {
+    return null;
   }
-  return best?.path ?? null;
 };
 
 export const FTS_UNAVAILABLE_NOTE =
