@@ -42,7 +42,7 @@ describe('Rust dyn-trait-object type-name normalization (#2604)', () => {
     expect(normalizeRustTypeName("Box<dyn Trait + 'static>")).toBe('Trait');
   });
 
-  it('truncates a dyn trait\'s own generic arguments after stripping dyn', () => {
+  it("truncates a dyn trait's own generic arguments after stripping dyn", () => {
     expect(normalizeRustTypeName('dyn Iterator<Item = u32>')).toBe('Iterator');
   });
 
