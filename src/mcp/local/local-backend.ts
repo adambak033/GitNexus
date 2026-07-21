@@ -4361,44 +4361,28 @@ export class LocalBackend {
       return { error: 'New name is the same as the current name.' };
     }
 
-    // Step 2: Collect edits from graph (high confidence)
-    const changes = new Map<string, { file_path: string; edits: any[] }>();
-
-    const addEdit = (
-      filePath: string,
-      line: number,
-      oldText: string,
-      newText: string,
-      confidence: string,
-    ) => {
-      if (!changes.has(filePath)) {
-        changes.set(filePath, { file_path: filePath, edits: [] });
-      }
-      changes.get(filePath)!.edits.push({ line, old_text: oldText, new_text: newText, confidence });
+    // Steps 2+3: Determine the set of files the apply step will rewrite, then
+    // enumerate every occurrence in each. The apply step (Step 4) does a
+    // whole-file `\boldName\b` global replace on every file in `changes`, so the
+    // reported edit list MUST enumerate every matching line in every such file —
+    // otherwise the preview under-reports what lands, and the same partial list
+    // comes back after apply (#2605). Building `changes` from one file set is the
+    // single source of truth that keeps the report and the apply provably in sync.
+    type RenameEdit = {
+      line: number;
+      old_text: string;
+      new_text: string;
+      confidence: 'graph' | 'text_search';
     };
+    const escapedOldName = oldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-    // The definition itself
-    if (sym.filePath && sym.startLine) {
-      try {
-        const content = await fs.readFile(assertSafePath(sym.filePath), 'utf-8');
-        const lines = content.split('\n');
-        const lineIdx = sym.startLine - 1;
-        if (lineIdx >= 0 && lineIdx < lines.length && lines[lineIdx].includes(oldName)) {
-          const defRegex = new RegExp(
-            `\\b${oldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`,
-            'g',
-          );
-          addEdit(
-            sym.filePath,
-            sym.startLine,
-            lines[lineIdx].trim(),
-            lines[lineIdx].replace(defRegex, new_name).trim(),
-            'graph',
-          );
-        }
-      } catch (e) {
-        logQueryError('rename:read-definition', e);
-      }
+    // Classify each file to rewrite by how it was discovered. Definition and
+    // graph-ref files carry graph confidence; files found only by text search
+    // carry text_search confidence. A graph-classified file is never downgraded.
+    const fileConfidence = new Map<string, 'graph' | 'text_search'>();
+
+    if (sym.filePath) {
+      fileConfidence.set(sym.filePath, 'graph');
     }
 
     // All incoming refs from graph (callers, importers, etc.)
@@ -4408,44 +4392,13 @@ export class LocalBackend {
       ...(lookupResult.incoming.extends || []),
       ...(lookupResult.incoming.implements || []),
     ];
-
-    let graphEdits = changes.size > 0 ? 1 : 0; // count definition edit
-
     for (const ref of allIncoming) {
-      if (!ref.filePath) continue;
-      try {
-        const content = await fs.readFile(assertSafePath(ref.filePath), 'utf-8');
-        const lines = content.split('\n');
-        for (let i = 0; i < lines.length; i++) {
-          if (lines[i].includes(oldName)) {
-            addEdit(
-              ref.filePath,
-              i + 1,
-              lines[i].trim(),
-              lines[i]
-                .replace(
-                  new RegExp(`\\b${oldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'g'),
-                  new_name,
-                )
-                .trim(),
-              'graph',
-            );
-            graphEdits++;
-            break; // one edit per file from graph refs
-          }
-        }
-      } catch (e) {
-        logQueryError('rename:read-ref', e);
+      if (ref.filePath) {
+        fileConfidence.set(ref.filePath, 'graph');
       }
     }
 
-    // Step 3: Text search for refs the graph might have missed
-    let astSearchEdits = 0;
-    const graphFiles = new Set(
-      [sym.filePath, ...allIncoming.map((r) => r.filePath)].filter(Boolean),
-    );
-
-    // Simple text search across the repo for the old name (in files not already covered by graph)
+    // Text search for files the graph might have missed entirely.
     try {
       const { execFileSync } = await import('child_process');
       const rgArgs = [
@@ -4472,32 +4425,50 @@ export class LocalBackend {
 
       for (const file of files) {
         const normalizedFile = file.replace(/\\/g, '/').replace(/^\.\//, '');
-        if (graphFiles.has(normalizedFile)) continue; // already covered by graph
-
-        try {
-          const content = await fs.readFile(assertSafePath(normalizedFile), 'utf-8');
-          const lines = content.split('\n');
-          const regex = new RegExp(`\\b${oldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'g');
-          for (let i = 0; i < lines.length; i++) {
-            regex.lastIndex = 0;
-            if (regex.test(lines[i])) {
-              regex.lastIndex = 0;
-              addEdit(
-                normalizedFile,
-                i + 1,
-                lines[i].trim(),
-                lines[i].replace(regex, new_name).trim(),
-                'text_search',
-              );
-              astSearchEdits++;
-            }
-          }
-        } catch (e) {
-          logQueryError('rename:text-search-read', e);
+        // Never downgrade a graph-classified file to text_search.
+        if (!fileConfidence.has(normalizedFile)) {
+          fileConfidence.set(normalizedFile, 'text_search');
         }
       }
     } catch (e) {
       logQueryError('rename:ripgrep', e);
+    }
+
+    // Enumerate every `\boldName\b` line in every file to rewrite, using the same
+    // escaped global regex the apply step uses. A file with no matching line is
+    // dropped (apply would write nothing to it). Because apply's per-file global
+    // replace rewrites exactly these lines, the reported list equals what lands.
+    const changes = new Map<string, { file_path: string; edits: RenameEdit[] }>();
+    let graphEdits = 0;
+    let astSearchEdits = 0;
+
+    for (const [filePath, confidence] of fileConfidence) {
+      try {
+        const content = await fs.readFile(assertSafePath(filePath), 'utf-8');
+        const lines = content.split('\n');
+        const edits: RenameEdit[] = [];
+        for (let i = 0; i < lines.length; i++) {
+          if (!new RegExp(`\\b${escapedOldName}\\b`).test(lines[i])) {
+            continue;
+          }
+          edits.push({
+            line: i + 1,
+            old_text: lines[i].trim(),
+            new_text: lines[i].replace(new RegExp(`\\b${escapedOldName}\\b`, 'g'), new_name).trim(),
+            confidence,
+          });
+          if (confidence === 'graph') {
+            graphEdits++;
+          } else {
+            astSearchEdits++;
+          }
+        }
+        if (edits.length > 0) {
+          changes.set(filePath, { file_path: filePath, edits });
+        }
+      } catch (e) {
+        logQueryError('rename:enumerate', e);
+      }
     }
 
     // Step 4: Apply or preview
