@@ -372,23 +372,42 @@ function synthesizeJavaAnonymousClassDeclarations(rootNode: SyntaxNode): Capture
   // constant's class extends its HOST ENUM (javac semantics), so the
   // inherits reference names the enum — giving `mroFor(E$N) ∋ E` and
   // keeping bare calls from the body to the enum's own helpers alive
-  // through the ownership gate's MRO arm. No receiver typeBinding piece:
-  // constants are not variable initializers; `E.A.hook()` dispatch rides
-  // the existing enum receiver machinery.
+  // through the ownership gate's MRO arm.
   for (const constant of rootNode.descendantsOfType('enum_constant')) {
-    const name = synthesizeJavaAnonymousClassName(constant);
-    if (name === undefined) continue;
-    const body = constant.childForFieldName?.('body');
-    if (body === null || body === undefined || body.type !== 'class_body') continue;
-    out.push({
-      '@declaration.class': nodeToCapture('@declaration.class', body),
-      '@declaration.name': syntheticCapture('@declaration.name', body, name),
-    });
     const hostEnum = javaEnclosingEnumNameOf(constant);
-    if (hostEnum !== undefined) {
+    const bodiedName = synthesizeJavaAnonymousClassName(constant);
+    if (bodiedName !== undefined) {
+      const body = constant.childForFieldName?.('body');
+      if (body !== null && body !== undefined && body.type === 'class_body') {
+        out.push({
+          '@declaration.class': nodeToCapture('@declaration.class', body),
+          '@declaration.name': syntheticCapture('@declaration.name', body, bodiedName),
+        });
+        if (hostEnum !== undefined) {
+          out.push({
+            '@reference.inherits': nodeToCapture('@reference.inherits', body),
+            '@reference.name': syntheticCapture('@reference.name', body, hostEnum),
+          });
+        }
+      }
+    }
+
+    // Receiver dispatch (#2561): `E.CONST.method()` resolves through the
+    // generic compound-receiver chain walk, which looks up each dotted
+    // segment via the owning class scope's `typeBindings` map — the same
+    // mechanism a field declaration uses (`private User user;` binds
+    // `user` on the class scope). Binding the constant's own simple name
+    // there — to its synthesized `E$N` class when bodied (MRO includes E,
+    // so members inherited from the enum still resolve), or to the host
+    // enum itself when body-less — makes `E.CONST.method()` resolve with
+    // no changes to the shared receiver-binding machinery.
+    const constantNameNode = constant.childForFieldName?.('name');
+    const constantType = bodiedName ?? hostEnum;
+    if (constantNameNode !== null && constantNameNode !== undefined && constantType !== undefined) {
       out.push({
-        '@reference.inherits': nodeToCapture('@reference.inherits', body),
-        '@reference.name': syntheticCapture('@reference.name', body, hostEnum),
+        '@type-binding.annotation': nodeToCapture('@type-binding.annotation', constant),
+        '@type-binding.name': nodeToCapture('@type-binding.name', constantNameNode),
+        '@type-binding.type': syntheticCapture('@type-binding.type', constant, constantType),
       });
     }
   }
