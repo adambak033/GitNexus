@@ -7,6 +7,7 @@ import {
   isHardcodedIgnoredDirectory,
   loadIgnoreRules,
   createIgnoreFilter,
+  getGlobalIgnorePath,
 } from '../../src/config/ignore-service.js';
 import { _captureLogger } from '../../src/core/logger.js';
 
@@ -657,4 +658,117 @@ describe('loadIgnoreRules — GITNEXUS_NO_GITIGNORE env var', () => {
       await fs.unlink(path.join(tmpDir, '.gitnexusignore'));
     }
   });
+});
+
+// ─── User-level global ignore file (#2606) ───────────────────────────
+//
+// IgnoreService previously read only per-repo .gitignore/.gitnexusignore.
+// #2606 asked for a global layer so an exclusion meant to apply to every
+// indexed repo is declared once, under the existing GITNEXUS_HOME/~/.gitnexus
+// global directory (same one that already holds registry.json/config.json),
+// rather than being repeated per repo or hand-patched into node_modules.
+//
+// Precedence: the global file is added to the `ignore` instance BEFORE
+// .gitignore/.gitnexusignore, so per-repo rules can negate it — the same
+// last-add-wins mechanism the #771 tests above already lock in one layer up.
+describe('loadIgnoreRules — user-level global ignore file (#2606)', () => {
+  let repoDir: string;
+  let globalHomeDir: string;
+  let originalGitnexusHome: string | undefined;
+  let originalNoGlobalIgnore: string | undefined;
+
+  beforeEach(async () => {
+    repoDir = await fs.mkdtemp(path.join(os.tmpdir(), 'gn-global-ignore-repo-'));
+    globalHomeDir = await fs.mkdtemp(path.join(os.tmpdir(), 'gn-global-ignore-home-'));
+    originalGitnexusHome = process.env.GITNEXUS_HOME;
+    originalNoGlobalIgnore = process.env.GITNEXUS_NO_GLOBAL_IGNORE;
+    process.env.GITNEXUS_HOME = globalHomeDir;
+  });
+
+  afterEach(async () => {
+    if (originalGitnexusHome === undefined) {
+      delete process.env.GITNEXUS_HOME;
+    } else {
+      process.env.GITNEXUS_HOME = originalGitnexusHome;
+    }
+    if (originalNoGlobalIgnore === undefined) {
+      delete process.env.GITNEXUS_NO_GLOBAL_IGNORE;
+    } else {
+      process.env.GITNEXUS_NO_GLOBAL_IGNORE = originalNoGlobalIgnore;
+    }
+    await fs.rm(repoDir, { recursive: true, force: true });
+    await fs.rm(globalHomeDir, { recursive: true, force: true });
+  });
+
+  it('getGlobalIgnorePath resolves under GITNEXUS_HOME', () => {
+    expect(getGlobalIgnorePath()).toBe(path.join(globalHomeDir, 'ignore'));
+  });
+
+  it('honours rules from the global ignore file when no per-repo files exist', async () => {
+    await fs.writeFile(getGlobalIgnorePath(), 'docs/\n');
+    const ig = await loadIgnoreRules(repoDir);
+    expect(ig).not.toBeNull();
+    expect(ig!.ignores('docs/guide.md')).toBe(true);
+    expect(ig!.ignores('src/index.ts')).toBe(false);
+  });
+
+  it('per-repo .gitnexusignore can negate a global-ignore rule', async () => {
+    await fs.writeFile(getGlobalIgnorePath(), 'docs/\n');
+    await fs.writeFile(path.join(repoDir, '.gitnexusignore'), '!docs/\n');
+    const ig = await loadIgnoreRules(repoDir);
+    expect(ig).not.toBeNull();
+    expect(ig!.ignores('docs/guide.md')).toBe(false);
+  });
+
+  it('GITNEXUS_NO_GLOBAL_IGNORE skips the global file entirely', async () => {
+    await fs.writeFile(getGlobalIgnorePath(), 'docs/\n');
+    process.env.GITNEXUS_NO_GLOBAL_IGNORE = '1';
+    const ig = await loadIgnoreRules(repoDir);
+    expect(ig).toBeNull();
+  });
+
+  it('noGlobalIgnore option skips the global file entirely', async () => {
+    await fs.writeFile(getGlobalIgnorePath(), 'docs/\n');
+    const ig = await loadIgnoreRules(repoDir, { noGlobalIgnore: true });
+    expect(ig).toBeNull();
+  });
+
+  it('missing global ignore file is a no-op (byte-identical to pre-#2606 behaviour)', async () => {
+    // globalHomeDir exists but has no `ignore` file in it, and no per-repo files either.
+    const ig = await loadIgnoreRules(repoDir);
+    expect(ig).toBeNull();
+  });
+
+  it('still combines global, .gitignore, and .gitnexusignore rules together', async () => {
+    await fs.writeFile(getGlobalIgnorePath(), 'docs/\n');
+    await fs.writeFile(path.join(repoDir, '.gitignore'), 'data/\n');
+    await fs.writeFile(path.join(repoDir, '.gitnexusignore'), 'vendor/\n');
+    const ig = await loadIgnoreRules(repoDir);
+    expect(ig).not.toBeNull();
+    expect(ig!.ignores('docs/guide.md')).toBe(true);
+    expect(ig!.ignores('data/file.txt')).toBe(true);
+    expect(ig!.ignores('vendor/lib.js')).toBe(true);
+    expect(ig!.ignores('src/index.ts')).toBe(false);
+  });
+
+  // Root bypasses POSIX read-permission checks (see the analogous EACCES
+  // test above for .gitignore), so this can't reproduce under uid=0.
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+    'warns on an unreadable global ignore file but does not throw',
+    async () => {
+      const globalIgnorePath = getGlobalIgnorePath();
+      await fs.writeFile(globalIgnorePath, 'docs/\n');
+      await fs.chmod(globalIgnorePath, 0o000);
+
+      const cap = _captureLogger();
+      const ig = await loadIgnoreRules(repoDir);
+      expect(ig).toBeNull();
+      expect(
+        cap.records().some((r) => String(r.msg ?? '').includes('global ignore file')),
+      ).toBe(true);
+
+      cap.restore();
+      await fs.chmod(globalIgnorePath, 0o644);
+    },
+  );
 });
