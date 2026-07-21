@@ -1969,7 +1969,9 @@ describe('Rust dyn trait-object dispatch (#2604)', () => {
 
   it('emits exactly one CALLS edge from calls_via_dyn(b: &dyn Behaviour) to trait_target', () => {
     const calls = getRelationships(result, 'CALLS');
-    const dynCalls = calls.filter((c) => c.source === 'calls_via_dyn' && c.target === 'trait_target');
+    const dynCalls = calls.filter(
+      (c) => c.source === 'calls_via_dyn' && c.target === 'trait_target',
+    );
     expect(dynCalls.length).toBe(1);
   });
 });
