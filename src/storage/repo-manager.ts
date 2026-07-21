@@ -437,8 +437,15 @@ export interface RepoMeta {
  * `Record` node and its `HAS_METHOD` edges for every unchanged record file
  * (same v7 contract: new nodes/edges the incremental path would otherwise
  * never backfill); force a full re-analyze instead.
+ * v11: Rust abstract trait methods (`fn foo(&self) -> T;`, no body) now get a
+ * scope + declaration capture (#2604): RUST_SCOPE_QUERY had no
+ * `function_signature_item` pattern, so a `&dyn Trait` receiver could never
+ * dispatch a CALLS edge to the trait's own method. Same v7/v10 contract: the
+ * incremental write set only covers changed files, so a top-up against a
+ * pre-v11 index would keep silently missing these CALLS edges for every
+ * unchanged Rust trait file; force a full re-analyze instead.
  */
-export const INCREMENTAL_SCHEMA_VERSION = 10;
+export const INCREMENTAL_SCHEMA_VERSION = 11;
 
 export interface IndexedRepo {
   repoPath: string;
