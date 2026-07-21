@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { execSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
@@ -12,6 +12,8 @@ import {
   sanitizeRepoName,
   getDefaultBranch,
   getCurrentBranch,
+  getGitInfoExcludePath,
+  getCoreExcludesFilePath,
 } from '../../src/storage/git.js';
 
 // Mock child_process.execSync
@@ -285,6 +287,78 @@ describe('git utilities', () => {
     it('returns null for empty URL', () => {
       expect(parseRepoNameFromUrl('')).toBeNull();
       expect(parseRepoNameFromUrl(null)).toBeNull();
+    });
+  });
+
+  describe('getGitInfoExcludePath (#2606)', () => {
+    it('joins info/exclude onto the absolute git-common-dir', () => {
+      mockExecSync.mockReturnValueOnce(Buffer.from('/repo/.git\n'));
+      expect(getGitInfoExcludePath('/repo')).toBe(path.join('/repo/.git', 'info', 'exclude'));
+      expect(mockExecSync).toHaveBeenCalledWith(
+        'git rev-parse --path-format=absolute --git-common-dir',
+        expect.objectContaining({ cwd: '/repo', windowsHide: true }),
+      );
+    });
+
+    it('resolves the worktree-shared common dir, not a per-worktree one', () => {
+      // $GIT_COMMON_DIR is the same for the main checkout and every linked
+      // worktree, so a worktree's info/exclude resolves to the shared main repo.
+      mockExecSync.mockReturnValueOnce(Buffer.from('/repo/.git\n'));
+      expect(getGitInfoExcludePath('/repo/.worktrees/feature')).toBe(
+        path.join('/repo/.git', 'info', 'exclude'),
+      );
+    });
+
+    it('returns null when not inside a git repository', () => {
+      mockExecSync.mockImplementationOnce(() => {
+        throw new Error('not a git repo');
+      });
+      expect(getGitInfoExcludePath('/not-a-repo')).toBeNull();
+    });
+  });
+
+  describe('getCoreExcludesFilePath (#2606)', () => {
+    let originalXdgConfigHome: string | undefined;
+
+    beforeEach(() => {
+      originalXdgConfigHome = process.env.XDG_CONFIG_HOME;
+    });
+
+    afterEach(() => {
+      if (originalXdgConfigHome === undefined) {
+        delete process.env.XDG_CONFIG_HOME;
+      } else {
+        process.env.XDG_CONFIG_HOME = originalXdgConfigHome;
+      }
+    });
+
+    it('returns the configured core.excludesFile value', () => {
+      mockExecSync.mockReturnValueOnce(Buffer.from('/home/user/.gitignore_global\n'));
+      expect(getCoreExcludesFilePath('/repo')).toBe('/home/user/.gitignore_global');
+      expect(mockExecSync).toHaveBeenCalledWith(
+        'git config --get --type=path core.excludesFile',
+        expect.objectContaining({ cwd: '/repo', windowsHide: true }),
+      );
+    });
+
+    it("falls back to git's documented default ($XDG_CONFIG_HOME/git/ignore) when unset", () => {
+      mockExecSync.mockImplementationOnce(() => {
+        throw new Error('key not set'); // git config --get exits 1 when unset
+      });
+      process.env.XDG_CONFIG_HOME = '/home/user/.config';
+      expect(getCoreExcludesFilePath('/repo')).toBe(
+        path.join('/home/user/.config', 'git', 'ignore'),
+      );
+    });
+
+    it('falls back to the default even when git is unavailable entirely', () => {
+      mockExecSync.mockImplementationOnce(() => {
+        throw new Error('git: command not found');
+      });
+      process.env.XDG_CONFIG_HOME = '/home/user/.config';
+      expect(getCoreExcludesFilePath('/anything')).toBe(
+        path.join('/home/user/.config', 'git', 'ignore'),
+      );
     });
   });
 });

@@ -1,6 +1,7 @@
 import { execFileSync, execSync } from 'child_process';
 import { statSync } from 'fs';
 import path from 'path';
+import os from 'os';
 
 // Git utilities for repository detection, commit tracking, and diff analysis
 
@@ -207,6 +208,59 @@ export const getCanonicalRepoRoot = (fromPath: string): string | null => {
   } catch {
     return null;
   }
+};
+
+/**
+ * Path to the repo's `$GIT_COMMON_DIR/info/exclude` file — git's own
+ * per-repo, untracked exclude list (same tier as `.gitignore` in
+ * precedence, but never committed, so it works even when the caller has
+ * no write access to the repo's tracked content). Shared across every
+ * linked worktree of a repo, matching git's own resolution (#2606).
+ *
+ * Returns `null` when `fromPath` is not inside a git repository or `git`
+ * is unavailable; callers should treat that the same as "no file".
+ */
+export const getGitInfoExcludePath = (fromPath: string): string | null => {
+  try {
+    const commonDir = chompGitOutput(
+      execSync('git rev-parse --path-format=absolute --git-common-dir', {
+        cwd: fromPath,
+        stdio: ['ignore', 'pipe', 'ignore'],
+        windowsHide: true,
+      }),
+    );
+    if (!commonDir) return null;
+    return path.join(path.resolve(commonDir), 'info', 'exclude');
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * Path to git's own global, all-repos ignore file: the value of
+ * `core.excludesFile` (any config scope — system/global/local, resolved
+ * the same way `git` itself would from `fromPath`), or git's documented
+ * default of `$XDG_CONFIG_HOME/git/ignore` when unset (gitignore(5)).
+ * Lowest-precedence source, mirroring git's own behavior (#2606).
+ *
+ * Never throws: an unset key or unavailable `git` falls through to the
+ * default path, which is always computable without `git`.
+ */
+export const getCoreExcludesFilePath = (fromPath: string): string => {
+  try {
+    const configured = chompGitOutput(
+      execSync('git config --get --type=path core.excludesFile', {
+        cwd: fromPath,
+        stdio: ['ignore', 'pipe', 'ignore'],
+        windowsHide: true,
+      }),
+    );
+    if (configured) return configured;
+  } catch {
+    // Unset, or git unavailable — fall through to git's documented default.
+  }
+  const xdgConfigHome = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config');
+  return path.join(xdgConfigHome, 'git', 'ignore');
 };
 
 /**
