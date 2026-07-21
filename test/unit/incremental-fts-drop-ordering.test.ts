@@ -74,7 +74,11 @@ describe('runFullAnalysis incremental writeback — FTS drop-before-delete order
       // threshold (50 files) on this 7-file mini-repo, so it takes the
       // non-escalated (surgical) incremental branch this test targets.
       const handlerPath = path.join(repo.dbPath, 'src', 'handler.ts');
-      await writeFile(handlerPath, (await readFile(handlerPath, 'utf-8')) + '\n// #2589 ordering-test touch\n', 'utf-8');
+      await writeFile(
+        handlerPath,
+        (await readFile(handlerPath, 'utf-8')) + '\n// #2589 ordering-test touch\n',
+        'utf-8',
+      );
       execSync('git -c user.name=test -c user.email=t@t -c commit.gpgsign=false add -A', {
         cwd: repo.dbPath,
         stdio: 'pipe',
