@@ -1868,7 +1868,9 @@ export class LocalBackend {
     await this.ensureInitialized(repo);
 
     const processLimit = params.limit || 5;
-    const maxSymbolsPerProcess = params.max_symbols || 10;
+    // #trpc-fork: default raised 10 → 25 to fit a procedure→workflow→helper
+    // chain inside a single page. The tool schema mirrors this default.
+    const maxSymbolsPerProcess = params.max_symbols || 25;
     const includeContent = params.include_content ?? false;
     const searchQuery = rawQuery.trim();
 
@@ -1939,8 +1941,10 @@ export class LocalBackend {
         heuristicLabel: string;
         processType: string;
         stepCount: number;
+        entryPointId: string;
         totalScore: number;
         cohesionBoost: number;
+        route?: { url: string; method: string };
         symbols: any[];
       }
     >();
@@ -1977,13 +1981,16 @@ export class LocalBackend {
 
       // Processes each symbol participates in. `n.id AS nodeId` is prepended as
       // column 0 so rows from many symbols can be re-associated to their symbol.
+      // #trpc-fork: also fetch `p.entryPointId` so we can (a) mark the entry
+      // symbol with `is_entry_point: true` in `process_symbols` and (b) look up
+      // the route attached to this process (if any) via ENTRY_POINT_OF.
       try {
         const rows = await executeParameterized(
           repo.lbugPath,
           `
           MATCH (n)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
           WHERE n.id IN $nodeIds
-          RETURN n.id AS nodeId, p.id AS pid, p.label AS label, p.heuristicLabel AS heuristicLabel, p.processType AS processType, p.stepCount AS stepCount, r.step AS step
+          RETURN n.id AS nodeId, p.id AS pid, p.label AS label, p.heuristicLabel AS heuristicLabel, p.processType AS processType, p.stepCount AS stepCount, r.step AS step, p.entryPointId AS entryPointId
         `,
           { nodeIds: ids },
         );
@@ -2094,6 +2101,10 @@ export class LocalBackend {
           const pType = row.processType ?? row[4];
           const stepCount = row.stepCount ?? row[5];
           const step = row.step ?? row[6];
+          // #trpc-fork: entryPointId is the new column from STEP_IN_PROCESS.
+          // Falls back to '' when the Process node predates the property or
+          // the column is null (older index).
+          const entryPointId = row.entryPointId ?? row[7] ?? '';
 
           if (!processMap.has(pid)) {
             processMap.set(pid, {
@@ -2102,8 +2113,10 @@ export class LocalBackend {
               heuristicLabel: hLabel,
               processType: pType,
               stepCount,
+              entryPointId,
               totalScore: 0,
               cohesionBoost: 0,
+              route: undefined,
               symbols: [],
             });
           }
@@ -2122,11 +2135,67 @@ export class LocalBackend {
 
     timer.stop(); // symbol_lookup
 
+    // #trpc-fork: batched ENTRY_POINT_OF lookup — for each process, find the
+    // Route node linked to the process's entry-point symbol (or to the process
+    // directly). This surfaces the HTTP route (e.g. "/trpc/cabinet.setProviderCap")
+    // alongside each process in `query` results so agents don't need a separate
+    // `route_map` call. Also handles upstream's link shape where the edge goes
+    // from Route → Process directly.
+    const routeByProcessId = new Map<string, { url: string; method: string }>();
+    if (processMap.size > 0) {
+      try {
+        const pidList = Array.from(processMap.keys());
+        for (let i = 0; i < pidList.length; i += QUERY_CHUNK_SIZE) {
+          const pidChunk = pidList.slice(i, i + QUERY_CHUNK_SIZE);
+          // Try two edge shapes:
+          //   (1) Route -[ENTRY_POINT_OF]-> Process   (upstream processes.ts)
+          //   (2) Route -[ENTRY_POINT_OF]-> <entryFn> -[STEP_IN_PROCESS]-> Process
+          //     (when the edge is anchored on the entry symbol instead of the
+          //     Process node — older variant we still emit for tRPC handlers)
+          const routeRows = await executeParameterized(
+            repo.lbugPath,
+            `
+            MATCH (route:Route)-[r:CodeRelation {type: 'ENTRY_POINT_OF'}]->(p:Process)
+            WHERE p.id IN $pids
+            RETURN p.id AS pid, route.name AS url, route.method AS method
+            UNION ALL
+            MATCH (route:Route)-[r:CodeRelation {type: 'ENTRY_POINT_OF'}]->(entryFn)
+            WHERE entryFn.id IN $entryIds
+            RETURN entryFn.id AS pid, route.name AS url, route.method AS method
+          `,
+            {
+              pids: pidChunk,
+              entryIds: pidChunk
+                .map((pid) => processMap.get(pid)?.entryPointId)
+                .filter((id): id is string => !!id && id.length > 0),
+            },
+          );
+          for (const row of routeRows) {
+            const targetPid = row.pid ?? row[0];
+            const url = row.url ?? row[1];
+            const method = row.method ?? row[2];
+            // entryFn.id from shape (2) is the entry symbol's id, not a pid —
+            // re-anchor it to the process that owns this entry symbol.
+            const owningPid = processMap.has(targetPid)
+              ? targetPid
+              : Array.from(processMap.values()).find((p) => p.entryPointId === targetPid)?.id;
+            if (owningPid && !routeByProcessId.has(owningPid)) {
+              routeByProcessId.set(owningPid, { url, method: method || '' });
+            }
+          }
+        }
+      } catch (e) {
+        // Best-effort enrichment — never fail the query.
+        logQueryError('query:route-lookup', e);
+      }
+    }
+
     // Step 3: Rank processes by aggregate score + internal cohesion boost
     timer.start('ranking');
     const rankedProcesses = Array.from(processMap.values())
       .map((p) => ({
         ...p,
+        route: routeByProcessId.get(p.id),
         priority: p.totalScore + p.cohesionBoost * 0.1, // cohesion as subtle ranking signal
       }))
       .sort((a, b) => b.priority - a.priority)
@@ -2142,12 +2211,15 @@ export class LocalBackend {
       symbol_count: p.symbols.length,
       process_type: p.processType,
       step_count: p.stepCount,
+      ...(p.route ? { route: p.route.url, method: p.route.method || undefined } : {}),
     }));
 
     const processSymbols = rankedProcesses.flatMap((p) =>
       p.symbols.slice(0, maxSymbolsPerProcess).map((s) => ({
         ...s,
-        // remove internal fields
+        // #trpc-fork: mark the entry-point symbol so an agent reading the
+        // process can tell procedure vs. workflow vs. helper at a glance.
+        ...(p.entryPointId && s.id === p.entryPointId ? { is_entry_point: true } : {}),
       })),
     );
 
@@ -3027,6 +3099,7 @@ export class LocalBackend {
       file_path?: string;
       kind?: string;
       include_content?: boolean;
+      chain_depth?: number;
     },
   ): Promise<any> {
     try {
@@ -3051,11 +3124,12 @@ export class LocalBackend {
       file_path?: string;
       kind?: string;
       include_content?: boolean;
+      chain_depth?: number;
     },
   ): Promise<any> {
     await this.ensureInitialized(repo);
 
-    const { name, uid, file_path, kind, include_content } = params;
+    const { name, uid, file_path, kind, include_content, chain_depth } = params;
 
     if (!name && !uid) {
       return { error: 'Either "name" or "uid" parameter is required.' };
@@ -3092,13 +3166,27 @@ export class LocalBackend {
     const symId = sym.id;
 
     // Categorized incoming refs
+    // ORDER BY pushes test-file callers to the end so they don't saturate the
+    // LIMIT when a workflow has many test consumers but also real callers
+    // (e.g. tRPC procedures, which were previously hidden behind test mocks).
+    // LadybugDB has no regex match operator, so we use CONTAINS/ENDS WITH.
     const incomingRows = await executeParameterized(
       repo.lbugPath,
       `
       MATCH (caller)-[r:CodeRelation]->(n {id: $symId})
-      WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'USES', 'HAS_METHOD', 'HAS_PROPERTY', 'METHOD_OVERRIDES', 'OVERRIDES', 'METHOD_IMPLEMENTS', 'ACCESSES']
-      RETURN r.type AS relType, caller.id AS uid, caller.name AS name, caller.filePath AS filePath, labels(caller)[0] AS kind
-      LIMIT 30
+      WHERE r.type = 'CALLS' OR r.type = 'IMPORTS' OR r.type = 'EXTENDS' OR r.type = 'IMPLEMENTS' OR r.type = 'USES' OR r.type = 'HAS_METHOD' OR r.type = 'HAS_PROPERTY' OR r.type = 'METHOD_OVERRIDES' OR r.type = 'OVERRIDES' OR r.type = 'METHOD_IMPLEMENTS' OR r.type = 'ACCESSES'
+      RETURN r.type AS relType, caller.id AS uid, caller.name AS name, caller.filePath AS filePath, labels(caller)[0] AS kind,
+             CASE
+               WHEN caller.filePath IS NULL THEN 0
+               WHEN caller.filePath CONTAINS '.test.' THEN 1
+               WHEN caller.filePath CONTAINS '.spec.' THEN 1
+               WHEN caller.filePath CONTAINS '__tests__/' THEN 1
+               WHEN caller.filePath CONTAINS '/test/' THEN 1
+               WHEN caller.filePath CONTAINS '/tests/' THEN 1
+               ELSE 0
+             END AS isTest
+      ORDER BY isTest ASC, caller.filePath ASC, caller.name ASC
+      LIMIT 100
     `,
       { symId },
     );
@@ -3145,7 +3233,7 @@ export class LocalBackend {
             MATCH (n)-[hm:CodeRelation]->(ctor:Constructor)
             WHERE n.id = $symId AND hm.type = 'HAS_METHOD'
             MATCH (caller)-[r:CodeRelation]->(ctor)
-            WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'USES', 'ACCESSES']
+            WHERE r.type = 'CALLS' OR r.type = 'IMPORTS' OR r.type = 'EXTENDS' OR r.type = 'IMPLEMENTS' OR r.type = 'USES' OR r.type = 'ACCESSES'
             RETURN r.type AS relType, caller.id AS uid, caller.name AS name, caller.filePath AS filePath, labels(caller)[0] AS kind
             LIMIT 30
           `,
@@ -3157,7 +3245,7 @@ export class LocalBackend {
             MATCH (f:File)-[rel:CodeRelation]->(n)
             WHERE n.id = $symId AND rel.type = 'DEFINES'
             MATCH (caller)-[r:CodeRelation]->(f)
-            WHERE r.type IN ['CALLS', 'IMPORTS']
+            WHERE r.type = 'CALLS' OR r.type = 'IMPORTS'
             RETURN r.type AS relType, caller.id AS uid, caller.name AS name, caller.filePath AS filePath, labels(caller)[0] AS kind
             LIMIT 30
           `,
@@ -3166,12 +3254,12 @@ export class LocalBackend {
             executeParameterized(
               repo.lbugPath,
               `
-            MATCH (p:\`Property\`)
+            MATCH (p:Property)
             WHERE p.declaredType = $name
                OR p.declaredType STARTS WITH $genericPrefix
                OR p.declaredType CONTAINS $genericArg
             MATCH (caller)-[r:CodeRelation]->(p)
-            WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'USES', 'ACCESSES']
+            WHERE r.type = 'CALLS' OR r.type = 'IMPORTS' OR r.type = 'EXTENDS' OR r.type = 'IMPLEMENTS' OR r.type = 'USES' OR r.type = 'ACCESSES'
             RETURN r.type AS relType, caller.id AS uid, caller.name AS name, caller.filePath AS filePath, labels(caller)[0] AS kind
             LIMIT 30
           `,
@@ -3220,13 +3308,25 @@ export class LocalBackend {
     }
 
     // Categorized outgoing refs
+    // Same test-last ORDER BY as the incoming query so real callees (e.g.
+    // workflow functions) surface ahead of test helpers when both appear.
     const outgoingRows = await executeParameterized(
       repo.lbugPath,
       `
       MATCH (n {id: $symId})-[r:CodeRelation]->(target)
-      WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'USES', 'HAS_METHOD', 'HAS_PROPERTY', 'METHOD_OVERRIDES', 'OVERRIDES', 'METHOD_IMPLEMENTS', 'ACCESSES']
-      RETURN r.type AS relType, target.id AS uid, target.name AS name, target.filePath AS filePath, labels(target)[0] AS kind
-      LIMIT 30
+      WHERE r.type = 'CALLS' OR r.type = 'IMPORTS' OR r.type = 'EXTENDS' OR r.type = 'IMPLEMENTS' OR r.type = 'USES' OR r.type = 'HAS_METHOD' OR r.type = 'HAS_PROPERTY' OR r.type = 'METHOD_OVERRIDES' OR r.type = 'OVERRIDES' OR r.type = 'METHOD_IMPLEMENTS' OR r.type = 'ACCESSES'
+      RETURN r.type AS relType, target.id AS uid, target.name AS name, target.filePath AS filePath, labels(target)[0] AS kind,
+             CASE
+               WHEN target.filePath IS NULL THEN 0
+               WHEN target.filePath CONTAINS '.test.' THEN 1
+               WHEN target.filePath CONTAINS '.spec.' THEN 1
+               WHEN target.filePath CONTAINS '__tests__/' THEN 1
+               WHEN target.filePath CONTAINS '/test/' THEN 1
+               WHEN target.filePath CONTAINS '/tests/' THEN 1
+               ELSE 0
+             END AS isTest
+      ORDER BY isTest ASC, target.filePath ASC, target.name ASC
+      LIMIT 100
     `,
       { symId },
     );
@@ -3331,6 +3431,22 @@ export class LocalBackend {
     // above (concurrent with methodMetadata).
     const [epistemic, beanMetadata] = await Promise.all([epistemicPromise, beanMetadataPromise]);
 
+    // #trpc-fork: optional BFS chain expansion. When `chain_depth` > 0, walk
+    // CALLS edges up to N hops from this symbol and return the layered result
+    // as a `chain` field. This reveals the full procedure→workflow→sub-workflow
+    // call chain in ONE call instead of forcing the agent to chain context()
+    // invocations. Test-file nodes are deprioritized (pushed to the end of each
+    // depth layer) so real callers/callees surface first.
+    let chain: any[] | undefined;
+    const requestedDepth = Math.max(0, Math.min(3, Number(chain_depth ?? 0) || 0));
+    if (requestedDepth > 0) {
+      try {
+        chain = await this._computeContextChain(repo, symId, requestedDepth);
+      } catch (e) {
+        logQueryError('context:chain-bfs', e);
+      }
+    }
+
     return {
       status: 'found',
       symbol: {
@@ -3347,6 +3463,7 @@ export class LocalBackend {
       ...epistemic,
       incoming: categorize(incomingRows),
       outgoing: categorize(outgoingRows),
+      ...(chain ? { chain } : {}),
       ...(typedPropertyRows.length > 0
         ? {
             typed_properties: typedPropertyRows.map((r: any) => ({
@@ -3365,6 +3482,143 @@ export class LocalBackend {
         step_count: r.stepCount || r[3],
       })),
     };
+  }
+
+  /**
+   * #trpc-fork: BFS chain expansion for `context({chain_depth: N})`.
+   *
+   * Walks CALLS edges up to `maxDepth` hops from the seed symbol, in BOTH
+   * directions (upstream callers AND downstream callees), and returns the
+   * layered result so an agent can see the full procedure→workflow→sub-workflow
+   * chain in a single call instead of chaining context() invocations.
+   *
+   * Output shape (one entry per depth, depth 0 = the seed itself):
+   *   [
+   *     { depth: 0, symbol: {seed} },
+   *     { depth: 1, upstream: [...callers], downstream: [...callees] },
+   *     { depth: 2, upstream: [...], downstream: [...] },
+   *     ...
+   *   ]
+   *
+   * Test-file nodes are deprioritized (pushed to the end of each list) so real
+   * callers/callees surface first — same ORDER BY logic as the main incoming
+   * /outgoing queries (Fix A). Cycles are broken via a global `visited` set
+   * (a node visited at depth N is not re-emitted at depth N+1 even if it has
+   * another path back into the frontier). Hard cap of 50 nodes per direction
+   * per depth layer keeps the response bounded.
+   */
+  private async _computeContextChain(
+    repo: RepoHandle,
+    seedId: string,
+    maxDepth: number,
+  ): Promise<
+    Array<{
+      depth: number;
+      upstream?: any[];
+      downstream?: any[];
+    }>
+  > {
+    // LadybugDB has no regex operator — use CONTAINS clauses. Kept as a string
+    // fragment so both the upstream and downstream queries below share it.
+    const TEST_ORDER_EXPR = `
+      CASE
+        WHEN n.filePath IS NULL THEN 0
+        WHEN n.filePath CONTAINS '.test.' THEN 1
+        WHEN n.filePath CONTAINS '.spec.' THEN 1
+        WHEN n.filePath CONTAINS '__tests__/' THEN 1
+        WHEN n.filePath CONTAINS '/test/' THEN 1
+        WHEN n.filePath CONTAINS '/tests/' THEN 1
+        ELSE 0
+      END
+    `;
+
+    const layers: Array<{ depth: number; upstream?: any[]; downstream?: any[] }> = [];
+    const visited = new Set<string>([seedId]);
+    let upstreamFrontier = [seedId];
+    let downstreamFrontier = [seedId];
+
+    for (let depth = 1; depth <= maxDepth; depth++) {
+      const layer: { depth: number; upstream?: any[]; downstream?: any[] } = { depth };
+
+      // Upstream (callers) — MATCH (caller)-[CALLS]->(n)
+      if (upstreamFrontier.length > 0) {
+        try {
+          const rows = await executeParameterized(
+            repo.lbugPath,
+            `
+            MATCH (caller)-[r:CodeRelation]->(n)
+            WHERE r.type = 'CALLS' AND n.id IN $frontier
+              AND NOT caller.id IN $visited
+            RETURN caller.id AS uid, caller.name AS name,
+                   caller.filePath AS filePath, labels(caller)[0] AS kind,
+                   ${TEST_ORDER_EXPR} AS isTest
+            ORDER BY isTest ASC, caller.filePath ASC, caller.name ASC
+            LIMIT 50
+          `,
+            { frontier: upstreamFrontier, visited: Array.from(visited) },
+          );
+          if (rows.length > 0) {
+            const fresh = rows.filter((r: any) => !visited.has(r.uid));
+            layer.upstream = fresh.map((r: any) => ({
+              uid: r.uid,
+              name: r.name,
+              filePath: r.filePath,
+              kind: r.kind,
+            }));
+            for (const r of fresh) visited.add(r.uid);
+            upstreamFrontier = fresh.map((r: any) => r.uid);
+          } else {
+            upstreamFrontier = [];
+          }
+        } catch (e) {
+          logQueryError('context:chain-bfs:upstream', e);
+          upstreamFrontier = [];
+        }
+      }
+
+      // Downstream (callees) — MATCH (n)-[CALLS]->(target)
+      if (downstreamFrontier.length > 0) {
+        try {
+          const rows = await executeParameterized(
+            repo.lbugPath,
+            `
+            MATCH (n)-[r:CodeRelation]->(target)
+            WHERE r.type = 'CALLS' AND n.id IN $frontier
+              AND NOT target.id IN $visited
+            RETURN target.id AS uid, target.name AS name,
+                   target.filePath AS filePath, labels(target)[0] AS kind,
+                   ${TEST_ORDER_EXPR} AS isTest
+            ORDER BY isTest ASC, target.filePath ASC, target.name ASC
+            LIMIT 50
+          `,
+            { frontier: downstreamFrontier, visited: Array.from(visited) },
+          );
+          if (rows.length > 0) {
+            const fresh = rows.filter((r: any) => !visited.has(r.uid));
+            layer.downstream = fresh.map((r: any) => ({
+              uid: r.uid,
+              name: r.name,
+              filePath: r.filePath,
+              kind: r.kind,
+            }));
+            for (const r of fresh) visited.add(r.uid);
+            downstreamFrontier = fresh.map((r: any) => r.uid);
+          } else {
+            downstreamFrontier = [];
+          }
+        } catch (e) {
+          logQueryError('context:chain-bfs:downstream', e);
+          downstreamFrontier = [];
+        }
+      }
+
+      // Stop early if both frontiers collapsed.
+      if (!layer.upstream && !layer.downstream) break;
+      layers.push(layer);
+      if (upstreamFrontier.length === 0 && downstreamFrontier.length === 0) break;
+    }
+
+    return layers;
   }
 
   /**

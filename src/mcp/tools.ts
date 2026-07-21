@@ -166,8 +166,9 @@ SERVICE: optional monorepo path prefix (POSIX-style, case-sensitive segments). W
         },
         max_symbols: {
           type: 'number',
-          description: 'Max symbols per process (default: 10)',
-          default: 10,
+          description:
+            'Max symbols per process (default: 25 — raised from 10 so a procedure→workflow→helper chain fits in a single page without a follow-up context() call)',
+          default: 25,
           minimum: 1,
           maximum: 200,
         },
@@ -310,6 +311,14 @@ SERVICE: optional monorepo path prefix (case-sensitive path segments). When "rep
           type: 'boolean',
           description: 'Include full symbol source code (default: false)',
           default: false,
+        },
+        chain_depth: {
+          type: 'integer',
+          minimum: 0,
+          maximum: 3,
+          default: 0,
+          description:
+            'Optional: walk CALLS edges up to N hops (0-3) and return the result as a `chain` field (downstream callees + upstream callers layered by depth). 0 = disabled (default). 1 = direct neighbours only. 2-3 = procedure→workflow→sub-workflow depth. Useful for revealing the full tRPC/RPC call chain in a single call instead of chaining context() invocations.',
         },
         maxTokens: {
           type: 'integer',
