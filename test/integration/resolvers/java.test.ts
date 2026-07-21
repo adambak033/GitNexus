@@ -1175,6 +1175,40 @@ describe('Java chained method call resolution', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Java record: container node + HAS_METHOD edges
+// Regression test for #2564: JAVA_QUERIES previously had no @definition.record
+// capture, so a record never got a Class/Record graph node — its methods
+// existed as ownerless orphans with no HAS_METHOD edge.
+// ---------------------------------------------------------------------------
+
+describe('Java record method resolution (#2564)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'java-record-methods'), () => {});
+  }, 60000);
+
+  it('detects a Record node for Point', () => {
+    const records = getNodesByLabel(result, 'Record');
+    expect(records).toContain('Point');
+  });
+
+  it('emits HAS_METHOD edges linking sum and scaled to Point', () => {
+    const hasMethod = getRelationships(result, 'HAS_METHOD');
+    const sumEdge = hasMethod.find((e) => e.source === 'Point' && e.target === 'sum');
+    const scaledEdge = hasMethod.find((e) => e.source === 'Point' && e.target === 'scaled');
+    expect(sumEdge).toBeDefined();
+    expect(scaledEdge).toBeDefined();
+  });
+
+  it('resolves scaled() calling sum() via a CALLS edge', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const sumCall = calls.find((c) => c.target === 'sum' && c.source === 'scaled');
+    expect(sumCall).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Java 16+ instanceof pattern variable: `if (obj instanceof User user)`
 // Phase 5.2: extractPatternBinding on instanceof_expression binds user → User.
 // Disambiguation: User.save vs Repo.save — only User.save should be called.
