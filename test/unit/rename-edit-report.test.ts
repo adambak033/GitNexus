@@ -66,9 +66,10 @@ const OCCURRENCE_LINES = RUST_SRC.split('\n')
  *  (the exact condition that made the old code report only the definition). */
 function stubbedBackend(): LocalBackend {
   const backend = new LocalBackend();
-  vi.spyOn(backend as unknown as { ensureInitialized: () => Promise<void> }, 'ensureInitialized').mockResolvedValue(
-    undefined,
-  );
+  vi.spyOn(
+    backend as unknown as { ensureInitialized: () => Promise<void> },
+    'ensureInitialized',
+  ).mockResolvedValue(undefined);
   vi.spyOn(backend as unknown as { context: () => Promise<unknown> }, 'context').mockResolvedValue({
     status: 'success',
     symbol: { name: 'rename_target', filePath: 'src/lib.rs', startLine: OCCURRENCE_LINES[0] },
@@ -96,7 +97,10 @@ describe('rename edit report is faithful to apply (#2605)', () => {
   it('previews every occurrence that apply will rewrite (dry_run)', async () => {
     const result = await (
       backend as unknown as { rename: (r: unknown, p: unknown) => Promise<any> }
-    ).rename({ repoPath: tmpDir }, { symbol_name: 'rename_target', new_name: 'renamed_fn', dry_run: true });
+    ).rename(
+      { repoPath: tmpDir },
+      { symbol_name: 'rename_target', new_name: 'renamed_fn', dry_run: true },
+    );
 
     expect(result.applied).toBe(false);
     expect(result.files_affected).toBe(1);
@@ -116,7 +120,10 @@ describe('rename edit report is faithful to apply (#2605)', () => {
   it('reports exactly what it wrote (apply)', async () => {
     const result = await (
       backend as unknown as { rename: (r: unknown, p: unknown) => Promise<any> }
-    ).rename({ repoPath: tmpDir }, { symbol_name: 'rename_target', new_name: 'renamed_fn', dry_run: false });
+    ).rename(
+      { repoPath: tmpDir },
+      { symbol_name: 'rename_target', new_name: 'renamed_fn', dry_run: false },
+    );
 
     expect(result.applied).toBe(true);
     expect(result.total_edits).toBe(OCCURRENCE_LINES.length);
