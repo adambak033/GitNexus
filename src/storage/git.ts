@@ -210,6 +210,18 @@ export const getCanonicalRepoRoot = (fromPath: string): string | null => {
   }
 };
 
+// getGitInfoExcludePath/getCoreExcludesFilePath are called once per repo
+// PER language/contract extractor during group sync (#2606) — an N-repo
+// group fans out to 6+ extractors each calling these, so an uncached
+// execSync per call turns into O(extractors × repos) blocking subprocess
+// spawns. Both resolve to the same value for the same fromPath for the
+// life of the process (git config/exclude files don't change mid-run), so
+// memoize by fromPath. ponytail: process-lifetime cache, never invalidated
+// — fine for one-shot CLI runs; the long-lived MCP server would need a
+// TTL or explicit invalidation if a user edits core.excludesFile mid-session.
+const gitInfoExcludePathCache = new Map<string, string | null>();
+const coreExcludesFilePathCache = new Map<string, string>();
+
 /**
  * Path to the repo's `$GIT_COMMON_DIR/info/exclude` file — git's own
  * per-repo, untracked exclude list (same tier as `.gitignore` in
@@ -221,6 +233,10 @@ export const getCanonicalRepoRoot = (fromPath: string): string | null => {
  * is unavailable; callers should treat that the same as "no file".
  */
 export const getGitInfoExcludePath = (fromPath: string): string | null => {
+  const cached = gitInfoExcludePathCache.get(fromPath);
+  if (cached !== undefined) return cached;
+
+  let result: string | null;
   try {
     const commonDir = chompGitOutput(
       execSync('git rev-parse --path-format=absolute --git-common-dir', {
@@ -229,11 +245,12 @@ export const getGitInfoExcludePath = (fromPath: string): string | null => {
         windowsHide: true,
       }),
     );
-    if (!commonDir) return null;
-    return path.join(path.resolve(commonDir), 'info', 'exclude');
+    result = commonDir ? path.join(path.resolve(commonDir), 'info', 'exclude') : null;
   } catch {
-    return null;
+    result = null;
   }
+  gitInfoExcludePathCache.set(fromPath, result);
+  return result;
 };
 
 /**
@@ -247,6 +264,10 @@ export const getGitInfoExcludePath = (fromPath: string): string | null => {
  * default path, which is always computable without `git`.
  */
 export const getCoreExcludesFilePath = (fromPath: string): string => {
+  const cached = coreExcludesFilePathCache.get(fromPath);
+  if (cached !== undefined) return cached;
+
+  let result: string | undefined;
   try {
     const configured = chompGitOutput(
       execSync('git config --get --type=path core.excludesFile', {
@@ -255,12 +276,16 @@ export const getCoreExcludesFilePath = (fromPath: string): string => {
         windowsHide: true,
       }),
     );
-    if (configured) return configured;
+    if (configured) result = configured;
   } catch {
     // Unset, or git unavailable — fall through to git's documented default.
   }
-  const xdgConfigHome = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config');
-  return path.join(xdgConfigHome, 'git', 'ignore');
+  if (!result) {
+    const xdgConfigHome = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config');
+    result = path.join(xdgConfigHome, 'git', 'ignore');
+  }
+  coreExcludesFilePathCache.set(fromPath, result);
+  return result;
 };
 
 /**

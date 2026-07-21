@@ -346,7 +346,10 @@ describe('git utilities', () => {
         throw new Error('key not set'); // git config --get exits 1 when unset
       });
       process.env.XDG_CONFIG_HOME = '/home/user/.config';
-      expect(getCoreExcludesFilePath('/repo')).toBe(
+      // Different fromPath than the "configured" test above — each function
+      // caches by fromPath (see below), so reusing '/repo' here would return
+      // that test's cached result instead of exercising the fallback.
+      expect(getCoreExcludesFilePath('/repo-unconfigured')).toBe(
         path.join('/home/user/.config', 'git', 'ignore'),
       );
     });
@@ -359,6 +362,47 @@ describe('git utilities', () => {
       expect(getCoreExcludesFilePath('/anything')).toBe(
         path.join('/home/user/.config', 'git', 'ignore'),
       );
+    });
+  });
+
+  // A group sync calls loadIgnoreRules (and therefore these two functions)
+  // once per repo, per extractor — repeated calls with the same fromPath
+  // are the normal case, not an edge case. Both functions memoize by
+  // fromPath so a second call never spawns a second subprocess (#2606).
+  describe('getGitInfoExcludePath / getCoreExcludesFilePath caching (#2606)', () => {
+    it('getGitInfoExcludePath only spawns git once for repeated calls with the same fromPath', () => {
+      mockExecSync.mockReturnValueOnce(Buffer.from('/cached-repo/.git\n'));
+      const first = getGitInfoExcludePath('/cached-repo');
+      const second = getGitInfoExcludePath('/cached-repo');
+      expect(first).toBe(path.join('/cached-repo/.git', 'info', 'exclude'));
+      expect(second).toBe(first);
+      expect(mockExecSync).toHaveBeenCalledTimes(1);
+    });
+
+    it('getGitInfoExcludePath caches a null result too (not-a-git-repo stays cheap)', () => {
+      mockExecSync.mockImplementationOnce(() => {
+        throw new Error('not a git repo');
+      });
+      expect(getGitInfoExcludePath('/cached-non-repo')).toBeNull();
+      expect(getGitInfoExcludePath('/cached-non-repo')).toBeNull();
+      expect(mockExecSync).toHaveBeenCalledTimes(1);
+    });
+
+    it('getCoreExcludesFilePath only spawns git once for repeated calls with the same fromPath', () => {
+      mockExecSync.mockReturnValueOnce(Buffer.from('/home/user/.gitignore_global\n'));
+      const first = getCoreExcludesFilePath('/cached-repo-2');
+      const second = getCoreExcludesFilePath('/cached-repo-2');
+      expect(first).toBe('/home/user/.gitignore_global');
+      expect(second).toBe(first);
+      expect(mockExecSync).toHaveBeenCalledTimes(1);
+    });
+
+    it("a different fromPath is not served from another path's cache entry", () => {
+      mockExecSync.mockReturnValueOnce(Buffer.from('/repo-a/.git\n'));
+      mockExecSync.mockReturnValueOnce(Buffer.from('/repo-b/.git\n'));
+      expect(getGitInfoExcludePath('/repo-a')).toBe(path.join('/repo-a/.git', 'info', 'exclude'));
+      expect(getGitInfoExcludePath('/repo-b')).toBe(path.join('/repo-b/.git', 'info', 'exclude'));
+      expect(mockExecSync).toHaveBeenCalledTimes(2);
     });
   });
 });
