@@ -763,9 +763,9 @@ describe('loadIgnoreRules — user-level global ignore file (#2606)', () => {
       const cap = _captureLogger();
       const ig = await loadIgnoreRules(repoDir);
       expect(ig).toBeNull();
-      expect(
-        cap.records().some((r) => String(r.msg ?? '').includes('global ignore file')),
-      ).toBe(true);
+      expect(cap.records().some((r) => String(r.msg ?? '').includes('global ignore file'))).toBe(
+        true,
+      );
 
       cap.restore();
       await fs.chmod(globalIgnorePath, 0o644);
