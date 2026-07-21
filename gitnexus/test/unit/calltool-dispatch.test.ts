@@ -7,7 +7,7 @@
  * These are pure unit tests that mock the LadybugDB layer to test
  * the dispatch and error handling logic in isolation.
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
 import fsPromises from 'fs/promises';
 import os from 'os';
@@ -114,7 +114,9 @@ import { CALLEES_TRUNCATED_SENTINEL } from '../../src/core/ingestion/cfg/emit.js
 import {
   listRegisteredRepos,
   cleanupOldKuzuFiles,
+  getStoragePaths,
   loadMeta,
+  type RegistryEntry,
 } from '../../src/storage/repo-manager.js';
 import { getGitRoot } from '../../src/storage/git.js';
 import { _captureLogger } from '../../src/core/logger.js';
@@ -325,6 +327,138 @@ describe('LocalBackend.callTool', () => {
     );
   });
 
+  it.each(['name', 'symbol'] as const)(
+    'normalizes impact.%s to target once before local dispatch',
+    async (alias) => {
+      const impactSpy = vi
+        .spyOn(backend as any, 'impact')
+        .mockResolvedValue({ status: 'normalized' });
+
+      const result = await backend.callTool('impact', {
+        [alias]: ' validate ',
+        direction: 'upstream',
+      });
+
+      expect(result).toEqual({ status: 'normalized' });
+      const dispatched = impactSpy.mock.calls[0][1] as Record<string, unknown>;
+      expect(dispatched.target).toBe('validate');
+      expect(dispatched).not.toHaveProperty('name');
+      expect(dispatched).not.toHaveProperty('symbol');
+    },
+  );
+
+  it('normalizes context.file to file_path once before local dispatch', async () => {
+    const contextSpy = vi
+      .spyOn(backend as any, 'context')
+      .mockResolvedValue({ status: 'normalized' });
+
+    const result = await backend.callTool('context', {
+      name: 'validate',
+      file: ' src/auth.ts ',
+    });
+
+    expect(result).toEqual({ status: 'normalized' });
+    const dispatched = contextSpy.mock.calls[0][1] as Record<string, unknown>;
+    expect(dispatched.file_path).toBe('src/auth.ts');
+    expect(dispatched).not.toHaveProperty('file');
+  });
+
+  it('treats undefined optional alias keys from CLI callers as absent', async () => {
+    const contextSpy = vi
+      .spyOn(backend as any, 'context')
+      .mockResolvedValue({ status: 'normalized' });
+
+    const result = await backend.callTool('context', {
+      name: 'validate',
+      file_path: undefined,
+      file: undefined,
+    });
+
+    expect(result).toEqual({ status: 'normalized' });
+    expect(contextSpy.mock.calls[0][1]).toMatchObject({ name: 'validate' });
+  });
+
+  it('allows agreeing canonical and alias values after trimming', async () => {
+    const impactSpy = vi
+      .spyOn(backend as any, 'impact')
+      .mockResolvedValue({ status: 'normalized' });
+
+    await backend.callTool('impact', {
+      target: 'validate',
+      name: ' validate ',
+      symbol: 'validate',
+      direction: 'upstream',
+    });
+
+    expect(impactSpy.mock.calls[0][1]).toMatchObject({ target: 'validate' });
+  });
+
+  it.each([
+    ['impact', { target: 'validate', name: 'login', direction: 'upstream' }],
+    ['impact', { name: 'validate', symbol: 'login', direction: 'upstream' }],
+    ['context', { name: 'validate', file_path: 'src/auth.ts', file: 'src/login.ts' }],
+  ])('rejects conflicting %s aliases before repository resolution', async (method, params) => {
+    const resolveSpy = vi.spyOn(backend, 'resolveRepo');
+
+    const result = await backend.callTool(method, params);
+
+    expect(result.error).toMatch(/conflicting mcp parameters/i);
+    expect(resolveSpy).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['impact', { target: '', direction: 'upstream' }],
+    ['impact', { name: 42, direction: 'upstream' }],
+    ['context', { name: 'validate', file: '   ' }],
+    ['context', { name: 'validate', file: null }],
+  ])('rejects invalid %s aliases before repository resolution', async (method, params) => {
+    const resolveSpy = vi.spyOn(backend, 'resolveRepo');
+
+    const result = await backend.callTool(method, params);
+
+    expect(result.error).toMatch(/non-empty string/i);
+    expect(resolveSpy).not.toHaveBeenCalled();
+  });
+
+  it('rejects a missing impact target before repository resolution', async () => {
+    const resolveSpy = vi.spyOn(backend, 'resolveRepo');
+
+    const result = await backend.callTool('impact', { direction: 'upstream' });
+
+    expect(result.error).toMatch(/requires target, name, symbol, or target_uid/i);
+    expect(resolveSpy).not.toHaveBeenCalled();
+  });
+
+  it('preserves target_uid-only impact dispatch', async () => {
+    const impactSpy = vi
+      .spyOn(backend as any, 'impact')
+      .mockResolvedValue({ status: 'normalized' });
+
+    await backend.callTool('impact', {
+      target_uid: 'Function:src/auth.ts:validate',
+      direction: 'upstream',
+    });
+
+    expect(impactSpy.mock.calls[0][1]).toMatchObject({
+      target_uid: 'Function:src/auth.ts:validate',
+    });
+  });
+
+  it('normalizes impact aliases before @group forwarding', async () => {
+    resolveAtMemberMock.mockResolvedValue({ ok: true, repoPath: '/tmp/test-project' });
+    const groupImpactSpy = vi
+      .spyOn(backend.getGroupService(), 'groupImpact')
+      .mockResolvedValue({ status: 'normalized' } as any);
+
+    await backend.callTool('impact', {
+      symbol: 'validate',
+      direction: 'upstream',
+      repo: '@grp',
+    });
+
+    expect(groupImpactSpy.mock.calls[0][0]).toMatchObject({ target: 'validate' });
+  });
+
   it('dispatches query tool', async () => {
     (executeParameterized as any).mockResolvedValue([]);
     const result = await backend.callTool('query', { query: 'auth' });
@@ -465,6 +599,32 @@ describe('LocalBackend.callTool', () => {
 
     const queries = (executeQuery as any).mock.calls.map(([, cypher]: [string, string]) => cypher);
     expect(queries.some((cypher: string) => cypher.includes('QUERY_VECTOR_INDEX'))).toBe(true);
+    // The configured threshold must reach the WHERE clause (MCP default 0.6), guarding
+    // against a regression that drops the filter or re-hardcodes a different value.
+    expect(queries.some((cypher: string) => cypher.includes('distance < 0.6'))).toBe(true);
+  });
+
+  it('threads GITNEXUS_VECTOR_MAX_DISTANCE into the vector index WHERE clause', async () => {
+    platformMocks.isVectorExtensionSupportedByPlatform.mockReturnValue(true);
+    vi.mocked(executeQuery).mockImplementation(async (_repoId: string, cypher: string) => {
+      if (cypher.includes('COUNT(*) AS cnt')) return [{ cnt: 1 }];
+      return [];
+    });
+    vi.mocked(executeParameterized).mockResolvedValue([]);
+
+    const previous = process.env.GITNEXUS_VECTOR_MAX_DISTANCE;
+    process.env.GITNEXUS_VECTOR_MAX_DISTANCE = '0.42';
+    try {
+      await backend.callTool('query', { query: 'auth' });
+      const queries = vi
+        .mocked(executeQuery)
+        .mock.calls.map(([, cypher]: [string, string]) => cypher);
+      expect(queries.some((cypher: string) => cypher.includes('distance < 0.42'))).toBe(true);
+      expect(queries.some((cypher: string) => cypher.includes('distance < 0.6'))).toBe(false);
+    } finally {
+      if (previous === undefined) delete process.env.GITNEXUS_VECTOR_MAX_DISTANCE;
+      else process.env.GITNEXUS_VECTOR_MAX_DISTANCE = previous;
+    }
   });
 
   it('query tool returns error for empty query', async () => {
@@ -1317,9 +1477,21 @@ describe('LocalBackend.callTool', () => {
         },
       ])
       .mockResolvedValue([]);
+    const repoDir = mkdtempSync(path.join(os.tmpdir(), 'gnx-rename-'));
+    (listRegisteredRepos as any).mockResolvedValue([
+      { ...MOCK_REPO_ENTRY, path: repoDir, storagePath: path.join(repoDir, '.gitnexus') },
+    ]);
+    backend = new LocalBackend();
+    await backend.init();
+
+    // The symbol is stored at 0-based startLine 1; context() presents it 1-based
+    // (line 2) and rename subtracts 1 to recover the 0-based file index (1), so
+    // `oldName` must sit on the file's 0-based line 1 for the definition edit to
+    // fire. (#2380: the mock previously put it on line 0, which stopped matching
+    // once context() went 1-based.)
     const readSpy = vi
       .spyOn(fsPromises, 'readFile')
-      .mockResolvedValue('function oldName() {}\n' as unknown as Buffer);
+      .mockResolvedValue('\nfunction oldName() {}\n' as unknown as Buffer);
     const writeSpy = vi
       .spyOn(fsPromises, 'writeFile')
       .mockRejectedValue(new Error('EACCES: permission denied'));
@@ -1337,6 +1509,7 @@ describe('LocalBackend.callTool', () => {
     } finally {
       readSpy.mockRestore();
       writeSpy.mockRestore();
+      rmSync(repoDir, { recursive: true, force: true });
     }
   });
 
@@ -3428,6 +3601,24 @@ describe('cypher result formatting', () => {
     expect(result.row_count).toBe(2);
   });
 
+  it('keeps one markdown line per row when a cell value contains newlines (#2310)', async () => {
+    // A multi-line `content` value must not split its row across physical lines —
+    // otherwise the rendered table is corrupt and the CLI `--limit` line-slice
+    // keeps the wrong number of rows.
+    (executeParameterized as any).mockResolvedValue([
+      { name: 'a', content: 'export function a() {\n  return 1;\n}' },
+      { name: 'b', content: 'line1\nline2' },
+    ]);
+    const result = await backend.callTool('cypher', {
+      query: 'MATCH (n:Function) RETURN n.name AS name, n.content AS content',
+    });
+    const lines = result.markdown.split('\n');
+    // header + separator + exactly one line per data row, no embedded newlines.
+    expect(lines).toHaveLength(2 + result.row_count);
+    expect(result.row_count).toBe(2);
+    expect(result.markdown).not.toMatch(/\n[^|]/);
+  });
+
   it('returns empty array as-is', async () => {
     (executeParameterized as any).mockResolvedValue([]);
     const result = await backend.callTool('cypher', {
@@ -3451,10 +3642,14 @@ describe('cypher result formatting', () => {
 describe('LocalBackend.resolveRepo branch scope (#2106)', () => {
   let backend: LocalBackend;
 
+  // Per-run unique dir: a fixed shared os.tmpdir() path lets concurrent
+  // vitest runs on one host rm each other's materialized sub-index stub
+  // mid-test (the documented parallel-agents workflow).
+  const MULTI_DIR = mkdtempSync(path.join(os.tmpdir(), 'gnx-2106-multi-'));
   const BRANCH_ENTRY = {
     name: 'multi',
-    path: path.join(os.tmpdir(), 'gnx-2106-multi'),
-    storagePath: path.join(os.tmpdir(), 'gnx-2106-multi', '.gitnexus'),
+    path: MULTI_DIR,
+    storagePath: path.join(MULTI_DIR, '.gitnexus'),
     indexedAt: '2026-06-10T12:00:00Z',
     lastCommit: 'mainsha',
     branch: 'main',
@@ -3463,25 +3658,39 @@ describe('LocalBackend.resolveRepo branch scope (#2106)', () => {
   };
 
   const flatLbug = path.join(BRANCH_ENTRY.storagePath, 'lbug');
+  // The pinned sub-index must exist on disk: applyBranchScope serves a
+  // branches[] summary only when its lbug is really there (#2364 review F1
+  // arm ii — a stale summary must not route to an adopt-deleted dir).
+  const branchLbug = getStoragePaths(BRANCH_ENTRY.path, 'feature/x').lbugPath;
 
   beforeEach(async () => {
     vi.clearAllMocks();
+    mkdirSync(path.dirname(branchLbug), { recursive: true });
+    writeFileSync(branchLbug, 'stub');
     backend = new LocalBackend();
     (listRegisteredRepos as any).mockResolvedValue([BRANCH_ENTRY]);
     await backend.init();
   });
 
-  it('no branch param resolves the flat/primary lbug', async () => {
+  afterEach(() => {
+    rmSync(BRANCH_ENTRY.storagePath, { recursive: true, force: true });
+  });
+
+  afterAll(() => {
+    rmSync(MULTI_DIR, { recursive: true, force: true });
+  });
+
+  it('no branch param resolves the flat workspace lbug', async () => {
     const handle = await backend.resolveRepo('multi');
     expect(handle.lbugPath).toBe(flatLbug);
   });
 
-  it('the primary branch name resolves the flat lbug', async () => {
+  it('the workspace-recorded branch name resolves the flat lbug', async () => {
     const handle = await backend.resolveRepo('multi', 'main');
     expect(handle.lbugPath).toBe(flatLbug);
   });
 
-  it('an indexed non-primary branch resolves a branches/<slug> lbug', async () => {
+  it('an indexed pinned branch resolves a branches/<slug> lbug', async () => {
     const handle = await backend.resolveRepo('multi', 'feature/x');
     expect(handle.lbugPath).not.toBe(flatLbug);
     expect(handle.lbugPath).toContain(path.join('.gitnexus', 'branches'));
@@ -3492,6 +3701,14 @@ describe('LocalBackend.resolveRepo branch scope (#2106)', () => {
 
   it('an un-indexed branch throws a clear error', async () => {
     await expect(backend.resolveRepo('multi', 'nope')).rejects.toThrow(/not indexed/i);
+    // Post-#2354 guidance: a bare `analyze --branch <X>` refuses unless X is
+    // checked out, so the message must lead with the checkout (#2364 F6).
+    await expect(backend.resolveRepo('multi', 'nope')).rejects.toThrow(
+      /workspace index follows the checked-out branch/,
+    );
+    await expect(backend.resolveRepo('multi', 'nope')).rejects.toThrow(
+      /check out "nope" and re-run: gitnexus analyze/,
+    );
   });
 
   it('a legacy entry with no top-level branch still routes an indexed branch', async () => {
@@ -3503,10 +3720,11 @@ describe('LocalBackend.resolveRepo branch scope (#2106)', () => {
     expect(handle.lbugPath).toContain(path.join('.gitnexus', 'branches'));
   });
 
-  it('a legacy entry resolves --branch <primary> via the flat meta (#2106 R4)', async () => {
+  it('a legacy entry resolves --branch <workspace-branch> via the flat meta (#2106 R4)', async () => {
     // Pre-#2106 flat index: registry entry has no `branch`/`branches`, but the
-    // flat meta.json records the primary. `--branch <primary>` must resolve to
-    // the flat handle (read from meta), while an unindexed branch still errors.
+    // flat meta.json records the workspace branch. `--branch <that branch>`
+    // must resolve to the flat handle (read from meta), while an unindexed
+    // branch still errors.
     const dir = mkdtempSync(path.join(os.tmpdir(), 'gnx-2106-legacy-'));
     const storagePath = path.join(dir, '.gitnexus');
     mkdirSync(storagePath, { recursive: true });
@@ -3522,6 +3740,132 @@ describe('LocalBackend.resolveRepo branch scope (#2106)', () => {
       const handle = await backend.resolveRepo('legacy', 'main');
       expect(handle.lbugPath).toBe(path.join(storagePath, 'lbug'));
       await expect(backend.resolveRepo('legacy', 'feature')).rejects.toThrow(/not indexed/i);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a stale cached handle still resolves the restamped workspace branch via flat meta (#2354)', async () => {
+    // The flat workspace slot follows the checked-out working tree: a plain
+    // analyze after a branch switch restamps the flat meta.json without any
+    // repo-resolution miss that would refresh a long-lived server's handle.
+    // The cached handle still says branch 'main'; the on-disk flat meta is the
+    // truth ('feature/z') and must win over a stale "not indexed" error.
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'gnx-2354-restamp-'));
+    const storagePath = path.join(dir, '.gitnexus');
+    mkdirSync(storagePath, { recursive: true });
+    writeFileSync(
+      path.join(storagePath, 'meta.json'),
+      JSON.stringify({ repoPath: dir, lastCommit: 'zzz', indexedAt: 'now', branch: 'feature/z' }),
+    );
+    try {
+      (listRegisteredRepos as any).mockResolvedValue([
+        {
+          name: 'flipped',
+          path: dir,
+          storagePath,
+          indexedAt: 'now',
+          lastCommit: 'aaa',
+          branch: 'main',
+        },
+      ]);
+      await backend.init();
+      const handle = await backend.resolveRepo('flipped', 'feature/z');
+      expect(handle.lbugPath).toBe(path.join(storagePath, 'lbug'));
+      // A genuinely unindexed branch still errors (never serves the wrong DB).
+      await expect(backend.resolveRepo('flipped', 'nope')).rejects.toThrow(/not indexed/i);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a stale cached label errors instead of serving the flat handle (#2364 F1 arm i)', async () => {
+    // Long-lived server cached branch 'main'; a plain analyze on feature/z
+    // restamped the flat meta (and the pool reinit will hot-swap content).
+    // Requesting the OLD label must error — the flat DB no longer holds main.
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'gnx-2364-stale-label-'));
+    const storagePath = path.join(dir, '.gitnexus');
+    mkdirSync(storagePath, { recursive: true });
+    writeFileSync(
+      path.join(storagePath, 'meta.json'),
+      JSON.stringify({ repoPath: dir, lastCommit: 'zzz', indexedAt: 'now', branch: 'feature/z' }),
+    );
+    try {
+      const entry: RegistryEntry = {
+        name: 'flipped',
+        path: dir,
+        storagePath,
+        indexedAt: 'now',
+        lastCommit: 'aaa',
+        branch: 'main',
+      };
+      vi.mocked(listRegisteredRepos).mockResolvedValue([entry]);
+      await backend.init();
+      const callsBefore = vi.mocked(listRegisteredRepos).mock.calls.length;
+      await expect(backend.resolveRepo('flipped', 'main')).rejects.toThrow(/not indexed/i);
+      // Exactly one refreshRepos fired for cache coherence (observed via its
+      // unconditional first call — refreshRepos itself is private).
+      expect(vi.mocked(listRegisteredRepos).mock.calls.length - callsBefore).toBe(1);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a stale summary whose sub-index was adopted falls through to the flat handle (#2364 F1 arm ii)', async () => {
+    // The cached branches[] summary still lists feature/z, but adopt deleted
+    // branches/<slug>/ and the flat slot now owns the label: serve flat.
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'gnx-2364-adopted-'));
+    const storagePath = path.join(dir, '.gitnexus');
+    mkdirSync(storagePath, { recursive: true });
+    writeFileSync(
+      path.join(storagePath, 'meta.json'),
+      JSON.stringify({ repoPath: dir, lastCommit: 'zzz', indexedAt: 'now', branch: 'feature/z' }),
+    );
+    try {
+      const entry: RegistryEntry = {
+        name: 'adopted',
+        path: dir,
+        storagePath,
+        indexedAt: 'now',
+        lastCommit: 'aaa',
+        branch: 'main',
+        branches: [{ branch: 'feature/z', indexedAt: 'now', lastCommit: 'zzz' }],
+      };
+      vi.mocked(listRegisteredRepos).mockResolvedValue([entry]);
+      await backend.init();
+      const handle = await backend.resolveRepo('adopted', 'feature/z');
+      expect(handle.lbugPath).toBe(path.join(storagePath, 'lbug'));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a dangling summary with a disagreeing flat meta errors honestly (#2364 F3 window)', async () => {
+    // Partial fast-path failure: adopt deleted the sub-index but the flat
+    // meta was never restamped (saveMeta runs last). The degraded state must
+    // yield the not-indexed error — no ghost route, no wrong data.
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'gnx-2364-dangling-'));
+    const storagePath = path.join(dir, '.gitnexus');
+    mkdirSync(storagePath, { recursive: true });
+    writeFileSync(
+      path.join(storagePath, 'meta.json'),
+      JSON.stringify({ repoPath: dir, lastCommit: 'aaa', indexedAt: 'now', branch: 'main' }),
+    );
+    try {
+      const entry: RegistryEntry = {
+        name: 'dangling',
+        path: dir,
+        storagePath,
+        indexedAt: 'now',
+        lastCommit: 'aaa',
+        branch: 'main',
+        branches: [{ branch: 'feature/z', indexedAt: 'now', lastCommit: 'zzz' }],
+      };
+      vi.mocked(listRegisteredRepos).mockResolvedValue([entry]);
+      await backend.init();
+      const callsBefore = vi.mocked(listRegisteredRepos).mock.calls.length;
+      await expect(backend.resolveRepo('dangling', 'feature/z')).rejects.toThrow(/not indexed/i);
+      expect(vi.mocked(listRegisteredRepos).mock.calls.length - callsBefore).toBe(1);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

@@ -33,14 +33,27 @@ export type ScopeId = string;
 /** Stable symbol-definition identifier (graph nodeId). */
 export type DefId = string;
 
-/** Kinds of lexical scope a `Scope` node can represent. */
+/**
+ * Kinds of lexical scope a `Scope` node can represent.
+ *
+ * `Object` is a hoist boundary ONLY: an object/record literal body
+ * (TS/JS `{...}`, Kotlin anonymous `object {...}`). Members are
+ * reachable via property access, never as bare identifiers, so
+ * scope-chain walkers (`scope/walkers.ts`) must skip an `Object`
+ * scope's own bindings while still traversing past it to the parent
+ * (#2545/#2551) -- unlike `Block`, where a nested closure legitimately
+ * DOES see a sibling `let`/`const` from an enclosing `if`/`for`/`while`,
+ * a nested closure inside an object literal must NOT see a sibling
+ * property's name as a free identifier.
+ */
 export type ScopeKind =
   | 'Module' // file root
   | 'Namespace' // C++ namespace, C# namespace, Kotlin package-object, Rust mod
   | 'Class' // class/struct/trait/interface body
   | 'Function' // function/method/closure/lambda body
   | 'Block' // { ... }, if-body, for-body, with-body, match arms
-  | 'Expression'; // comprehensions, for-init, pattern bindings, lambda param lists
+  | 'Expression' // comprehensions, for-init, pattern bindings, lambda param lists
+  | 'Object'; // object/record literal body -- see doc comment above
 
 // ─── Range + Capture (parser-agnostic) ──────────────────────────────────────
 
@@ -105,6 +118,9 @@ export type ParsedImport =
       readonly localName: string;
       readonly importedName: string;
       readonly targetRaw: string;
+      /** Provider-specific imported symbol category when module and symbol
+       * namespaces have distinct resolution rules (for example PHP). */
+      readonly importedSymbolKind?: 'type' | 'function' | 'const';
       /**
        * Set by providers when `targetRaw` already names the imported symbol
        * rather than only its containing module. Consumers that compose
@@ -126,6 +142,8 @@ export type ParsedImport =
       readonly importedName: string;
       readonly alias: string;
       readonly targetRaw: string;
+      /** See the same field on the `named` variant. */
+      readonly importedSymbolKind?: 'type' | 'function' | 'const';
       /** See the same field on the `named` variant. */
       readonly targetIncludesImportedName?: boolean;
     }
@@ -448,7 +466,15 @@ export interface Reference {
   readonly toDef: DefId;
   /** Location of the reference in source. */
   readonly atRange: Range;
-  readonly kind: 'call' | 'read' | 'write' | 'type-reference' | 'inherits' | 'import-use' | 'macro';
+  readonly kind:
+    | 'call'
+    | 'read'
+    | 'write'
+    | 'type-reference'
+    | 'inherits'
+    | 'import-use'
+    | 'value-ref'
+    | 'macro';
   readonly confidence: number;
   readonly evidence: readonly ResolutionEvidence[];
 }

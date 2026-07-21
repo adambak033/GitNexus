@@ -6,7 +6,7 @@ const { runFullAnalysisMock, generateAIContextFilesMock, generateSkillFilesMock,
     const generateAIContextFilesMock = vi.fn(async () => ({ files: [] as string[] }));
     const generateSkillFilesMock = vi.fn(async () => ({
       skills: [{ name: 'c', label: 'Community', symbolCount: 1, fileCount: 1 }],
-      outputPath: '/repo/.claude/skills/generated',
+      outputPath: '/repo/.claude/skills',
     }));
     const cliErrorMock = vi.fn();
     return {
@@ -74,7 +74,7 @@ describe('analyzeCommand commander → runFullAnalysis noStats bridge (#1477)', 
     generateSkillFilesMock.mockReset();
     generateSkillFilesMock.mockResolvedValue({
       skills: [{ name: 'c', label: 'Community', symbolCount: 1, fileCount: 1 }],
-      outputPath: '/repo/.claude/skills/generated',
+      outputPath: '/repo/.claude/skills',
     });
     cliErrorMock.mockReset();
     process.exitCode = undefined;
@@ -89,6 +89,15 @@ describe('analyzeCommand commander → runFullAnalysis noStats bridge (#1477)', 
     expect(runFullAnalysisMock).toHaveBeenCalledTimes(1);
     const opts = runFullAnalysisMock.mock.calls[0][1];
     expect(opts.noStats).toBe(true);
+  });
+
+  it('threads the capture-before-import runner receipt into runFullAnalysis', async () => {
+    const { analyzeCommandWithRunnerIdentity } = await import('../../src/cli/analyze.js');
+    const receipt = { schemaVersion: 4 } as never;
+
+    await analyzeCommandWithRunnerIdentity(receipt, undefined, {});
+
+    expect(runFullAnalysisMock.mock.calls[0]?.[3]).toBe(receipt);
   });
 
   it('maps omitted stats to noStats:false (default-on preserved)', async () => {

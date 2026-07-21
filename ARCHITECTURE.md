@@ -15,9 +15,9 @@ Monorepo: **CLI/MCP** (`gitnexus/`) + **browser UI** (`gitnexus-web/`).
 
 ## End-to-end flow: index → graph → tools
 
-1. **Ingestion** — `analyze.ts` → `runFullAnalysis` (`run-analyze.ts`) → `runPipelineFromRepo` (`pipeline.ts`). DAG of 14 phases builds a `KnowledgeGraph` in memory, then loads into LadybugDB under `.gitnexus/`. Repo registered in `~/.gitnexus/registry.json` for MCP discovery.
+1. **Ingestion** — `analyze.ts` → `runFullAnalysis` (`run-analyze.ts`) → `runPipelineFromRepo` (`pipeline.ts`). DAG of 15 phases builds a `KnowledgeGraph` in memory, then loads into LadybugDB under `.gitnexus/`. Repo registered in `~/.gitnexus/registry.json` for MCP discovery.
 
-2. **Persistence** — `repo-manager.ts` (paths, registry, KuzuDB cleanup). `lbug-adapter.ts` (graph load, queries, embedding batches).
+2. **Persistence** — `repo-manager.ts` (paths, registry, LadybugDB cleanup). `lbug-adapter.ts` (graph load, queries, embedding batches).
 
 3. **Query layer** — three interfaces to the same backend:
    - **MCP (stdio):** `mcp.ts` → `LocalBackend` → tools (`tools.ts`) + resources (`resources.ts`)
@@ -82,11 +82,11 @@ Group-mode `trace` (`gitnexus/src/core/group/cross-trace.ts`) stitches a path th
 
 ## Pipeline Phase DAG
 
-14 phases defined in `gitnexus/src/core/ingestion/pipeline-phases/`, each with explicit `deps` and typed output.
+15 phases defined in `gitnexus/src/core/ingestion/pipeline-phases/`, each with explicit `deps` and typed output.
 
 ```
 scan → structure → [markdown, cobol] → parse → [routes, tools, orm]
-  → crossFile → scopeResolution → pruneLocalSymbols → mro → communities → processes
+  → crossFile → scopeResolution → pruneLocalSymbols → mro → di → communities → processes
 ```
 
 | Phase | File | Deps | Output |
@@ -103,6 +103,7 @@ scan → structure → [markdown, cobol] → parse → [routes, tools, orm]
 | `scopeResolution` | `scope-resolution/pipeline/phase.ts` | `parse`, `crossFile`, `structure` | Binding/reference + inheritance edges; disposes BindingAccumulator |
 | `pruneLocalSymbols` | `prune-local-symbols.ts` | `scopeResolution` | Drops inert block-local `Const`/`Variable`/`Static` nodes (only a `File→DEFINES` edge) post-resolution |
 | `mro` | `mro.ts` | `crossFile`, `scopeResolution`, `pruneLocalSymbols`, `structure` | METHOD_OVERRIDES + METHOD_IMPLEMENTS edges |
+| `di` | `di.ts` | `mro` | INJECTS edges (framework-neutral DI resolution; per-language matchers registered in `di-extractors/`) |
 | `communities` | `communities.ts` | `mro`, `pruneLocalSymbols`, `structure` | Community nodes + MEMBER_OF edges (Leiden algorithm) |
 | `processes` | `processes.ts` | `communities`, `routes`, `tools`, `pruneLocalSymbols`, `structure` | Process nodes + STEP_IN_PROCESS edges |
 
@@ -126,7 +127,7 @@ scan → structure → [markdown, cobol] → parse → [routes, tools, orm]
 - **Single graph accumulator** — all phases mutate the same `KnowledgeGraph` in `ctx`; the graph is the primary output.
 - **Typed phase access** — `getPhaseOutput<T>(deps, 'name')` for type-safe upstream results.
 - **Binding accumulator lifecycle** — created in `parse`, disposed by `crossFile` (in `finally`). No other phase should take ownership.
-- **Skippable phases** — `skipGraphPhases` omits MRO/communities/processes (faster tests); `pruneLocalSymbols` still runs (it is graph cleanup, not analysis). `skipWorkers` is no longer a sequential escape hatch — it (like `--workers 0` / `GITNEXUS_WORKER_POOL_SIZE=0`) is rejected with an actionable error, since the worker pool is the sole parse path (§ Chunked parse-and-resolve).
+- **Skippable phases** — `skipGraphPhases` omits MRO/di/communities/processes (faster tests); `pruneLocalSymbols` still runs (it is graph cleanup, not analysis). `skipWorkers` is no longer a sequential escape hatch — it (like `--workers 0` / `GITNEXUS_WORKER_POOL_SIZE=0`) is rejected with an actionable error, since the worker pool is the sole parse path (§ Chunked parse-and-resolve).
 - **Local-symbol pruning** — `pruneLocalSymbols` removes inert block-local value symbols after scope resolution has consumed them. Opt out per-call with `PipelineOptions.keepLocalValueSymbols` or globally with the `GITNEXUS_KEEP_LOCAL_VALUE_SYMBOLS` env var.
 
 ### How to add a new phase
@@ -200,7 +201,9 @@ Language-agnostic scope-resolution resolver. This is the resolution path for eve
  ReferenceIndex
     │  emitReceiverBoundCalls  ── FIRST
     │  emitFreeCallFallback    ── THEN
-    │  emitReferencesViaLookup ── LAST (uses handledSites)
+    │  emitReferencesViaLookup ── uses handledSites + deferred-site skip set
+    │  emitPropertyDispatchCalls ── registration USES + conservative CALLS
+    │  emitCallableValueFlow   ── assigned/passed callable invocation CALLS
     │  emitImportEdges
     ▼
  KnowledgeGraph  (IMPORTS / CALLS / ACCESSES / INHERITS / USES)
@@ -208,6 +211,18 @@ Language-agnostic scope-resolution resolver. This is the resolution path for eve
 
 Orchestrator: `runScopeResolution(input, provider)` in `scope-resolution/pipeline/run.ts`.
 Pipeline phase: `scopeResolutionPhase` in `scope-resolution/pipeline/phase.ts` — iterates the registered `SCOPE_RESOLVERS` over the worker-serialized `ParsedFile`s. (Per-language `emitScopeCaptures` hooks may reuse a cached Tree via the orchestrator's `treeCache`, but in worker-pool runs that cache is empty — Trees can't cross MessageChannels — so they consume the pre-extracted `ParsedFile` instead; § Performance notes.)
+
+### Callable-value flow
+
+First-class callable values use a language-neutral inclusion analysis in `passes/callable-value-flow.ts`. Providers recognize their own syntax and emit JSON-safe `CallableFlowSite` facts (`seed`, `copy`, `alias`, `address`, `load`, `store`, `formal`, `argument`, and `invoke`) into `ParsedFile`; shared ingestion never branches on a language name. These always-on facts cross workers and the durable parse store, whose schema is bumped whenever their semantic shape changes.
+
+The emit stage defers only invocation sites proven to reference a flow cell. Ordinary receiver/free/reference passes still resolve direct callees first and record exact callee IDs by file/line/column. Property dispatch then runs before callable flow because a property-dispatched wrapper call can seed actual-to-formal propagation. The callable solver consumes those direct targets, propagates callable sets through lexical cells and formals, and emits `CALLS` at the real indirect invocation site with reason `callable-value-flow` (confidence 0.8 for a singleton, 0.7 for a bounded multi-target set).
+
+The solver is flow-insensitive but bounded: dependency-indexed work items rerun only when a cell they read changes; target/address sets cap at 32; a hostile fact graph has a finite work budget; overflow or budget exhaustion emits no partial `CALLS` and produces a structured warning. Lexical shadowing is function/block aware, invocation/constructor results are not reinterpreted as callable designators, and overload selection uses provider-supplied signature metadata. C/C++ additionally associate visible prototypes with unique definitions so actual-to-formal flow crosses translation units; the provider-owned `hasFileLocalCallableLinkage` hook prevents `static` declarations or definitions from leaking across files. C++ member-function pointers preserve parameter/cv shape, keep non-virtual targets exact, and expand virtual targets through `MethodDispatchIndex`/MRO.
+
+Property-key dispatch remains a separate conservative fallback. Its per-key fan-out cap is 32; capped keys synthesize no partial calls and are reported at warning level with language, skipped-key count, dropped key names (bounded), and cap; the count also travels in `RunScopeResolutionStats.propertyDispatchSkippedKeys`.
+
+Standalone (regex-based) providers such as COBOL participate via `ScopeResolver.scopeResolutionEdgeMode: 'callable-flow-only'`: `runScopeResolution` runs for them, but every ordinary emission path — heritage, interface implementations, receiver-bound, free-call fallback, reference/import edges, post-resolution hooks — is gated off, so their legacy phase (e.g. `cobolPhase`) remains the sole owner of structural edges and the callable solver's `CALLS` are purely additive. A callable-flow-only provider whose files emitted no callable facts exits early, before finalize, keeping the opt-in proportional to source scanning.
 
 ### Optional CFG/PDG emission (`--pdg`, #2081–#2086)
 
@@ -241,6 +256,7 @@ Single interface a language implements to plug into the pipeline. Contract fully
 | `collapseMemberCallsByCallerTarget?` | One CALLS edge per (caller, target) instead of per-site — default off |
 | `populateNamespaceSiblings?` | Cross-file implicit visibility (compiler-implicit namespace sharing) — default off; ctx carries `treeCache` |
 | `hoistTypeBindingsToModule?` | Walk up to Module scope when looking up a method's return-type typeBinding — default off; enable only when bindings are stored at module level |
+| `hasFileLocalCallableLinkage?` | Precise internal-linkage predicate used only when joining callable declarations/prototypes to cross-file definitions; C/C++ use it for `static` free functions |
 
 ### Per-language registration
 
@@ -272,6 +288,7 @@ CI auto-discovers the set via `tsx`. No workflow edit required.
 - **Cross-phase Tree cache**: the orchestrator's `treeCache` (`RunScopeResolutionInput.treeCache`) lets a scope-resolution per-language hook (`emitScopeCaptures`) reuse a tree instead of re-parsing. Workers leave it empty — Trees can't cross MessageChannels — so in normal (worker-pool) runs scope-resolution does NOT rely on it: workers serialize each file's `ParsedFile` (+ capture side-channel) and stream them in, so scope-resolution consumes the pre-extracted artifact rather than re-parsing on the main thread (§ Chunked parse-and-resolve). `PROF_SCOPE_RESOLUTION=1` emits hit/miss counters and a worker-engaged warning.
 - **Typed relationship iteration**: heritage + MRO walk only the EXTENDS / IMPLEMENTS / HAS_METHOD edges via `iterRelationshipsByType`, not the full relationship map.
 - **Workspace-resolution-index**: O(1) `findOwnedMember` / `findExportedDef` / `classScopeByDefId` built once per run.
+- **Callable-value worklist**: dependency-indexed inclusion propagation is linear in a reverse-ordered copy-chain fixture; target/address sets cap at 32 and the whole worklist has a finite budget with no partial edge emission on exhaustion.
 - **SCC-ordered cross-file return-type propagation** (PR #1050): `propagateImportedReturnTypes` walks `indexes.sccs` in reverse-topological order (leaves first), so multi-hop alias chains like `models.User → service.user → app.user` collapse to the terminal class in a single linear pass. Within each importer, the source module's `typeBindings` is chain-followed BEFORE mirroring (so we mirror terminal types, not intermediate refs), and the importer's own `typeBindings` is chain-followed AFTER mirroring (so local `const x = importedFn()` resolves before downstream importers run). Cyclic SCCs reach a partial fixpoint within a single pass without iterating to convergence — see the `ts-circular` cross-file-binding fixture which only asserts pipeline-no-throw. PROF output (`PROF_SCOPE_RESOLUTION=1`) splits `finalize` from `propagate` so quadratic regressions in the chain-follow surface independently.
 
 ---
@@ -381,8 +398,11 @@ CLI (analyze.ts) → runFullAnalysis(repoPath, options, callbacks)
 <repo>/.gitnexus/
   ├── lbug           # LadybugDB database
   ├── lbug.wal       # Write-ahead log
+  ├── lbug.shadow    # Shadow sidecar (checkpoint staging)
   ├── lbug.lock      # Single-writer lock
-  └── meta.json      # lastCommit, indexedAt, stats
+  ├── lbug.{wal,shadow}.dirty-recovery  # parked sidecars from a crashed run; safe to delete
+  ├── gitnexus.json  # lastCommit, indexedAt, stats (primary metadata file)
+  └── meta.json      # legacy mirror of gitnexus.json, kept in sync (see MIGRATION.md)
 
 ~/.gitnexus/
   └── registry.json  # Global repo registry (MCP discovery)

@@ -1,10 +1,49 @@
-import { execSync } from 'child_process';
+import { execFileSync, execSync } from 'child_process';
 import { statSync } from 'fs';
 import path from 'path';
 
 // Git utilities for repository detection, commit tracking, and diff analysis
 
 const chompGitOutput = (value: Buffer): string => value.toString().replace(/\r?\n$/, '');
+
+/**
+ * True when the working tree has uncommitted changes that analyze would
+ * re-index, even at a matching HEAD. Excludes the paths GitNexus writes during
+ * analyze (.gitnexus/, .claude/, .cursor/, AGENTS.md, CLAUDE.md) so its own
+ * output never counts as dirty (regression vs PR #1233 behavior). Conservative
+ * on any git failure. Shared so `analyze`'s fast-path gate and `status`'s
+ * freshness report agree on what "dirty" means.
+ */
+export const isWorkingTreeDirty = (repoPath: string): boolean => {
+  try {
+    const out = execFileSync(
+      'git',
+      [
+        'status',
+        '--porcelain',
+        '--',
+        '.',
+        ':(exclude).gitnexus',
+        ':(exclude).gitnexus/**',
+        ':(exclude).claude',
+        ':(exclude).claude/**',
+        ':(exclude).cursor',
+        ':(exclude).cursor/**',
+        ':(exclude)AGENTS.md',
+        ':(exclude)CLAUDE.md',
+      ],
+      {
+        cwd: repoPath,
+        stdio: ['ignore', 'pipe', 'ignore'],
+        windowsHide: true,
+        encoding: 'utf8',
+      },
+    );
+    return out.trim().length > 0;
+  } catch {
+    return true; // conservative on git failure
+  }
+};
 
 export const isGitRepo = (repoPath: string): boolean => {
   try {
@@ -42,7 +81,7 @@ export const getCurrentCommit = (repoPath: string): string => {
  * Get a stable canonical identifier for the repo's `origin` remote, if any.
  *
  * Used to fingerprint two on-disk clones as the same logical repository
- * (issue #XXX — silent graph drift across sibling clones). `path` alone
+ * (prevents silent graph drift across sibling clones — see #2054). `path` alone
  * is unreliable: worktrees, "clean clone for indexing" hygiene, and
  * multi-agent workspaces routinely have the same repo at multiple
  * absolute paths. The remote URL is the only on-disk signal that
@@ -103,6 +142,12 @@ export const getRemoteUrl = (repoPath: string): string | undefined => {
  * Find the git repository root from any path inside the repo
  */
 export const getGitRoot = (fromPath: string): string | null => {
+  const resolved = path.resolve(fromPath);
+  // Avoid git rev-parse --show-toplevel trimming trailing spaces from the
+  // repository root on Windows; callers that need identity keys canonicalize
+  // this value with realpath before comparing it.
+  if (hasGitDir(resolved)) return resolved;
+
   try {
     const raw = chompGitOutput(
       execSync('git rev-parse --show-toplevel', {

@@ -110,11 +110,17 @@
  *     in this order; the FIRST that emits an edge wins:
  *       1. super branch (`provider.isSuperReceiver(receiverName)`)
  *       2. Case 0 compound (`receiverName` has `.` or `(`)
- *       3. Case 1 namespace-receiver
- *       4. Case 2 class-name receiver
- *       5. Case 3 dotted typeBinding for namespace prefix
- *       6. Case 3b chain-typebinding (compound resolver)
- *       7. Case 4 simple typeBinding (MRO walk + findOwnedMember)
+ *       3. Case 0.5 implicit-`this` chain walk — GATED: fires only for
+ *          languages that set `resolveThisViaEnclosingClass === true`;
+ *          it intercepts every bare-`this` call/read/write site ahead of
+ *          Case 4 and does NOT emit Case 4's interface-dispatch fan-out,
+ *          so enabling the toggle for a language changes that language's
+ *          `this` dispatch semantics (see the toggle's doc below)
+ *       4. Case 1 namespace-receiver
+ *       5. Case 2 class-name receiver
+ *       6. Case 3 dotted typeBinding for namespace prefix
+ *       7. Case 3b chain-typebinding (compound resolver)
+ *       8. Case 4 simple typeBinding (MRO walk + findOwnedMember)
  *     Reordering or merging cases changes resolution semantics. The
  *     numbering is part of the contract — keep the comments.
  *
@@ -267,6 +273,7 @@ import type {
   Callsite,
   ConstraintContext,
   ParsedFile,
+  ParsedImport,
   ReferenceSite,
   ScopeId,
   SupportedLanguages,
@@ -295,6 +302,11 @@ export type ArityVerdict = 'compatible' | 'unknown' | 'incompatible';
 export type ReceiverMemberResolution =
   | { readonly kind: 'resolved'; readonly definition: SymbolDefinition }
   | { readonly kind: 'ambiguous'; readonly candidateIds: readonly string[] };
+
+export interface ImportResolutionContext {
+  readonly parsedFiles: readonly ParsedFile[];
+  readonly parsedImport?: ParsedImport;
+}
 
 /** Re-exported for ScopeResolver consumers — same shape as
  *  `RegistryProviders.constraintCompatibility`'s third parameter. */
@@ -334,12 +346,18 @@ export interface ScopeResolver {
    * orchestrator). TypeScript uses this to thread `tsconfig.json` path
    * aliases through to the standard resolver. Languages that don't
    * need any extra config ignore the parameter.
+   *
+   * `context.parsedFiles` is the complete, read-only language workspace. It is
+   * optional so resolvers that only need paths retain their existing shape.
+   * `context.parsedImport` is the exact import being finalized. PHP uses both
+   * when a PSR-4 import names a function instead of a file.
    */
   resolveImportTarget(
     targetRaw: string,
     fromFile: string,
     allFilePaths: ReadonlySet<string>,
     resolutionConfig?: unknown,
+    context?: ImportResolutionContext,
   ): string | readonly string[] | null;
 
   /**
@@ -394,6 +412,23 @@ export interface ScopeResolver {
    * `(def, callsite)` and need an adapter at the wiring site.
    */
   arityCompatibility(callsite: Callsite, def: SymbolDefinition): ArityVerdict;
+
+  /**
+   * Add provider-specific callable value targets beyond the shared
+   * Function/Method/Constructor set. This is intentionally a predicate hook:
+   * shared flow analysis never branches on a language name or syntax kind.
+   */
+  readonly isCallableValueTarget?: (def: SymbolDefinition) => boolean;
+
+  /**
+   * Restrict this provider's scope-resolution graph mutations to callable-value
+   * CALLS edges. Providers with an existing structural edge pipeline can use
+   * the shared scope model and callable solver without duplicating their
+   * established CALLS, IMPORTS, heritage, or property-dispatch edges.
+   *
+   * Default: `all`.
+   */
+  readonly scopeResolutionEdgeMode?: 'all' | 'callable-flow-only';
 
   /**
    * Per-language constraint compatibility between a callsite and a
@@ -628,6 +663,22 @@ export interface ScopeResolver {
   // ─── Optional toggles ──────────────────────────────────────────────────────
 
   /**
+   * Source-text retention policy for post-extraction hooks that receive a
+   * `fileContents` context (`populateWorkspaceOwners`,
+   * `populateNamespaceSiblings`, `populateRangeBindings`, and
+   * `emitPostResolutionEdges`).
+   *
+   * The default, `all-files`, preserves the existing contract: source text is
+   * loaded for every file before any of those hooks run. A resolver may choose
+   * `uncached-files` only when all of its hooks derive cached-file facts from
+   * `ParsedFile` / capture side-channels and tolerate an empty content string
+   * for pre-extracted files. This keeps the durable ParsedFile path at
+   * O(uncached source) memory without putting language checks in the shared
+   * pipeline.
+   */
+  readonly postExtractSourceTextPolicy?: 'all-files' | 'uncached-files';
+
+  /**
    * Whether the orchestrator should run `propagateImportedReturnTypes`
    * after finalize. Default `true`. TypeScript with explicit type
    * exports may want a different propagation strategy and opt out.
@@ -683,6 +734,24 @@ export interface ScopeResolver {
   readonly allowGlobalFreeCallFallback?: boolean;
 
   /**
+   * In this language every `Method` belongs to a class instance, so a
+   * FREE (receiver-less) call may resolve to a `Method` only when the
+   * caller's enclosing class chain — the class itself plus its MRO —
+   * contains the method's owner (#2550). Suppresses the finalize-bucket
+   * leak where an unqualified call matched any same-file method by bare
+   * name (`materializeBindings` flattens every declaration onto module
+   * scope). Java opts in; C# is the intended next adopter.
+   *
+   * NOT implemented via `LanguageProvider.builtInNames`: that mechanism
+   * has unrelated consumers (`parse-worker`'s call-site extraction gate
+   * suppresses member calls too; `type-env`'s return-type lookup) which
+   * assume a flagged name is never a real repository declaration —
+   * false for common method names like `run`/`get`/`compare` (verified
+   * regression).
+   */
+  readonly freeCallsRequireInstanceOwnership?: boolean;
+
+  /**
    * When true, a constructor-form call `Type(...)` links to the Class def
    * itself rather than its explicit Constructor def. Default
    * (undefined/false) targets the explicit Constructor when one exists,
@@ -727,6 +796,20 @@ export interface ScopeResolver {
    * Languages without file-local linkage semantics leave this undefined.
    */
   readonly isFileLocalDef?: (def: SymbolDefinition) => boolean;
+
+  /**
+   * Optional precise linkage predicate used when callable-value flow joins a
+   * declaration graph node (for example a C/C++ prototype in a caller file)
+   * to its out-of-file definition. Unlike `isFileLocalDef`, this hook MUST
+   * answer only language-level internal/file-local linkage. It must not fold
+   * in broader unqualified-name visibility rules such as namespace or member
+   * lookup: an explicit declaration already establishes caller visibility.
+   *
+   * C and C++ provide this hook for `static` free functions. Languages whose
+   * declaration/definition identity is already represented by imports or one
+   * graph node leave it undefined, disabling cross-file prototype joining.
+   */
+  readonly hasFileLocalCallableLinkage?: (def: SymbolDefinition) => boolean;
 
   /**
    * Optional predicate to identify members for which dispatch through
@@ -926,6 +1009,44 @@ export interface ScopeResolver {
    * level bindings.
    */
   readonly hoistTypeBindingsToModule?: boolean;
+
+  /**
+   * Whether the compound-receiver resolver should strip C-style cast
+   * expressions from receiver-position text before resolving it —
+   * `((Target)((Object)expr)).method()` peels to receiver `expr` with
+   * cast type `Target`, and the outermost captured cast type wins as
+   * the receiver's class. Default `false`.
+   *
+   * Java opts in: decompiler output is dense with cast-wrapped
+   * receivers, and Java's `(Type) expr` cast syntax makes the paren
+   * group textually classifiable. Keep disabled elsewhere:
+   * `(...)`-prefixed receiver text is ambiguous across languages
+   * (grouping, tuples, IIFEs, C-style declarations), so treating it
+   * as a cast would fabricate receiver types — non-opting languages
+   * must see receiver text completely untouched.
+   *
+   * Classifier grammar (exact): a peeled paren group whose content is
+   * a simple identifier (`/^[a-zA-Z_]\w*$/`) is captured as the cast
+   * type; content matching `Ident(.Ident)*(<...>)?([])*` — dotted,
+   * generic, and/or array shapes — is recognized as a cast whose
+   * target type cannot be looked up, and the resolver resolves
+   * NOTHING for that receiver (never the pre-cast expression's own
+   * declared type). Any other paren-group content is not a cast and
+   * the text falls through to the normal resolver.
+   *
+   * A second opting language must extend the classifier grammar or
+   * convert this toggle into a per-language classifier hook (the
+   * `unwrapCollectionAccessor` pattern) — do not flip this flag for
+   * another language as-is.
+   *
+   * Known non-goal: the compound-receiver options built from this
+   * toggle also feed Case 3b (chain-typeBinding rawNames — declared
+   * types / member paths, never cast RHS for Java) and Case 4's
+   * compound fallback (`receiverName`, paren-free because Case 0
+   * intercepts receivers containing `(` or `.` first), so the
+   * stripper is structurally inert on those inputs.
+   */
+  readonly stripReceiverCastExpressions?: boolean;
 
   /**
    * Optional: detect structural (duck-typing) interface implementations.

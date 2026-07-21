@@ -2,7 +2,7 @@
  * AI Context Generator
  *
  * Creates AGENTS.md and CLAUDE.md with full inline GitNexus context.
- * AGENTS.md is the standard read by Cursor, Windsurf, OpenCode, Codex, Cline, etc.
+ * AGENTS.md is the standard read by Cursor, Windsurf, OpenCode, Codex, Cline, CodeBuddy, Qoder, etc.
  * CLAUDE.md is for Claude Code which only reads that file.
  */
 
@@ -10,6 +10,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { type GeneratedSkillInfo } from './skill-gen.js';
+import { STANDARD_SKILL_CATALOG } from './standard-skills.js';
 import { logger } from '../core/logger.js';
 
 // ESM equivalent of __dirname
@@ -155,7 +156,7 @@ export function generateGitNexusContent(
       ? generatedSkills
           .map(
             (s) =>
-              `| Work in the ${s.label} area (${s.symbolCount} symbols) | \`.claude/skills/generated/${s.name}/SKILL.md\` |`,
+              `| Work in the ${s.label} area (${s.symbolCount} symbols) | \`.claude/skills/${s.name}/SKILL.md\` |`,
           )
           .join('\n')
       : '';
@@ -163,16 +164,13 @@ export function generateGitNexusContent(
   // Standard skill rows reference files installed by installSkills(). When
   // --skip-skills suppresses that install, these rows must be omitted — else
   // AGENTS.md/CLAUDE.md would direct agents to read files that don't exist.
-  // Community skills (generatedRows) live in .claude/skills/generated/ and
+  // Community skills (generatedRows) live directly under .claude/skills/ and
   // are independent of --skip-skills, so they remain when present.
   const standardSkillsRows = skipSkills
     ? ''
-    : `| Understand architecture / "How does X work?" | \`.claude/skills/gitnexus/gitnexus-exploring/SKILL.md\` |
-| Blast radius / "What breaks if I change X?" | \`.claude/skills/gitnexus/gitnexus-impact-analysis/SKILL.md\` |
-| Trace bugs / "Why is X failing?" | \`.claude/skills/gitnexus/gitnexus-debugging/SKILL.md\` |
-| Rename / extract / split / refactor | \`.claude/skills/gitnexus/gitnexus-refactoring/SKILL.md\` |
-| Tools, resources, schema reference | \`.claude/skills/gitnexus/gitnexus-guide/SKILL.md\` |
-| Index, status, clean, wiki CLI commands | \`.claude/skills/gitnexus/gitnexus-cli/SKILL.md\` |`;
+    : STANDARD_SKILL_CATALOG.filter((skill) => skill.distributions.project)
+        .map((skill) => `| ${skill.agentTableTask} | \`.claude/skills/${skill.name}/SKILL.md\` |`)
+        .join('\n');
 
   const tableBody = [standardSkillsRows, generatedRows].filter(Boolean).join('\n');
   const skillsTable = tableBody
@@ -364,48 +362,17 @@ async function upsertGitNexusSection(
 }
 
 /**
- * Install GitNexus skills to .claude/skills/gitnexus/
+ * Install GitNexus skills as direct children of .claude/skills/
  * Works natively with Claude Code, Cursor, and GitHub Copilot
  */
 async function installSkills(repoPath: string): Promise<string[]> {
-  const skillsDir = path.join(repoPath, '.claude', 'skills', 'gitnexus');
+  const skillsDir = path.join(repoPath, '.claude', 'skills');
+  const legacySkillsDir = path.join(skillsDir, 'gitnexus');
   const installedSkills: string[] = [];
 
-  // Skill definitions bundled with the package
-  const skills = [
-    {
-      name: 'gitnexus-exploring',
-      description:
-        'Use when the user asks how code works, wants to understand architecture, trace execution flows, or explore unfamiliar parts of the codebase. Examples: "How does X work?", "What calls this function?", "Show me the auth flow"',
-    },
-    {
-      name: 'gitnexus-debugging',
-      description:
-        'Use when the user is debugging a bug, tracing an error, or asking why something fails. Examples: "Why is X failing?", "Where does this error come from?", "Trace this bug"',
-    },
-    {
-      name: 'gitnexus-impact-analysis',
-      description:
-        'Use when the user wants to know what will break if they change something, or needs safety analysis before editing code. Examples: "Is it safe to change X?", "What depends on this?", "What will break?"',
-    },
-    {
-      name: 'gitnexus-refactoring',
-      description:
-        'Use when the user wants to rename, extract, split, move, or restructure code safely. Examples: "Rename this function", "Extract this into a module", "Refactor this class", "Move this to a separate file"',
-    },
-    {
-      name: 'gitnexus-guide',
-      description:
-        'Use when the user asks about GitNexus itself — available tools, how to query the knowledge graph, MCP resources, graph schema, or workflow reference. Examples: "What GitNexus tools are available?", "How do I use GitNexus?"',
-    },
-    {
-      name: 'gitnexus-cli',
-      description:
-        'Use when the user needs to run GitNexus CLI commands like analyze/index a repo, check status, clean the index, generate a wiki, or list indexed repos. Examples: "Index this repo", "Reanalyze the codebase", "Generate a wiki"',
-    },
-  ];
-
-  for (const skill of skills) {
+  for (const skill of STANDARD_SKILL_CATALOG.filter(
+    (entry) => entry.distributions.project && entry.distributions.npm,
+  )) {
     const skillDir = path.join(skillsDir, skill.name);
     const skillPath = path.join(skillDir, 'SKILL.md');
 
@@ -423,12 +390,12 @@ async function installSkills(repoPath: string): Promise<string[]> {
         // Fallback: generate minimal skill content
         skillContent = `---
 name: ${skill.name}
-description: ${skill.description}
+description: ${skill.fallbackDescription}
 ---
 
 # ${skill.name.charAt(0).toUpperCase() + skill.name.slice(1)}
 
-${skill.description}
+${skill.fallbackDescription}
 
 Use GitNexus tools to accomplish this task.
 `;
@@ -436,6 +403,15 @@ Use GitNexus tools to accomplish this task.
 
       await fs.writeFile(skillPath, skillContent, 'utf-8');
       installedSkills.push(skill.name);
+
+      // Previous releases installed these known standard skills one level too
+      // deep. Remove only the child owned by this installer; unknown siblings
+      // under the legacy grouping directory may be user-authored and survive.
+      try {
+        await fs.rm(path.join(legacySkillsDir, skill.name), { recursive: true, force: true });
+      } catch (err) {
+        logger.warn({ err }, `Warning: Could not remove legacy skill ${skill.name}:`);
+      }
     } catch (err) {
       // Skip on error, don't fail the whole process
       logger.warn({ err }, `Warning: Could not install skill ${skill.name}:`);
@@ -518,14 +494,14 @@ export async function generateAIContextFiles(
     createdFiles.push('CLAUDE.md (skipped via --skip-agents-md)');
   }
 
-  // Install skills to .claude/skills/gitnexus/ (unless --skip-skills)
+  // Install standard skills directly under .claude/skills/ (unless --skip-skills)
   if (!options?.skipSkills) {
     const installedSkills = await installSkills(repoPath);
     if (installedSkills.length > 0) {
-      createdFiles.push(`.claude/skills/gitnexus/ (${installedSkills.length} skills)`);
+      createdFiles.push(`.claude/skills/gitnexus-*/ (${installedSkills.length} skills)`);
     }
   } else {
-    createdFiles.push('.claude/skills/gitnexus/ (skipped via --skip-skills)');
+    createdFiles.push('.claude/skills/gitnexus-*/ (skipped via --skip-skills)');
   }
 
   return { files: createdFiles };
