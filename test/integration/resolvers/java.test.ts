@@ -3077,6 +3077,17 @@ describe('Java enum-constant receiver dispatch (#2561)', () => {
     expect(dispatch!.rel.targetId).toBe('Method:src/EnumConst.java:EnumConst$1.hook#0');
   });
 
+  it("resolves EnumConst.A.log() to the host enum's inherited method via E$N's MRO (EnumConst.log#0)", () => {
+    // A's body overrides hook() but NOT log(); log() lives only on the enum.
+    // The bodied constant's receiver binds to EnumConst$1, whose MRO includes
+    // EnumConst (via @reference.inherits), so the qualified call reaches the
+    // host enum's own method — the inherited-dispatch capability the fix enables.
+    const calls = getRelationships(result, 'CALLS');
+    const dispatch = calls.find((c) => c.source === 'dispatchInherited' && c.target === 'log');
+    expect(dispatch).toBeDefined();
+    expect(dispatch!.rel.targetId).toBe('Method:src/EnumConst.java:EnumConst.log#0');
+  });
+
   it("resolves Plain.A.m() to the body-less constant's inherited enum method (Plain.m#0)", () => {
     const calls = getRelationships(result, 'CALLS');
     const dispatch = calls.find((c) => c.source === 'callPlain' && c.target === 'm');

@@ -375,20 +375,19 @@ function synthesizeJavaAnonymousClassDeclarations(rootNode: SyntaxNode): Capture
   // through the ownership gate's MRO arm.
   for (const constant of rootNode.descendantsOfType('enum_constant')) {
     const hostEnum = javaEnclosingEnumNameOf(constant);
+    const bodyNode = constant.childForFieldName?.('body');
+    const isBodied = bodyNode !== null && bodyNode !== undefined && bodyNode.type === 'class_body';
     const bodiedName = synthesizeJavaAnonymousClassName(constant);
-    if (bodiedName !== undefined) {
-      const body = constant.childForFieldName?.('body');
-      if (body !== null && body !== undefined && body.type === 'class_body') {
+    if (bodiedName !== undefined && isBodied) {
+      out.push({
+        '@declaration.class': nodeToCapture('@declaration.class', bodyNode),
+        '@declaration.name': syntheticCapture('@declaration.name', bodyNode, bodiedName),
+      });
+      if (hostEnum !== undefined) {
         out.push({
-          '@declaration.class': nodeToCapture('@declaration.class', body),
-          '@declaration.name': syntheticCapture('@declaration.name', body, bodiedName),
+          '@reference.inherits': nodeToCapture('@reference.inherits', bodyNode),
+          '@reference.name': syntheticCapture('@reference.name', bodyNode, hostEnum),
         });
-        if (hostEnum !== undefined) {
-          out.push({
-            '@reference.inherits': nodeToCapture('@reference.inherits', body),
-            '@reference.name': syntheticCapture('@reference.name', body, hostEnum),
-          });
-        }
       }
     }
 
@@ -401,8 +400,16 @@ function synthesizeJavaAnonymousClassDeclarations(rootNode: SyntaxNode): Capture
     // so members inherited from the enum still resolve), or to the host
     // enum itself when body-less — makes `E.CONST.method()` resolve with
     // no changes to the shared receiver-binding machinery.
+    //
+    // A bodied constant binds ONLY to its `E$N` class, never the host enum:
+    // if name synthesis fails on a malformed/error-recovery tree (`bodiedName`
+    // undefined despite a real body), emit nothing rather than silently
+    // misattributing an OVERRIDING constant's receiver to the enum's own
+    // (non-overridden) method — a wrong edge is worse than no edge. Mirrors
+    // the `object_creation_expression` branch, which skips on synthesis
+    // failure. `hostEnum` is used only for genuinely body-less constants.
     const constantNameNode = constant.childForFieldName?.('name');
-    const constantType = bodiedName ?? hostEnum;
+    const constantType = isBodied ? bodiedName : hostEnum;
     if (constantNameNode !== null && constantNameNode !== undefined && constantType !== undefined) {
       out.push({
         '@type-binding.annotation': nodeToCapture('@type-binding.annotation', constant),
