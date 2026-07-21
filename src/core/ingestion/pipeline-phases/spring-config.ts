@@ -25,6 +25,8 @@ import type { StructureOutput } from './structure.js';
 const require = createRequire(import.meta.url);
 const yaml = require('js-yaml') as typeof import('js-yaml');
 const MAX_CONFIG_FILE_BYTES = 2 * 1024 * 1024;
+const MAX_YAML_TRAVERSAL_DEPTH = 128;
+const MAX_YAML_TRAVERSAL_NODES = 100_000;
 
 export interface SpringConfigKey {
   readonly key: string;
@@ -143,6 +145,21 @@ interface YamlMappingLocation {
   readonly line: number;
 }
 
+interface YamlTraversalState {
+  remainingNodes: number;
+  readonly activeObjects: Set<object>;
+}
+
+function consumeYamlTraversalBudget(state: YamlTraversalState, depth: number): void {
+  if (depth > MAX_YAML_TRAVERSAL_DEPTH) {
+    throw new Error(`Spring YAML traversal depth exceeds ${MAX_YAML_TRAVERSAL_DEPTH}`);
+  }
+  state.remainingNodes--;
+  if (state.remainingNodes < 0) {
+    throw new Error(`Spring YAML traversal exceeds ${MAX_YAML_TRAVERSAL_NODES} nodes`);
+  }
+}
+
 function isObjectValue(value: unknown): value is object {
   return value !== null && typeof value === 'object';
 }
@@ -174,15 +191,25 @@ function findYamlMappingLocation(
   event: YamlParseEvent | undefined,
   key: string,
   objectEvents: WeakMap<object, YamlParseEvent>,
+  traversal: YamlTraversalState,
   visited = new Set<YamlParseEvent>(),
+  depth = 0,
 ): YamlMappingLocation | undefined {
+  consumeYamlTraversalBudget(traversal, depth);
   const resolved = resolveYamlAliasEvent(event, objectEvents);
   if (resolved === undefined || visited.has(resolved)) return undefined;
   visited.add(resolved);
 
   if (resolved.kind === 'sequence') {
     for (const child of resolved.children) {
-      const found = findYamlMappingLocation(child, key, objectEvents, visited);
+      const found = findYamlMappingLocation(
+        child,
+        key,
+        objectEvents,
+        traversal,
+        visited,
+        depth + 1,
+      );
       if (found !== undefined) return found;
     }
     return undefined;
@@ -195,7 +222,14 @@ function findYamlMappingLocation(
     return { valueEvent: direct.valueEvent, line: direct.keyEvent.startLine };
   }
   for (const merge of pairs.filter((pair) => pair.key === '<<')) {
-    const found = findYamlMappingLocation(merge.valueEvent, key, objectEvents, visited);
+    const found = findYamlMappingLocation(
+      merge.valueEvent,
+      key,
+      objectEvents,
+      traversal,
+      visited,
+      depth + 1,
+    );
     if (found !== undefined) return found;
   }
   return undefined;
@@ -207,45 +241,60 @@ function flattenYamlValue(
   prefix: string,
   out: Map<string, number>,
   objectEvents: WeakMap<object, YamlParseEvent>,
+  traversal: YamlTraversalState,
   sourceLine = event?.startLine ?? 1,
+  depth = 0,
 ): void {
+  consumeYamlTraversalBudget(traversal, depth);
   const resolvedEvent = resolveYamlAliasEvent(event, objectEvents);
-  if (Array.isArray(value)) {
-    if (value.length === 0 && prefix.length > 0 && !out.has(prefix)) out.set(prefix, sourceLine);
-    value.forEach((item, index) =>
-      flattenYamlValue(
-        item,
-        resolvedEvent?.children[index],
-        `${prefix}[${index}]`,
-        out,
-        objectEvents,
-        sourceLine,
-      ),
-    );
-    return;
-  }
-  if (
-    value !== null &&
-    typeof value === 'object' &&
-    (resolvedEvent?.kind === 'mapping' || resolvedEvent === undefined)
-  ) {
-    const entries = Object.entries(value as Record<string, unknown>);
-    if (entries.length === 0 && prefix.length > 0 && !out.has(prefix)) out.set(prefix, sourceLine);
-    for (const [key, nested] of entries) {
-      const next = prefix.length === 0 ? key : `${prefix}.${key}`;
-      const location = findYamlMappingLocation(resolvedEvent, key, objectEvents);
-      flattenYamlValue(
-        nested,
-        location?.valueEvent,
-        next,
-        out,
-        objectEvents,
-        location?.line ?? sourceLine,
+  const trackedObject = isObjectValue(value) ? value : undefined;
+  if (trackedObject !== undefined && traversal.activeObjects.has(trackedObject)) return;
+  if (trackedObject !== undefined) traversal.activeObjects.add(trackedObject);
+  try {
+    if (Array.isArray(value)) {
+      if (value.length === 0 && prefix.length > 0 && !out.has(prefix)) out.set(prefix, sourceLine);
+      value.forEach((item, index) =>
+        flattenYamlValue(
+          item,
+          resolvedEvent?.children[index],
+          `${prefix}[${index}]`,
+          out,
+          objectEvents,
+          traversal,
+          sourceLine,
+          depth + 1,
+        ),
       );
+      return;
     }
-    return;
+    if (
+      value !== null &&
+      typeof value === 'object' &&
+      (resolvedEvent?.kind === 'mapping' || resolvedEvent === undefined)
+    ) {
+      const entries = Object.entries(value as Record<string, unknown>);
+      if (entries.length === 0 && prefix.length > 0 && !out.has(prefix))
+        out.set(prefix, sourceLine);
+      for (const [key, nested] of entries) {
+        const next = prefix.length === 0 ? key : `${prefix}.${key}`;
+        const location = findYamlMappingLocation(resolvedEvent, key, objectEvents, traversal);
+        flattenYamlValue(
+          nested,
+          location?.valueEvent,
+          next,
+          out,
+          objectEvents,
+          traversal,
+          location?.line ?? sourceLine,
+          depth + 1,
+        );
+      }
+      return;
+    }
+    if (prefix.length > 0 && !out.has(prefix)) out.set(prefix, sourceLine);
+  } finally {
+    if (trackedObject !== undefined) traversal.activeObjects.delete(trackedObject);
   }
-  if (prefix.length > 0 && !out.has(prefix)) out.set(prefix, sourceLine);
 }
 
 /** Parse and flatten YAML leaves without retaining their values. */
@@ -259,6 +308,10 @@ export function parseSpringYaml(
   const documentEvents: YamlParseEvent[] = [];
   const objectEvents = new WeakMap<object, YamlParseEvent>();
   const documents: unknown[] = [];
+  const traversal: YamlTraversalState = {
+    remainingNodes: MAX_YAML_TRAVERSAL_NODES,
+    activeObjects: new Set<object>(),
+  };
 
   yaml.loadAll(content, (document) => documents.push(document), {
     schema: yaml.DEFAULT_SCHEMA,
@@ -290,7 +343,7 @@ export function parseSpringYaml(
   });
 
   documents.forEach((document, index) =>
-    flattenYamlValue(document, documentEvents[index], '', flattened, objectEvents),
+    flattenYamlValue(document, documentEvents[index], '', flattened, objectEvents, traversal),
   );
   return [...flattened.entries()]
     .sort(([left], [right]) => left.localeCompare(right))
@@ -350,7 +403,6 @@ export const springConfigPhase: PipelinePhase<SpringConfigOutput> = {
           filePath: entry.filePath,
           startLine: entry.line,
           endLine: entry.line,
-          language: entry.format,
           description: entry.profile
             ? `${SPRING_CONFIG_DESCRIPTION} (profile: ${entry.profile})`
             : SPRING_CONFIG_DESCRIPTION,

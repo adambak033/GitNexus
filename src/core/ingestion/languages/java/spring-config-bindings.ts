@@ -19,7 +19,7 @@ const CONFIGURATION_PROPERTIES_ANNOTATION =
 
 interface JavaAnnotation {
   readonly name: string;
-  readonly text: string;
+  readonly node: SyntaxNode;
 }
 
 interface JavaImports {
@@ -70,7 +70,7 @@ function annotationsOn(node: SyntaxNode): JavaAnnotation[] {
   for (const child of modifiers.namedChildren) {
     if (child.type !== 'annotation' && child.type !== 'marker_annotation') continue;
     const name = child.childForFieldName('name')?.text ?? child.firstNamedChild?.text;
-    if (name) annotations.push({ name, text: child.text });
+    if (name) annotations.push({ name, node: child });
   }
   return annotations;
 }
@@ -88,8 +88,9 @@ function resolvesToAnnotation(
 }
 
 function decodeJavaStringLiteral(literal: string): string {
+  const delimiterLength = literal.startsWith('"""') && literal.endsWith('"""') ? 3 : 1;
   return literal
-    .slice(1, -1)
+    .slice(delimiterLength, -delimiterLength)
     .replace(/\\u([0-9a-fA-F]{4})/g, (_match, hex: string) =>
       String.fromCharCode(Number.parseInt(hex, 16)),
     )
@@ -105,14 +106,16 @@ function decodeJavaStringLiteral(literal: string): string {
     });
 }
 
-function javaStringLiterals(text: string): string[] {
-  return [...text.matchAll(/"(?:\\.|[^"\\])*"/g)].map((match) => decodeJavaStringLiteral(match[0]));
+function javaStringLiterals(annotation: SyntaxNode): string[] {
+  return annotation
+    .descendantsOfType('string_literal')
+    .map((literal) => decodeJavaStringLiteral(literal.text));
 }
 
 /** Extract statically readable Spring placeholder keys from a Java annotation. */
-export function parseValuePlaceholderKeys(annotationText: string): string[] {
+export function parseValuePlaceholderKeys(annotation: SyntaxNode): string[] {
   const keys = new Set<string>();
-  for (const literal of javaStringLiterals(annotationText)) {
+  for (const literal of javaStringLiterals(annotation)) {
     for (const match of literal.matchAll(/\$\{([^{}]+)\}/g)) {
       const key = match[1].split(':', 1)[0].trim();
       if (/^[A-Za-z0-9_.-]+$/.test(key)) keys.add(key);
@@ -122,11 +125,22 @@ export function parseValuePlaceholderKeys(annotationText: string): string[] {
 }
 
 /** Extract `prefix`/`value` (or the positional value) from the annotation. */
-export function parseConfigurationPropertiesPrefix(annotationText: string): string | null {
-  const named = /\b(?:prefix|value)\s*=\s*("(?:\\.|[^"\\])*")/.exec(annotationText);
-  const literal = named?.[1] ?? annotationText.match(/"(?:\\.|[^"\\])*"/)?.[0];
-  if (literal === undefined) return null;
-  const prefix = decodeJavaStringLiteral(literal)
+export function parseConfigurationPropertiesPrefix(annotation: SyntaxNode): string | null {
+  const named = annotation.descendantsOfType('element_value_pair').find((pair) => {
+    const key = pair.childForFieldName('key')?.text;
+    return key === 'prefix' || key === 'value';
+  });
+  const namedValue = named?.childForFieldName('value');
+  const argumentsNode = annotation.childForFieldName('arguments');
+  const literalNode =
+    (namedValue?.type === 'string_literal'
+      ? namedValue
+      : namedValue?.descendantsOfType('string_literal')[0]) ??
+    (named === undefined
+      ? argumentsNode?.namedChildren.find((child) => child.type === 'string_literal')
+      : undefined);
+  if (literalNode === undefined) return null;
+  const prefix = decodeJavaStringLiteral(literalNode.text)
     .trim()
     .replace(/^\.+|\.+$/g, '');
   return /^[A-Za-z0-9_.-]+$/.test(prefix) ? prefix : null;
@@ -172,7 +186,7 @@ export function captureJavaSpringConfigConsumerFacts(
       const fieldName = declarator.childForFieldName('name')?.text;
       if (!fieldName) continue;
       for (const annotation of annotations) {
-        const keys = parseValuePlaceholderKeys(annotation.text);
+        const keys = parseValuePlaceholderKeys(annotation.node);
         if (keys.length > 0) {
           facts.push({
             consumer: { kind: 'value', fieldName, line: field.startPosition.row + 1, keys },
@@ -192,7 +206,7 @@ export function captureJavaSpringConfigConsumerFacts(
         if (!resolvesToAnnotation(annotation.name, CONFIGURATION_PROPERTIES_ANNOTATION, imports)) {
           continue;
         }
-        const prefix = parseConfigurationPropertiesPrefix(annotation.text);
+        const prefix = parseConfigurationPropertiesPrefix(annotation.node);
         if (prefix !== null) {
           facts.push({
             consumer: {

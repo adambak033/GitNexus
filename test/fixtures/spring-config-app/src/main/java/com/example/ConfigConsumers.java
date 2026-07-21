@@ -17,4 +17,9 @@ class ServiceProperties {
   private Retry retry;
 }
 
+@ConfigurationProperties("service")
+class UnmatchedServiceProperties {
+  private String unrelated;
+}
+
 class Retry {}

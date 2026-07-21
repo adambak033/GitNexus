@@ -28,6 +28,15 @@ describe('analysis feature versions', () => {
       'graph.class-framework-annotations': 1,
       'spring.bean-inventory': 1,
     });
+    expect(
+      resolveAnalysisFeatureVersions(FEATURES, [
+        'src/main/resources/application-local.yml',
+        'README.md',
+      ]),
+    ).toEqual({
+      'graph.class-framework-annotations': 1,
+      'spring.config-bindings': 1,
+    });
   });
 
   it('requires an exact, well-formed feature set', () => {

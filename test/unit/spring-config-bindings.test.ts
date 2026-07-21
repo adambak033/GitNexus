@@ -6,11 +6,7 @@ import {
   parseSpringProperties,
   parseSpringYaml,
 } from '../../src/core/ingestion/pipeline-phases/spring-config.js';
-import {
-  extractJavaSpringConfigConsumers,
-  parseConfigurationPropertiesPrefix,
-  parseValuePlaceholderKeys,
-} from '../../src/core/ingestion/languages/java/spring-config-bindings.js';
+import { extractJavaSpringConfigConsumers } from '../../src/core/ingestion/languages/java/spring-config-bindings.js';
 
 describe('Spring configuration parsing', () => {
   it('recognizes base and profile-specific application config files', () => {
@@ -83,13 +79,17 @@ describe('Spring configuration parsing', () => {
     expect(keys.some((entry) => entry.key.includes('<<'))).toBe(false);
   });
 
-  it('parses Value defaults and ConfigurationProperties aliases', () => {
-    expect(parseValuePlaceholderKeys('@Value("${server.port:8080}")')).toEqual(['server.port']);
+  it('terminates cyclic YAML aliases and bounds deeply nested expansion', () => {
     expect(
-      parseConfigurationPropertiesPrefix('@ConfigurationProperties(prefix = "acme.api")'),
-    ).toBe('acme.api');
-    expect(parseConfigurationPropertiesPrefix('@ConfigurationProperties("acme.api")')).toBe(
-      'acme.api',
+      parseSpringYaml('cycle: &cycle { self: *cycle }\nhealthy: true\n', 'application.yml'),
+    ).toEqual([expect.objectContaining({ key: 'healthy', line: 2 })]);
+
+    const aliasChain = ['level0: &level0 { leaf: true }'];
+    for (let index = 1; index <= 130; index++) {
+      aliasChain.push(`level${index}: &level${index} { next: *level${index - 1} }`);
+    }
+    expect(() => parseSpringYaml(aliasChain.join('\n'), 'application.yml')).toThrow(
+      'Spring YAML traversal depth',
     );
   });
 });
@@ -142,6 +142,30 @@ describe('Java Spring configuration consumers', () => {
         className: 'ServiceProperties',
         prefix: 'service',
       }),
+    ]);
+  });
+
+  it('reads only string-literal AST nodes and ignores placeholders inside comments', () => {
+    const consumers = extractJavaSpringConfigConsumers(`
+      import org.springframework.beans.factory.annotation.Value;
+      import org.springframework.boot.context.properties.ConfigurationProperties;
+
+      @ConfigurationProperties(
+        // legacy prefix: "old.unsafe"
+        value = "service"
+      )
+      class ServiceProperties {
+        @Value(
+          /* legacy: "\${old.unsafe.key}" */
+          "\${service.timeout:30}"
+        )
+        private int timeout;
+      }
+    `);
+
+    expect(consumers).toEqual([
+      expect.objectContaining({ kind: 'value', keys: ['service.timeout'] }),
+      expect.objectContaining({ kind: 'configuration-properties', prefix: 'service' }),
     ]);
   });
 });
