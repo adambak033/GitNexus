@@ -32,9 +32,13 @@ import { getJavaParser, getJavaScopeQuery } from './query.js';
 import { recordCacheHit, recordCacheMiss } from './cache-stats.js';
 import { getTreeSitterBufferSize } from '../../constants.js';
 import { parseSourceSafe } from '../../../tree-sitter/safe-parse.js';
-import { setJavaClassAnnotationFacts } from './capture-side-channel.js';
+import {
+  setJavaClassAnnotationFacts,
+  setJavaSpringConfigConsumerFacts,
+} from './capture-side-channel.js';
 import { captureJavaPackageFact } from './package-facts.js';
 import { synthesizeCallableFlowCaptures } from '../../utils/callable-flow-captures.js';
+import { captureJavaSpringConfigConsumerFacts } from './spring-config-bindings.js';
 
 /** Declaration anchors that carry function-like arity metadata. */
 const FUNCTION_DECL_TAGS = ['@declaration.method', '@declaration.constructor'] as const;
@@ -280,6 +284,10 @@ export function emitJavaScopeCaptures(
   }
 
   setJavaClassAnnotationFacts(filePath, materializeClassAnnotationFacts(classAnnotations));
+  setJavaSpringConfigConsumerFacts(
+    filePath,
+    captureJavaSpringConfigConsumerFacts(tree.rootNode, filePath),
+  );
 
   return [
     ...resolveVarTypeBindings(out),
