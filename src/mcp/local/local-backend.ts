@@ -4366,8 +4366,11 @@ export class LocalBackend {
     // whole-file `\boldName\b` global replace on every file in `changes`, so the
     // reported edit list MUST enumerate every matching line in every such file —
     // otherwise the preview under-reports what lands, and the same partial list
-    // comes back after apply (#2605). Building `changes` from one file set is the
-    // single source of truth that keeps the report and the apply provably in sync.
+    // comes back after apply (#2605). Building `changes` from one file set makes
+    // the preview enumerate exactly the files the apply loop rewrites, using the
+    // same word-boundary regex. (This is per-call consistency; the apply loop
+    // still re-reads each file, so an external write landing between preview and
+    // apply is a pre-existing gap this method does not lock against.)
     type RenameEdit = {
       line: number;
       old_text: string;
@@ -4434,13 +4437,15 @@ export class LocalBackend {
       logQueryError('rename:ripgrep', e);
     }
 
-    // Enumerate every `\boldName\b` line in every file to rewrite, using the same
-    // escaped global regex the apply step uses. A file with no matching line is
-    // dropped (apply would write nothing to it). Because apply's per-file global
-    // replace rewrites exactly these lines, the reported list equals what lands.
+    // Enumerate every `\boldName\b` line in each file to rewrite, so the previewed
+    // file set is exactly the set the apply loop below rewrites. A file with no
+    // matching line is dropped (apply would write nothing to it). `wordTest`
+    // (non-global) probes each line; `wordReplace` (global) rewrites it and is
+    // reused by the apply loop — compiled once each rather than once per line,
+    // and one escaping formula serves both passes.
+    const wordTest = new RegExp(`\\b${escapedOldName}\\b`);
+    const wordReplace = new RegExp(`\\b${escapedOldName}\\b`, 'g');
     const changes = new Map<string, { file_path: string; edits: RenameEdit[] }>();
-    let graphEdits = 0;
-    let astSearchEdits = 0;
 
     for (const [filePath, confidence] of fileConfidence) {
       try {
@@ -4448,20 +4453,15 @@ export class LocalBackend {
         const lines = content.split('\n');
         const edits: RenameEdit[] = [];
         for (let i = 0; i < lines.length; i++) {
-          if (!new RegExp(`\\b${escapedOldName}\\b`).test(lines[i])) {
+          if (!wordTest.test(lines[i])) {
             continue;
           }
           edits.push({
             line: i + 1,
             old_text: lines[i].trim(),
-            new_text: lines[i].replace(new RegExp(`\\b${escapedOldName}\\b`, 'g'), new_name).trim(),
+            new_text: lines[i].replace(wordReplace, new_name).trim(),
             confidence,
           });
-          if (confidence === 'graph') {
-            graphEdits++;
-          } else {
-            astSearchEdits++;
-          }
         }
         if (edits.length > 0) {
           changes.set(filePath, { file_path: filePath, edits });
@@ -4471,26 +4471,42 @@ export class LocalBackend {
       }
     }
 
-    // Step 4: Apply or preview
-    const allChanges = Array.from(changes.values());
-    const totalEdits = allChanges.reduce((sum, c) => sum + c.edits.length, 0);
-
+    // Step 4: Apply or preview.
     const failedFiles: string[] = [];
     if (!dry_run) {
-      // Apply edits to files
-      for (const change of allChanges) {
+      for (const change of changes.values()) {
         try {
           const fullPath = assertSafePath(change.file_path);
-          let content = await fs.readFile(fullPath, 'utf-8');
-          const regex = new RegExp(`\\b${oldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'g');
-          content = content.replace(regex, new_name);
-          await fs.writeFile(fullPath, content, 'utf-8');
+          const content = await fs.readFile(fullPath, 'utf-8');
+          await fs.writeFile(fullPath, content.replace(wordReplace, new_name), 'utf-8');
         } catch (e) {
-          // A swallowed write failure must not be reported as a full success
-          // (#2283): record the file so the result can degrade to 'partial'
-          // with the unwritten files listed, rather than masquerading as done.
+          // A swallowed write failure must not be reported as success (#2283):
+          // record the file so the result degrades to 'partial'.
           logQueryError('rename:apply-edit', e);
           failedFiles.push(change.file_path);
+        }
+      }
+      // A file whose write threw did not land, so drop its edits from the
+      // reported result — total_edits/changes must describe what actually
+      // reached disk, not what was attempted (#2605: the report matches reality
+      // even on partial failure). failed_files still names every dropped file.
+      for (const f of failedFiles) {
+        changes.delete(f);
+      }
+    }
+
+    // Counts derive from the reported set (dry-run: every enumerated file;
+    // apply: only files that landed), so the graph/text_search split always
+    // sums to total_edits and never overstates a partial apply.
+    const reported = Array.from(changes.values());
+    let graphEdits = 0;
+    let astSearchEdits = 0;
+    for (const change of reported) {
+      for (const edit of change.edits) {
+        if (edit.confidence === 'graph') {
+          graphEdits++;
+        } else {
+          astSearchEdits++;
         }
       }
     }
@@ -4499,11 +4515,11 @@ export class LocalBackend {
       status: failedFiles.length > 0 ? 'partial' : 'success',
       old_name: oldName,
       new_name,
-      files_affected: allChanges.length,
-      total_edits: totalEdits,
+      files_affected: reported.length,
+      total_edits: graphEdits + astSearchEdits,
       graph_edits: graphEdits,
       text_search_edits: astSearchEdits,
-      changes: allChanges,
+      changes: reported,
       applied: !dry_run,
       ...(failedFiles.length > 0 && { failed_files: failedFiles }),
     };
