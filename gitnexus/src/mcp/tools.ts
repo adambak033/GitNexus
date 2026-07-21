@@ -159,8 +159,9 @@ SERVICE: optional monorepo path prefix (POSIX-style, case-sensitive segments). W
         },
         limit: {
           type: 'number',
-          description: 'Max processes to return (default: 5)',
-          default: 5,
+          description:
+            'Max processes to return (default: 10 — raised from 5 so dense domains like tRPC action routers surface more of their flow set in one page)',
+          default: 10,
           minimum: 1,
           maximum: 100,
         },
