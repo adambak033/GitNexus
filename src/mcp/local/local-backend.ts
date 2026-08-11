@@ -4017,7 +4017,7 @@ export class LocalBackend {
             MATCH (n)-[hm:CodeRelation]->(ctor:Constructor)
             WHERE n.id = $symId AND hm.type = 'HAS_METHOD'
             MATCH (caller)-[r:CodeRelation]->(ctor)
-            WHERE r.type = 'CALLS' OR r.type = 'IMPORTS' OR r.type = 'EXTENDS' OR r.type = 'IMPLEMENTS' OR r.type = 'USES' OR r.type = 'ACCESSES'
+            WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'USES', 'ACCESSES']
             RETURN r.type AS relType, caller.id AS uid, caller.name AS name, caller.filePath AS filePath, labels(caller)[0] AS kind
             ORDER BY uid, relType
             LIMIT 30
@@ -4030,7 +4030,7 @@ export class LocalBackend {
             MATCH (f:File)-[rel:CodeRelation]->(n)
             WHERE n.id = $symId AND rel.type = 'DEFINES'
             MATCH (caller)-[r:CodeRelation]->(f)
-            WHERE r.type = 'CALLS' OR r.type = 'IMPORTS'
+            WHERE r.type IN ['CALLS', 'IMPORTS']
             RETURN r.type AS relType, caller.id AS uid, caller.name AS name, caller.filePath AS filePath, labels(caller)[0] AS kind
             ORDER BY uid, relType
             LIMIT 30
@@ -4045,7 +4045,7 @@ export class LocalBackend {
                OR p.declaredType STARTS WITH $genericPrefix
                OR p.declaredType CONTAINS $genericArg
             MATCH (caller)-[r:CodeRelation]->(p)
-            WHERE r.type = 'CALLS' OR r.type = 'IMPORTS' OR r.type = 'EXTENDS' OR r.type = 'IMPLEMENTS' OR r.type = 'USES' OR r.type = 'ACCESSES'
+            WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'USES', 'ACCESSES']
             RETURN r.type AS relType, caller.id AS uid, caller.name AS name, caller.filePath AS filePath, labels(caller)[0] AS kind
             ORDER BY uid, relType
             LIMIT 30
