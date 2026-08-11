@@ -23,7 +23,8 @@ import {
   registryPathEquals,
 } from '../storage/repo-manager.js';
 import { logger } from '../core/logger.js';
-import type { JobManager } from './analyze-job.js';
+import { autoHeapCapMb } from '../core/ingestion/utils/effective-ram.js';
+import { isTerminalJobStatus, type JobManager } from './analyze-job.js';
 import type { WorkerMessage } from './analyze-worker.js';
 
 const _require = createRequire(import.meta.url);
@@ -151,12 +152,20 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
       ? ['--import', pathToFileURL(_require.resolve('tsx/esm')).href]
       : [];
 
+    // Worker heap: 8192MB historical default, but never above what this
+    // machine/container actually has (#2649 review — a fixed 8192 inside a
+    // smaller cgroup limit died to the kernel with a misleading remedy).
+    // GITNEXUS_SERVER_ANALYZE_HEAP_MB overrides as an absolute value.
+    const envHeapMb = Number(process.env.GITNEXUS_SERVER_ANALYZE_HEAP_MB);
+    const workerHeapMb =
+      Number.isInteger(envHeapMb) && envHeapMb > 0 ? envHeapMb : Math.min(8192, autoHeapCapMb());
+
     const forkWorker = () => {
       const currentJob = jobManager.getJob(job.id);
-      if (!currentJob || currentJob.status === 'complete' || currentJob.status === 'failed') return;
+      if (!currentJob || isTerminalJobStatus(currentJob.status)) return;
 
       const child = fork(workerPath, [], {
-        execArgv: [...tsxHookArgs, '--max-old-space-size=8192'],
+        execArgv: [...tsxHookArgs, `--max-old-space-size=${workerHeapMb}`],
         stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
       });
 
@@ -173,7 +182,7 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
         // re-release the repo lock or flip the reported status. Mirrors the `exit`
         // handler guard below; pairs with the worker's terminal-claim (#2264 P3).
         const current = jobManager.getJob(job.id);
-        if (!current || current.status === 'complete' || current.status === 'failed') return;
+        if (!current || isTerminalJobStatus(current.status)) return;
 
         if (msg.type === 'progress') {
           jobManager.updateJob(job.id, {
@@ -185,16 +194,78 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
           // Before marking complete: (1) wait for the worker's on-disk
           // finalization to settle (see waitForSettledIndex), (2) evict the
           // cached DB handle — same invalidation DELETE /api/repo performs, a
-          // handle opened before the rewrite reads pre-rewrite state — and
-          // only then (3) reinitialize the backend. This makes the ordering
-          // comment below true in practice: the repo is actually queryable
-          // when the client receives the SSE complete event.
+          // handle opened before the rewrite reads pre-rewrite state — (3)
+          // decide the outcome, and only then (4) reinitialize the backend,
+          // which is what PUBLISHES the index. This makes the ordering comment
+          // below true in practice: the repo is actually queryable when the
+          // client receives the SSE complete event, and an index this run knows
+          // to be incomplete is never published at all.
           waitForSettledIndex(targetPath, jobStartMs)
             .then(() => closeDbHandle())
             .catch(() => {}) // best-effort: eviction failure must not fail the job
-            .then(() => backend.init())
             .then(() => {
-              jobManager.updateJob(job.id, { status: 'complete', repoName: msg.result.repoName });
+              // PARITY WITH THE CLI, which is what the IPC projection was added
+              // for. `analyze-worker-ipc.ts` carries `graphWriteCollapsed`
+              // "so a server-side caller sees the same degraded outcome the CLI
+              // does" — but nothing here read it, so the comment described an
+              // intention rather than the shipped behaviour and every collapsed
+              // run reported `complete` to the UI and to every API consumer.
+              //
+              // `failed` rather than `complete`, because that is the CLI's
+              // choice: it prints `Repository indexed INCOMPLETELY` and exits
+              // non-zero. The index exists but most of its edges do not, and a
+              // consumer that reads "complete" will query it and get confident
+              // wrong answers — the precise failure this whole guard exists to
+              // stop. The message names the remedy, and a re-run now forces a
+              // full rebuild on its own (see the `graphWriteCollapsed` trigger
+              // in run-analyze.ts).
+              //
+              // ── THE CHECK RUNS BEFORE `backend.init()`, AND THAT ORDER IS
+              // THE GUARD ── `backend.init()` is the PUBLISH step: it is
+              // `refreshRepos()`, which re-reads the registry and swaps the
+              // freshly-registered repo into the in-memory map every MCP tool
+              // and HTTP route resolves through. Running it first (as this
+              // chain used to) made the collapsed database live and queryable
+              // before the job was ever marked `failed`, so `status` was a
+              // label on an already-published index rather than a gate — and
+              // `backend-client.ts` routes the `failed` SSE event to
+              // `onError()` without ever calling `onComplete`, so the UI showed
+              // an error toast while every query answered from the incomplete
+              // graph. Publication cannot be undone from here (nothing on the
+              // backend un-registers a repo), so the only correct order is to
+              // decide first and publish second.
+              //
+              // `closeDbHandle()` above still runs on both paths, and must: the
+              // worker rewrote the DB files on disk, so a handle opened before
+              // the rewrite reads pre-rewrite state whatever the outcome was.
+              // Evicting it is not publication — it drops a cached connection,
+              // it does not add anything to the repo map.
+              const collapse = msg.result.graphWriteCollapsed;
+              if (collapse) {
+                // NOT published. `repoName` is reported even so: the success
+                // path sets it (`api.ts`'s repo-resolution wait matches jobs on
+                // `repoName` first and falls back to `repoUrl`/`repoPath`
+                // basenames), and a failure that drops it silently costs one of
+                // those three match keys for no reason.
+                jobManager.updateJob(job.id, {
+                  status: 'failed',
+                  repoName: msg.result.repoName,
+                  error:
+                    `Repository indexed INCOMPLETELY: only ${collapse.persisted} of ` +
+                    `${collapse.expected} expected relationships are readable. The index was not ` +
+                    `marked fresh and was NOT published to this server — a first-time analyze ` +
+                    `stays unreachable until a run succeeds (a previously published index for ` +
+                    `this repo keeps being served). Re-run the analysis — it will rebuild from ` +
+                    `scratch.`,
+                });
+                return;
+              }
+              // Healthy run only: publish, then report complete. This keeps the
+              // ordering comment above the chain true — the repo really is
+              // queryable when the client receives the SSE complete event.
+              return backend.init().then(() => {
+                jobManager.updateJob(job.id, { status: 'complete', repoName: msg.result.repoName });
+              });
             })
             .catch((err) => {
               logger.error({ err }, 'backend.init() failed after analyze:');
@@ -221,7 +292,7 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
 
       child.on('exit', (code) => {
         const j = jobManager.getJob(job.id);
-        if (!j || j.status === 'complete' || j.status === 'failed') return;
+        if (!j || isTerminalJobStatus(j.status)) return;
 
         // Worker crashed — attempt retry if under the limit
         if (j.retryCount < MAX_WORKER_RETRIES) {

@@ -18,7 +18,7 @@
  *     the delete joins `e.nodeId = n.id` through the still-present nodes —
  *     deleted/quoted files' rows go, survivors' rows stay.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import path from 'path';
 import { withTestLbugDB } from '../helpers/test-indexed-db.js';
 import { buildTestGraph, type TestNodeInput, type TestRelInput } from '../helpers/test-graph.js';
@@ -273,6 +273,293 @@ withTestLbugDB('delete-nodes-missing-embedding-table', () => {
       // …and the connection stays healthy for subsequent batches.
       await expect(deleteNodesForFiles(['src/b.ts'])).resolves.toBeUndefined();
       expect(await count(`MATCH (n:Function) RETURN count(n) AS c`)).toBe(0);
+    }, 120_000);
+  });
+});
+
+/**
+ * VECTOR-extension gate for embedding-row DML (#2623).
+ *
+ * LadybugDB refuses EVERY mutation of a table carrying an HNSW index while
+ * the VECTOR extension is not loaded on the connection. The surgical
+ * incremental writeback's FIRST statement is `deleteNodesForFiles`' embedding
+ * join-delete, and nothing on that path loaded VECTOR until Phase 4 — so an
+ * incremental analyze over a DB that already had `code_embedding_idx` died
+ * with "Trying to delete from an index on table CodeEmbedding but its
+ * extension is not loaded".
+ *
+ * `ensureEmbeddingRowDmlSafe` is the seam that answers "is embedding-row DML
+ * legal right now?" before a single row is touched. Own withTestLbugDB block:
+ * these cases close and reopen the DB under a different extension-install
+ * policy, which would wreck the sibling suites' shared connection.
+ *
+ * The block also carries the FTS twins of the same seam (#2841) —
+ * `ensureFtsRowDmlSafe` and, through the public `dropFTSIndex`, the catalog
+ * read behind it. They live here rather than in a new block because they need
+ * the identical machinery: the policy-reopen helper above, and the
+ * SHOW_INDEXES interception below that is the only way to stage an unreadable
+ * catalog. Where the VECTOR gate may fall back to a load it does not strictly
+ * need, both FTS readers must fall CLOSED — see the cases themselves.
+ */
+withTestLbugDB('embedding-row-dml-vector-gate', (handle) => {
+  describe('ensureEmbeddingRowDmlSafe (#2623)', () => {
+    const FILE_A = 'src/gate-a.ts';
+    const FILE_B = 'src/gate-b.ts';
+    const nodeIdFor = (fp: string): string => `Function:${fp}:fn:1`;
+
+    /** Reopen the singleton connection under an explicit install policy. */
+    const reopenWithPolicy = async (policy: string | undefined): Promise<void> => {
+      const { initLbug, closeLbug } = await import('../../src/core/lbug/lbug-adapter.js');
+      await closeLbug();
+      if (policy === undefined) delete process.env.GITNEXUS_LBUG_EXTENSION_INSTALL;
+      else process.env.GITNEXUS_LBUG_EXTENSION_INSTALL = policy;
+      await initLbug(handle.dbPath);
+    };
+
+    const seedTwoFilesWithEmbeddings = async (): Promise<void> => {
+      const { executeQuery, executeWithReusedStatement } =
+        await import('../../src/core/lbug/lbug-adapter.js');
+      const { batchInsertEmbeddings } =
+        await import('../../src/core/embeddings/embedding-pipeline.js');
+      for (const fp of [FILE_A, FILE_B]) {
+        await executeQuery(
+          `CREATE (:Function {id: '${nodeIdFor(fp)}', name: 'fn', filePath: '${fp}', startLine: 1, endLine: 3, isExported: true, content: '', description: ''})`,
+        );
+      }
+      await batchInsertEmbeddings(
+        executeWithReusedStatement,
+        [FILE_A, FILE_B].map((fp) => ({
+          nodeId: nodeIdFor(fp),
+          chunkIndex: 0,
+          startLine: 1,
+          endLine: 3,
+          embedding: new Array(EMBEDDING_DIMS).fill(0.1),
+          contentHash: `hash-${fp}`,
+        })),
+      );
+    };
+
+    const embeddingCountFor = async (fp: string): Promise<number> => {
+      const { executeQuery } = await import('../../src/core/lbug/lbug-adapter.js');
+      const rows = (await executeQuery(
+        `MATCH (e:${EMBEDDING_TABLE_NAME}) WHERE e.nodeId = '${nodeIdFor(fp)}' RETURN count(e) AS c`,
+      )) as Array<{ c: number | bigint }>;
+      return Number(rows[0]?.c ?? 0);
+    };
+
+    const clearSeed = async (): Promise<void> => {
+      const { executeQuery } = await import('../../src/core/lbug/lbug-adapter.js');
+      await executeQuery(`MATCH (e:${EMBEDDING_TABLE_NAME}) DELETE e`);
+      await executeQuery(`MATCH (n:Function) DETACH DELETE n`);
+    };
+
+    afterEach(async () => {
+      await reopenWithPolicy(undefined);
+      // Teardown deletes embedding rows, so it is itself subject to #2623 once
+      // a case has built the index — load VECTOR before clearing.
+      const { ensureEmbeddingRowDmlSafe } = await import('../../src/core/lbug/lbug-adapter.js');
+      await ensureEmbeddingRowDmlSafe();
+      await clearSeed();
+    });
+
+    it('no vector index + VECTOR unavailable → safe, and the delete still works', async () => {
+      await seedTwoFilesWithEmbeddings();
+      await reopenWithPolicy('never');
+      const { ensureEmbeddingRowDmlSafe, deleteNodesForFiles } =
+        await import('../../src/core/lbug/lbug-adapter.js');
+
+      // No HNSW index was ever built, so there is nothing to gate on — the
+      // degraded path must NOT escalate needlessly.
+      await expect(ensureEmbeddingRowDmlSafe()).resolves.toBe(true);
+      await expect(deleteNodesForFiles([FILE_A])).resolves.toBeUndefined();
+      expect(await embeddingCountFor(FILE_A)).toBe(0);
+      expect(await embeddingCountFor(FILE_B)).toBe(1);
+    }, 120_000);
+
+    it('vector index present + VECTOR unavailable → blocked, and the raw delete throws', async () => {
+      await seedTwoFilesWithEmbeddings();
+      const { createVectorIndex } = await import('../../src/core/lbug/lbug-adapter.js');
+      const built = await createVectorIndex();
+      if (!built) return; // VECTOR not installable here — nothing to assert.
+
+      await reopenWithPolicy('never');
+      const { ensureEmbeddingRowDmlSafe, deleteNodesForFiles } =
+        await import('../../src/core/lbug/lbug-adapter.js');
+
+      // The gate must SEE the hazard…
+      await expect(ensureEmbeddingRowDmlSafe()).resolves.toBe(false);
+      // …and the hazard must be real: this is the exact #2623 failure.
+      await expect(deleteNodesForFiles([FILE_A])).rejects.toThrow(/extension is not loaded/);
+      // Nothing was destroyed by the refused statement.
+      expect(await embeddingCountFor(FILE_A)).toBe(1);
+    }, 120_000);
+
+    it('vector index present + VECTOR loadable → safe, delete works, index survives', async () => {
+      await seedTwoFilesWithEmbeddings();
+      const { createVectorIndex } = await import('../../src/core/lbug/lbug-adapter.js');
+      const built = await createVectorIndex();
+      if (!built) return; // VECTOR not installable here — nothing to assert.
+
+      // Reopen so the in-process "already loaded" latch cannot mask a missing
+      // load — this is the state a second `analyze` run actually starts from.
+      await reopenWithPolicy(undefined);
+      const { ensureEmbeddingRowDmlSafe, deleteNodesForFiles, executeQuery } =
+        await import('../../src/core/lbug/lbug-adapter.js');
+
+      await expect(ensureEmbeddingRowDmlSafe()).resolves.toBe(true);
+      await expect(deleteNodesForFiles([FILE_A])).resolves.toBeUndefined();
+      expect(await embeddingCountFor(FILE_A)).toBe(0);
+      expect(await embeddingCountFor(FILE_B)).toBe(1);
+
+      // The surgical path KEEPS its index (run-analyze relies on HNSW
+      // self-maintaining across insert/delete) — it must still be there.
+      const indexes = (await executeQuery('CALL SHOW_INDEXES() RETURN *')) as Array<{
+        table_name?: string;
+        index_type?: string;
+      }>;
+      expect(
+        indexes.some((r) => r.table_name === EMBEDDING_TABLE_NAME && r.index_type === 'HNSW'),
+      ).toBe(true);
+    }, 120_000);
+
+    /**
+     * Run `run` with every `CALL SHOW_INDEXES()` on the writable connection
+     * forced to fail, passing every other statement through to the real engine
+     * and recording the SQL that was attempted.
+     *
+     * Forcing the read is the ONLY way to reach the gates' "could not prove
+     * anything" branch: `SHOW_INDEXES` is readable with no extension loaded, so
+     * a genuine unreadable catalog cannot be staged by configuration alone.
+     */
+    const withUnreadableIndexCatalog = async (
+      run: (seen: readonly string[]) => Promise<void>,
+    ): Promise<void> => {
+      const { default: lbug } = await import('@ladybugdb/core');
+      const originalQuery = lbug.Connection.prototype.query;
+      const seen: string[] = [];
+      const spy = vi.spyOn(lbug.Connection.prototype, 'query').mockImplementation(function (
+        this: unknown,
+        sql: string,
+        ...rest: unknown[]
+      ) {
+        seen.push(sql);
+        if (sql.includes('SHOW_INDEXES')) {
+          return Promise.reject(new Error('Catalog exception: forced by test'));
+        }
+        return originalQuery.call(this, sql, ...rest);
+      });
+
+      try {
+        await run(seen);
+      } finally {
+        spy.mockRestore();
+      }
+    };
+
+    it('catalog read fails → falls back to attempting the extension load (fail-safe)', async () => {
+      // The one branch where the gate cannot cheaply prove safety: SHOW_INDEXES
+      // itself errors. It must fall through to loadVectorExtension — in this
+      // environment the extension IS loadable, so the verdict is still `true`
+      // and DML proceeds safely despite the unreadable catalog.
+      await seedTwoFilesWithEmbeddings();
+      // Reopen so the module-level "already loaded" latch cannot let
+      // loadVectorExtension return true without issuing a LOAD statement.
+      await reopenWithPolicy('load-only');
+      const { ensureEmbeddingRowDmlSafe } = await import('../../src/core/lbug/lbug-adapter.js');
+
+      await withUnreadableIndexCatalog(async (seen) => {
+        await expect(ensureEmbeddingRowDmlSafe()).resolves.toBe(true);
+        // The catalog read was attempted and failed…
+        expect(seen.some((s) => s.includes('SHOW_INDEXES'))).toBe(true);
+        // …and the fallback really attempted the LOAD instead of guessing.
+        expect(seen.some((s) => s.toUpperCase().includes('LOAD'))).toBe(true);
+      });
+    }, 120_000);
+
+    /**
+     * The FTS twin of the case above (#2841). Same seam, opposite polarity:
+     * `ensureEmbeddingRowDmlSafe` may fall back to a load it does not strictly
+     * need, but `ensureFtsRowDmlSafe`'s only job is refusing an unsafe write, so
+     * an unprovable catalog must never be answered "no FTS index seen ⇒ safe".
+     *
+     * Both halves are asserted because either one alone is satisfiable by a
+     * broken gate: the verdict alone could come from a gate that never looked at
+     * the extension, and the LOAD alone could come from a gate that issued it
+     * and then returned `true` regardless.
+     */
+    it('FTS twin: an unreadable catalog fails CLOSED — verdict blocked, and the FTS load is attempted (#2841)', async () => {
+      const { ensureFtsRowDmlSafe } = await import('../../src/core/lbug/lbug-adapter.js');
+
+      // Half 1 — `never` makes the extension provably unloadable on every host,
+      // so the verdict is deterministic: a fail-OPEN gate answers `true` here.
+      await reopenWithPolicy('never');
+      await withUnreadableIndexCatalog(async (seen) => {
+        await expect(ensureFtsRowDmlSafe()).resolves.toBe(false);
+        expect(seen.some((s) => s.includes('SHOW_INDEXES'))).toBe(true);
+      });
+
+      // Half 2 — refusing is not enough: the gate must TRY to make the write
+      // legal, or an unreadable catalog would escalate every run to a full
+      // rebuild on a machine where FTS loads perfectly.
+      //
+      // Staging that needs care. `initLbug` pre-loads FTS itself whenever the
+      // policy permits (lbug-adapter.ts), and the adapter latches the result,
+      // so a gate running after a successful init-time load issues nothing and
+      // the assertion would be unfalsifiable. So: reopen under `never` (init's
+      // pre-load is refused, latch stays clear), then relax the policy WITHOUT
+      // reopening — the gate resolves it from the environment at call time, so
+      // the LOAD that appears is unambiguously its own. `afterEach`'s
+      // reopenWithPolicy(undefined) restores the variable.
+      //
+      // Deliberately not asserting the verdict here: whether FTS actually
+      // loads is a property of the host; ATTEMPTING it is the contract.
+      await reopenWithPolicy('never');
+      process.env.GITNEXUS_LBUG_EXTENSION_INSTALL = 'load-only';
+      await withUnreadableIndexCatalog(async (seen) => {
+        await ensureFtsRowDmlSafe();
+        expect(seen.some((s) => /^\s*LOAD EXTENSION fts\b/i.test(s))).toBe(true);
+        // …and it did not charge the caller a VECTOR load it never needed.
+        expect(seen.some((s) => /^\s*LOAD EXTENSION vector\b/i.test(s))).toBe(false);
+      });
+    }, 120_000);
+
+    /**
+     * `ftsIndexExistsInCatalog` is private; `dropFTSIndex` is the public surface
+     * that consumes it, and the H3 fix lives entirely in its unreadable-catalog
+     * branch. With the extension unloaded the DROP always fails the same way
+     * (`Catalog exception: function DROP_FTS_INDEX is not defined`), so the
+     * catalog read is the ONLY thing deciding whether the caller is told — which
+     * makes the two calls below a controlled pair on one connection.
+     */
+    it('FTS twin: dropFTSIndex rejects (not resolves) when the extension is unloaded and the catalog is unreadable (#2841 H3)', async () => {
+      await reopenWithPolicy('never');
+      const { dropFTSIndex } = await import('../../src/core/lbug/lbug-adapter.js');
+      // A name no index carries: with a READABLE catalog this is provably
+      // "nothing to drop", which is exactly what the unreadable read must NOT
+      // be allowed to imply.
+      const ABSENT_INDEX = 'delete_nodes_2841_absent_fts';
+
+      // Control — catalog readable, index provably absent ⇒ benign no-op.
+      await expect(dropFTSIndex('File', ABSENT_INDEX)).resolves.toBeUndefined();
+
+      // Same call, same connection, same engine error; only the catalog read
+      // changes. Before the fix this ALSO resolved silently — reporting an
+      // unprovable catalog as "index absent" and handing the caller a drop that
+      // never happened, one DML statement before the #2841 crash.
+      await withUnreadableIndexCatalog(async (seen) => {
+        // The message must claim only what the run can prove. This branch is
+        // reached when the catalog is UNREADABLE, and the only path into it
+        // (`ensureFtsRowDmlSafe` waved the surgical plan through because the
+        // catalog showed no FTS index, then a later read failed) is one where
+        // the same run already established the opposite of "exists" — so
+        // asserting existence here would state a fabricated fact while
+        // failing the run.
+        await expect(dropFTSIndex('File', ABSENT_INDEX)).rejects.toThrow(
+          /FTS index '.*' on table File could not be verified as absent/,
+        );
+        expect(seen.some((s) => s.includes('DROP_FTS_INDEX'))).toBe(true);
+        expect(seen.some((s) => s.includes('SHOW_INDEXES'))).toBe(true);
+      });
     }, 120_000);
   });
 });

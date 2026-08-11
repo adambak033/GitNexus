@@ -60,18 +60,23 @@ function isJsxFile(filePath: string): boolean {
   return filePath.endsWith('.jsx');
 }
 
-const JAVASCRIPT_SCOPE_QUERY = `
+export const JAVASCRIPT_SCOPE_QUERY = `
 ;; Scopes — module / class-likes / function-likes
 (program) @scope.module
 
 (class_declaration) @scope.class
 (class) @scope.class
 
-(function_declaration) @scope.function
-(generator_function_declaration) @scope.function
-(function_expression) @scope.function
+;; \`@receiver-owner.this\` — see the matching block in typescript/query.ts
+;; (#2701). Every function form except \`arrow_function\` binds its own \`this\`.
+(function_declaration) @scope.function @receiver-owner.this
+(generator_function_declaration) @scope.function @receiver-owner.this
+(function_expression) @scope.function @receiver-owner.this
+;; \`function*(){}\` as an EXPRESSION. Absent from this list before #2701, so it
+;; was not a scope at all and \`this\` inside one read as the enclosing method's.
+(generator_function) @scope.function @receiver-owner.this
 (arrow_function) @scope.function
-(method_definition) @scope.function
+(method_definition) @scope.function @receiver-owner.this
 
 ;; Object literals get their own scope boundary -- see the matching
 ;; comment in typescript/query.ts (#2545/#2551). Prevents a
@@ -79,6 +84,16 @@ const JAVASCRIPT_SCOPE_QUERY = `
 ;; past the literal into the enclosing scope, and (unlike Block) keeps
 ;; sibling properties from seeing each other as bare identifiers.
 (object) @scope.object
+
+;; Statement blocks are BINDING scopes (#2699). ECMAScript gives every block its
+;; own environment record, so \`let\`/\`const\`/\`class\`/\`function\` declared in
+;; sibling blocks of one function are DIFFERENT bindings — without this the
+;; resolver sees both as function-level and a call in one branch resolves to
+;; both. \`tsBindingScopeFor\` already implements the other half of the rule:
+;; \`var\` hoists past blocks to the enclosing Function/Module, \`let\`/\`const\`
+;; take the innermost scope, which is now the block.
+(statement_block) @scope.block
+
 
 ;; Declarations — classes
 (class_declaration
@@ -91,6 +106,15 @@ const JAVASCRIPT_SCOPE_QUERY = `
 ;; Declarations — class fields (JS uses field_definition, not public_field_definition)
 (field_definition
   property: (property_identifier) @declaration.name) @declaration.property
+
+;; Object-literal keys of a NAMED object (A1/A5) — the scope-resolution half of
+;; the same rule in TYPESCRIPT/JAVASCRIPT_QUERIES. The parse query mints the
+;; Property NODE; this mints the DEF the resolver can point a read/write at.
+(variable_declarator
+  name: (identifier)
+  value: (object
+    (pair
+      key: (property_identifier) @declaration.name) @declaration.property))
 
 ;; Declarations — free functions
 (function_declaration
@@ -136,6 +160,67 @@ const JAVASCRIPT_SCOPE_QUERY = `
   (variable_declarator
     name: (identifier) @declaration.name
     value: (function_expression) @declaration.function))
+
+;; CJS property-assignment exports (#2723): \`exports.foo = function () {}\`,
+;; \`module.exports.foo = (a) => a\`. The graph node for these comes from
+;; TYPESCRIPT/JAVASCRIPT_QUERIES; this block is the other half — without a
+;; scope-resolution declaration the node exists but nothing resolves TO it,
+;; so \`impact\` answered "found, zero callers" on a whole CommonJS API.
+;;
+;; The declaration binds the BARE property name into the enclosing (module)
+;; scope, which is what importers see: \`const { foo } = require('./m')\`
+;; matches by name, and a namespace \`m.foo()\` walks the module's defs.
+;;
+;; Same anchor discipline as the blocks above — \`@declaration.function\` sits
+;; on the INNER arrow / function_expression so its range matches the
+;; \`@scope.function\` range.
+;; The three right-hand-side forms share one pattern via an inner LEAF
+;; alternation. tree-sitter 0.21.1 has a known hazard where a top-level
+;; \`[...]\` alternation makes sibling branches share one predicate bucket and
+;; silently drops matches; an inner leaf alternation whose predicates all sit
+;; on captures OUTSIDE it (here \`@_cjs.exports\` / \`@_cjs.module\`, both on the
+;; left-hand side and bound in every branch) is the safe form. Verified by
+;; probing all six receiver × RHS combinations, not by reading.
+;;
+;; \`(generator_function) @scope.function\` is declared near the top of this
+;; query, so the anchor aligns for that branch too.
+(assignment_expression
+  left: (member_expression
+    object: (identifier) @_cjs.receiver
+    property: (property_identifier) @declaration.name)
+  right: [
+    (arrow_function)
+    (function_expression)
+    (generator_function)
+  ] @declaration.function)
+
+;; \`this.X = fn\` at MODULE level of a CommonJS file — there \`this\` IS
+;; \`module.exports\`, so this declares an export. Pruned emit-side for ESM
+;; files (where top-level \`this\` is undefined) and for a \`this\` inside a
+;; function, which is an instance member rather than an export.
+(assignment_expression
+  left: (member_expression
+    object: (this)
+    property: (property_identifier) @declaration.name)
+  right: [
+    (arrow_function)
+    (function_expression)
+    (generator_function)
+  ] @declaration.function)
+
+(assignment_expression
+  left: (member_expression
+    object: (member_expression
+      object: (identifier) @_cjs.module
+      property: (property_identifier) @_cjs.exports)
+    property: (property_identifier) @declaration.name)
+  right: [
+    (arrow_function)
+    (function_expression)
+    (generator_function)
+  ] @declaration.function
+  (#eq? @_cjs.module "module")
+  (#eq? @_cjs.exports "exports"))
 
 ;; Object-property arrows / function expressions named by their pair key.
 ;; Same anchor discipline as the lexical_declaration block above: the
@@ -354,6 +439,34 @@ const JAVASCRIPT_SCOPE_QUERY = `
   value: (new_expression
     constructor: (member_expression) @type-binding.type)) @type-binding.constructor
 
+;; Class field initializer: \`class C { p = new Outer(); }\` (#2807).
+;; JavaScript has no field annotations at all, so a class field's type can only
+;; ever come from its initializer — without this pattern \`this.p.inner()\` had
+;; nothing to type the receiver with and the receiver fold declined the whole
+;; chain. \`synthesizeConstructorFieldBindings\` in captures.ts already covers the
+;; sibling shape (\`this.p = new Outer()\`), but only inside a \`constructor\`
+;; body, so a field initialized at its declaration matched nothing.
+;;
+;; Anchored on \`field_definition\` so the binding lands in the class body scope,
+;; where \`typeOfMemberOnClass\` reads it — the same anchoring TypeScript uses for
+;; \`public_field_definition\`. Note the JS grammar names the field \`property:\`,
+;; not \`name:\`.
+(field_definition
+  property: (property_identifier) @type-binding.name
+  value: (new_expression
+    constructor: (identifier) @type-binding.type)) @type-binding.constructor
+
+(field_definition
+  property: (property_identifier) @type-binding.name
+  value: (new_expression
+    constructor: (member_expression) @type-binding.type)) @type-binding.constructor
+
+;; Private-name field: \`#p = new Outer()\`.
+(field_definition
+  property: (private_property_identifier) @type-binding.name
+  value: (new_expression
+    constructor: (identifier) @type-binding.type)) @type-binding.constructor
+
 ;; Call-result alias: const u = getUser()
 (variable_declarator
   name: (identifier) @type-binding.name
@@ -485,6 +598,99 @@ const JAVASCRIPT_SCOPE_QUERY = `
 
 (object
   (shorthand_property_identifier) @reference.name @reference.property-key @reference.value-ref)
+
+;; Bare-identifier reads (A2). VALUE POSITIONS ONLY — a blanket
+;; \`(identifier)\` rule would mint a site for every token in the file.
+(arguments
+  (identifier) @reference.name @reference.read.identifier)
+
+(assignment_pattern
+  right: (identifier) @reference.name @reference.read.identifier)
+
+(return_statement
+  (identifier) @reference.name @reference.read.identifier)
+
+;; \`const next = LIMIT\` and \`n > LIMIT\` — both plainly value reads, and both
+;; named in review as gaps between what A2 claimed and what it matched.
+(variable_declarator
+  value: (identifier) @reference.name @reference.read.identifier)
+
+(binary_expression
+  left: (identifier) @reference.name @reference.read.identifier)
+
+(binary_expression
+  right: (identifier) @reference.name @reference.read.identifier)
+
+;; Destructured PARAMETER keys (R2-1c). \`function exit({ exitMinAtrMult = 0 })\`
+;; reads that property off whatever the caller passes, exactly as
+;; \`cfg.exitMinAtrMult\` would — the field just never appears in a
+;; member_expression, so the read had no site at all and the function that
+;; implements the behaviour was missing from "who reads this setting?".
+;;
+;; A distinct anchor rather than @reference.read.member: that tag is filtered
+;; emit-side to matches with a member_expression ancestor (calls and writes
+;; share its shape), and a destructuring pattern has none, so it would be
+;; dropped. The \`read.\` head is what maps this to a read kind, so the new tag
+;; needs no mapping change.
+;;
+;; The object_pattern is the receiver. It is anonymous — there is no name to
+;; type — which is precisely the untyped-receiver case the name-narrowing pass
+;; exists to serve.
+;;
+;; Scoped to formal_parameters deliberately. A destructuring binding elsewhere
+;; (\`const { x } = require('m')\`) is often an import rather than a field read,
+;; and minting a property read for it would attribute module bindings to
+;; unrelated same-named keys.
+(formal_parameters
+  (object_pattern
+    (shorthand_property_identifier_pattern) @reference.name
+      @reference.read.destructured) @reference.receiver)
+
+(formal_parameters
+  (object_pattern
+    (object_assignment_pattern
+      left: (shorthand_property_identifier_pattern) @reference.name
+        @reference.read.destructured)) @reference.receiver)
+
+(formal_parameters
+  (object_pattern
+    (pair_pattern
+      key: (property_identifier) @reference.name
+        @reference.read.destructured)) @reference.receiver)
+
+;; Object-literal keys in RECORD CONSTRUCTION position (R2-1b). Building
+;; \`{ exitContract: { exitMinAtrMult: settings.x } }\` SETS that field, so this
+;; is the write counterpart to the destructured read above — without it
+;; "who reads this setting?" answers well and "who SETS it?" misses the code
+;; that stamps the value.
+;;
+;; A WRITE REFERENCE, deliberately not a definition. The round-1 rule already
+;; mints Property nodes for literals bound to a variable; minting more for
+;; anonymous records would add same-named competitors to the very name-narrowing
+;; that makes these reads resolvable — measured at 26 competing definitions for
+;; one field on the reporting repo. A construction site is a USE of a field, not
+;; another declaration of it.
+;;
+;; Two positions only: nested under a key, and returned. Both are records with a
+;; name attached (the key, or the function). An inline call argument
+;; (\`doThing({ id: 1 })\`) stays excluded for the same reason round 1 excluded
+;; it from definitions — it is call-site data, not a named surface.
+;;
+;; The enclosing literal is the receiver, and it is anonymous, which routes
+;; these through the same narrowing and the same refusal-to-guess as every other
+;; untyped receiver.
+(pair
+  value: (object
+    (pair
+      key: (property_identifier) @reference.name
+        @reference.write.property-key) @_r2b.nested) @reference.receiver)
+
+(return_statement
+  (object
+    (pair
+      key: (property_identifier) @reference.name
+        @reference.write.property-key) @_r2b.returned) @reference.receiver)
+
 `;
 
 /** JSX-only suffix — appended when compiling against the JSX grammar for .jsx files. */

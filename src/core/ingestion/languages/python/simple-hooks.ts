@@ -17,6 +17,7 @@ import type {
 } from 'gitnexus-shared';
 import type { SyntaxNode } from 'tree-sitter';
 import { findAncestorBeforeBoundary, FUNCTION_NODE_TYPES } from '../../utils/ast-helpers.js';
+import { walkToScope } from '../../utils/scope-tree-walk.js';
 
 const PYTHON_METHOD_CONTAINER_TYPES: ReadonlySet<string> = new Set(['class_definition']);
 
@@ -36,15 +37,18 @@ export function pythonFunctionDefinitionLabel(
 // ─── bindingScopeFor ──────────────────────────────────────────────────────
 
 /** Python has no block scope, so the central extractor's "innermost
- *  enclosing scope" default is already correct: `for x in …` creates
- *  `x` in the enclosing function/module scope (because we never emit a
- *  `@scope.block` for the for-loop body), comprehension variables stay
- *  in their expression context, etc. Returns `null` to delegate. */
+ *  enclosing scope" default is already correct for ordinary bindings.
+ *  Constructor-injected instance fields are the exception: their marker is
+ *  anchored inside `__init__`, but compound receiver resolution needs the
+ *  field type on the enclosing Class scope. */
 export function pythonBindingScopeFor(
-  _decl: CaptureMatch,
-  _innermost: Scope,
-  _tree: ScopeTree,
+  decl: CaptureMatch,
+  innermost: Scope,
+  tree: ScopeTree,
 ): ScopeId | null {
+  if (decl['@type-binding.instance-field'] !== undefined) {
+    return walkToScope(innermost, tree, 'Class');
+  }
   return null;
 }
 

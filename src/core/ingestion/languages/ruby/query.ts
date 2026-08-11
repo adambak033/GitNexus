@@ -79,6 +79,64 @@ const RUBY_SCOPE_QUERY = `
 (singleton_method
   name: (identifier) @declaration.name) @declaration.function
 
+;; ── Declarations — closure bound to a local ──────────────────────────────
+;;
+;; handler = ->(x) { target(x) } / lambda { |x| ... } / proc { |x| ... }
+;;
+;; Anchor discipline (same contract as javascript/query.ts): @declaration.function
+;; sits on the INNER (block), NOT on the assignment wrapper and NOT on the
+;; (lambda) node — the block is what carries @scope.block above, so anchoring
+;; there aligns anchor.range with the scope range. That alignment is what lets
+;; pickCallerCallableDef accept a Block-kind scope as a callable boundary.
+;; do_block/block stay @scope.block deliberately — do NOT re-kind them.
+;;
+;; The call forms are restricted to lambda/proc by name. An unrestricted
+;; (call block: (block)) would match ANY method call with a block, so
+;; mapped = items.map { |i| ... } would wrongly declare mapped a callable.
+;; Separate #eq? patterns rather than one #match? alternation: alternation
+;; predicates are a known hazard on this tree-sitter line.
+;; BOTH block forms in every pattern. do...end produces (do_block), braces
+;; produce (block), and do/end is the dominant MULTI-LINE style — covering only
+;; braces left lambda-do-end with a Block scope owning nothing, so its
+;; calls fell through to the enclosing method. @scope.block above already covers
+;; both, so the two channels now agree.
+;;
+;; The !receiver constraint is load-bearing: without it #eq? tests the method
+;; NAME only, so MyMod.lambda {...} / obj.proc {...} would be captured as
+;; closure bindings. Verified against the grammar: with !receiver those are
+;; rejected while bare lambda/proc still match.
+(assignment
+  left: (identifier) @declaration.name
+  right: (lambda body: [(block) (do_block)] @declaration.function))
+
+(assignment
+  left: (identifier) @declaration.name
+  right: (call
+    !receiver
+    method: (identifier) @_lambda-kw
+    block: [(block) (do_block)] @declaration.function)
+  (#eq? @_lambda-kw "lambda"))
+
+(assignment
+  left: (identifier) @declaration.name
+  right: (call
+    !receiver
+    method: (identifier) @_proc-kw
+    block: [(block) (do_block)] @declaration.function)
+  (#eq? @_proc-kw "proc"))
+
+;; Proc.new { ... } / Proc.new do ... end — the explicit constructor form.
+;; Receiver IS required here and must be the Proc constant, so this cannot
+;; collide with the bare-call patterns above.
+(assignment
+  left: (identifier) @declaration.name
+  right: (call
+    receiver: (constant) @_proc-const
+    method: (identifier) @_new-kw
+    block: [(block) (do_block)] @declaration.function)
+  (#eq? @_proc-const "Proc")
+  (#eq? @_new-kw "new"))
+
 ;; ── Declarations — variable assignment ───────────────────────────────────
 
 (assignment
@@ -119,6 +177,41 @@ const RUBY_SCOPE_QUERY = `
     receiver: (scope_resolution) @type-binding.type
     method: (identifier) @_new_method2
     (#eq? @_new_method2 "new"))) @type-binding.constructor
+
+;; Instance-variable constructor: \`@service = UserService.new\` (#2807).
+;; The patterns above bind locals and constants; an instance variable — the
+;; only way a Ruby object gets a field at all — bound nothing, so \`@service.run\`
+;; had no receiver type and the fold declined the whole chain.
+;;
+;; \`@type-binding.name\` is captured on the \`instance_variable\` node, so the
+;; bound name keeps its \`@\` sigil and matches the receiver text at the call
+;; site verbatim. The narrow \`@type-binding.ivar-field\` marker rides the same
+;; node for \`rubyBindingScopeFor\` to hoist on; anchorCaptureFor takes the
+;; broadest range, so the assignment stays the anchor and the source stays
+;; \`constructor-inferred\`.
+;;
+;; These patterns match unconditionally HERE; captures.ts then discards the
+;; whole binding via \`isRubyInstanceIvarWrite\` unless \`self\` at the write is
+;; provably an instance of the enclosing lexical class — which rules out
+;; \`def self.x\`, \`class << self\`, the class body itself, and any write reached
+;; through a block, whose \`self\` its receiver chooses (\`class_eval\`,
+;; \`Class.new\`, \`instance_eval\`, \`define_method\`, …). A tree-sitter pattern
+;; cannot state "and no singleton or block ancestor", so the ownership test has
+;; to be a walk.
+
+(assignment
+  left: (instance_variable) @type-binding.name @type-binding.ivar-field
+  right: (call
+    receiver: (constant) @type-binding.type
+    method: (identifier) @_new_ivar
+    (#eq? @_new_ivar "new"))) @type-binding.constructor
+
+(assignment
+  left: (instance_variable) @type-binding.name @type-binding.ivar-field
+  right: (call
+    receiver: (scope_resolution) @type-binding.type
+    method: (identifier) @_new_ivar_q
+    (#eq? @_new_ivar_q "new"))) @type-binding.constructor
 
 ;; Constant constructor: SERVICE = UserService.new (left is constant, not identifier)
 

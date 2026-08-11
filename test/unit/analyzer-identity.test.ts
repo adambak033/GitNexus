@@ -11,6 +11,7 @@ import {
   analyzerRunnerIdentitiesEqual,
   captureAnalyzerIdentityBeforeLoad,
   finalizeAnalyzerRunnerIdentity,
+  normalizeAnalyzerRootPath,
   normalizeAnalyzerRunnerIdentityForComparison,
   resolveAnalyzerRunnerIdentity,
 } from '../../src/core/analyzer-identity.js';
@@ -75,6 +76,16 @@ describe('analyzer runner identity', () => {
       expect(second.invokedArtifact.digest).toBe(first.invokedArtifact.digest);
       expect(second.build.digest).not.toBe(first.build.digest);
       expect(second.dependencyRuntime.digest).toBe(first.dependencyRuntime.digest);
+      // THE #2798 INVARIANT: the build digest moved while nothing else did.
+      // Node-id formats, wire formats, resolution tiers and emit ordering live in
+      // analyzer code, not in DDL, so `SCHEMA_FINGERPRINT` (lbug/schema.ts) is
+      // structurally incapable of firing on a change shaped like this one — it is
+      // a digest of the node+relation DDL and of nothing else. #2798 deleted the
+      // hand-incremented INCREMENTAL_SCHEMA_VERSION ladder, and roughly 30 of its
+      // ~35 bumps were exactly this shape: semantic, no DDL. This receipt is their
+      // only remaining cover, so a moved build digest MUST refuse index reuse.
+      // (call-summary-schema-version.test.ts holds the DDL-blind half of the split.)
+      expect(analyzerRunnerIdentitiesEqual(second, first)).toBe(false);
     } finally {
       await fixture.cleanup();
     }
@@ -1281,6 +1292,12 @@ describe('analyzer runner identity', () => {
           identity,
         ),
       ).toBe(false);
+      // Fail-closed on a receipt that cannot be read at all — the same posture as
+      // an absent schemaFingerprint. An index predating the field stamps nothing
+      // (undefined) and a cleared/legacy field reads back as null; neither is ever
+      // grandfathered into an incremental top-up (#2798).
+      expect(analyzerRunnerIdentitiesEqual(undefined, identity)).toBe(false);
+      expect(analyzerRunnerIdentitiesEqual(null, identity)).toBe(false);
 
       await writeFile(
         path.join(sourceRoot, 'new-semantic-input.ts'),
@@ -1507,4 +1524,42 @@ describe('analyzer runner identity', () => {
       await repo.cleanup();
     }
   }, 300_000);
+});
+
+// #2668 threading guard: the produced identity's path fields must already be
+// normalizer-stable, i.e. resolveBuildRoot/resolveRuntimeVariant actually route
+// build.rootPath and runtime.executablePath through normalizeAnalyzerRootPath.
+// Ubuntu-only by necessity: this needs a real fixture identity, and the fixture
+// harness cannot run on the Windows matrix (the runner's repo is on D: while temp
+// is on C:, and isInside() misjudges cross-drive paths so resolveInvokedArtifact
+// picks the vitest fork worker). The pure-transform assertions that DO run on
+// windows-latest live in analyzer-identity-path-normalization.test.ts.
+describe('analyzer identity path threading (#2668)', () => {
+  it('produces identity path fields that are already normalizer-stable', async () => {
+    const fixture = await createTempDir();
+    try {
+      const sourceRoot = path.join(fixture.dbPath, 'src');
+      const modulePath = path.join(sourceRoot, 'core', 'analyzer.ts');
+      await mkdir(path.dirname(modulePath), { recursive: true });
+      await writeFile(
+        path.join(fixture.dbPath, 'package.json'),
+        '{"name":"fixture-analyzer","version":"1.0.0"}\n',
+      );
+      await writeFile(path.join(fixture.dbPath, 'package-lock.json'), '{"lockfileVersion":3}\n');
+      await writeFile(modulePath, 'export const analyzer = 1;\n');
+
+      const identity = resolveAnalyzerRunnerIdentity(pathToFileURL(modulePath).href, {
+        cacheDirectory: path.join(fixture.dbPath, 'identity-cache'),
+      });
+
+      expect(identity.build.rootPath).toBe(
+        normalizeAnalyzerRootPath(identity.build.rootPath, process.platform),
+      );
+      expect(identity.runtime.executablePath).toBe(
+        normalizeAnalyzerRootPath(identity.runtime.executablePath, process.platform),
+      );
+    } finally {
+      await fixture.cleanup();
+    }
+  });
 });

@@ -20,9 +20,10 @@ import {
   recordClassAnnotationCapture,
 } from '../../frameworks/spring/bean-candidates.js';
 import {
+  javaLocalTypeDeclarationContainer,
   nodeIfType,
   nodeToCapture,
-  synthesizeJavaAnonymousClassName,
+  synthesizeJavaTypeIdentity,
   syntheticCapture,
 } from '../../utils/ast-helpers.js';
 import { splitImportDeclaration } from './import-decomposer.js';
@@ -34,17 +35,31 @@ import { getTreeSitterBufferSize } from '../../constants.js';
 import { parseSourceSafe } from '../../../tree-sitter/safe-parse.js';
 import {
   setJavaClassAnnotationFacts,
+  setJavaSpringAopFacts,
   setJavaSpringConfigConsumerFacts,
+  setJavaSpringConditionalFacts,
+  setJavaSpringDiFacts,
 } from './capture-side-channel.js';
 import { captureJavaPackageFact } from './package-facts.js';
 import { synthesizeCallableFlowCaptures } from '../../utils/callable-flow-captures.js';
 import { captureJavaSpringConfigConsumerFacts } from './spring-config-bindings.js';
+import { captureJavaSpringDiClassFact, type JavaSpringDiClassFact } from './spring-di.js';
+import { synthesizeReceiverChainCapture } from '../../utils/receiver-chain-captures.js';
+import { captureJavaSpringAopFacts, type JavaSpringAopFact } from './spring-aop.js';
+import {
+  captureJavaSpringConditionalFacts,
+  type JavaSpringConditionalFact,
+} from './spring-conditionals.js';
 
 /** Declaration anchors that carry function-like arity metadata. */
 const FUNCTION_DECL_TAGS = ['@declaration.method', '@declaration.constructor'] as const;
 
 /** tree-sitter-java node types that the method extractor accepts. */
-const FUNCTION_NODE_TYPES = ['method_declaration', 'constructor_declaration'] as const;
+const FUNCTION_NODE_TYPES = [
+  'method_declaration',
+  'constructor_declaration',
+  'compact_constructor_declaration',
+] as const;
 
 const JAVA_CALLABLE_CAPTURE_OPTIONS = {
   functionNodeTypes: new Set([...FUNCTION_NODE_TYPES, 'lambda_expression']),
@@ -64,6 +79,26 @@ const JAVA_CALLABLE_CAPTURE_OPTIONS = {
   callableProtocolMethods: new Set(['run', 'apply', 'accept', 'call']),
   normalizeQualifiedName: (raw: string) => raw.replaceAll('::', '.'),
 } as const;
+
+/** Visibility of a local type begins at its declaration and ends with its
+ * immediately enclosing block (JLS 6.3). A Java-only synthetic Block scope
+ * models that range without changing shared resolver selection semantics. */
+function javaLocalTypeVisibilityScope(node: SyntaxNode): CaptureMatch | undefined {
+  const container = javaLocalTypeDeclarationContainer(node);
+  if (container === null) return undefined;
+  return {
+    '@scope.block': {
+      name: '@scope.block',
+      range: {
+        startLine: node.startPosition.row + 1,
+        startCol: node.startPosition.column,
+        endLine: container.endPosition.row + 1,
+        endCol: container.endPosition.column,
+      },
+      text: node.text,
+    },
+  };
+}
 
 /** Suppress read.member emissions when the field_access is already
  *  covered by a method_invocation (object of a call) or an
@@ -99,6 +134,11 @@ export function emitJavaScopeCaptures(
   const rawMatches = getJavaScopeQuery().matches(tree.rootNode);
   const out: CaptureMatch[] = [];
   const classAnnotations = new Map<ScopeId, Set<string>>();
+  const springAopFacts: JavaSpringAopFact[] = [];
+  const springAopTypeNodeIds = new Set<number>();
+  const springConditionalFacts: JavaSpringConditionalFact[] = [];
+  const springDiFacts: JavaSpringDiClassFact[] = [];
+  const springDiClassNodeIds = new Set<number>();
 
   for (const m of rawMatches) {
     const grouped: Record<string, Capture> = {};
@@ -118,11 +158,53 @@ export function emitJavaScopeCaptures(
     }
     if (Object.keys(grouped).length === 0) continue;
 
+    const springAopTypeNode = [
+      nodeIfType(nodeMap['@scope.class'], 'class_declaration'),
+      nodeIfType(nodeMap['@scope.class'], 'interface_declaration'),
+    ].find((node): node is SyntaxNode => node !== null);
+    if (springAopTypeNode !== undefined && !springAopTypeNodeIds.has(springAopTypeNode.id)) {
+      springAopTypeNodeIds.add(springAopTypeNode.id);
+      springAopFacts.push(...captureJavaSpringAopFacts(springAopTypeNode, filePath));
+    }
+
+    const springDiClassNode = nodeIfType(nodeMap['@scope.class'], 'class_declaration');
+    if (springDiClassNode !== null && !springDiClassNodeIds.has(springDiClassNode.id)) {
+      springDiClassNodeIds.add(springDiClassNode.id);
+      springConditionalFacts.push(
+        ...captureJavaSpringConditionalFacts(springDiClassNode, filePath),
+      );
+      const fact = captureJavaSpringDiClassFact(springDiClassNode, filePath);
+      if (fact !== null) springDiFacts.push(fact);
+    }
+
     const annotatedClass = grouped['@class-annotation.class'];
     const annotationName = grouped['@class-annotation.name'];
     if (annotatedClass !== undefined && annotationName !== undefined) {
       recordClassAnnotationCapture(classAnnotations, filePath, annotatedClass, annotationName.text);
       continue;
+    }
+
+    const typeDeclaration = [
+      nodeMap['@declaration.class'],
+      nodeMap['@declaration.enum'],
+      nodeMap['@declaration.record'],
+      nodeMap['@declaration.interface'],
+    ].find((node): node is SyntaxNode => node !== undefined);
+    const localTypeIdentity =
+      typeDeclaration === undefined ? undefined : synthesizeJavaTypeIdentity(typeDeclaration);
+    if (
+      localTypeIdentity?.bindingName !== undefined &&
+      grouped['@declaration.name'] !== undefined &&
+      typeDeclaration !== undefined
+    ) {
+      grouped['@declaration.binding-name'] = grouped['@declaration.name'];
+      grouped['@declaration.name'] = syntheticCapture(
+        '@declaration.name',
+        typeDeclaration,
+        localTypeIdentity.name,
+      );
+      const visibilityScope = javaLocalTypeVisibilityScope(typeDeclaration);
+      if (visibilityScope !== undefined) out.push(visibilityScope);
     }
 
     // Decompose each `import_declaration`. `@import.statement` is captured
@@ -136,6 +218,12 @@ export function emitJavaScopeCaptures(
           continue;
         }
       }
+      // Structural receiver chain for a call whose receiver is itself an
+      // expression, so resolution can type it by folding over structure
+      // instead of re-parsing the receiver's source text. Self-gating: a
+      // non-call match, an absent receiver, or a chain with no nameable base
+      // all leave `grouped` untouched.
+      synthesizeReceiverChainCapture(grouped, nodeMap['@reference.receiver']);
       out.push(grouped);
       continue;
     }
@@ -189,6 +277,12 @@ export function emitJavaScopeCaptures(
     // Synthesize `this` / `super` receiver type-bindings on every
     // instance method-like.
     if (grouped['@scope.function'] !== undefined) {
+      // Structural receiver chain for a call whose receiver is itself an
+      // expression, so resolution can type it by folding over structure
+      // instead of re-parsing the receiver's source text. Self-gating: a
+      // non-call match, an absent receiver, or a chain with no nameable base
+      // all leave `grouped` untouched.
+      synthesizeReceiverChainCapture(grouped, nodeMap['@reference.receiver']);
       out.push(grouped);
       // `@scope.function` is captured directly on the method/constructor node.
       const fnNode = findFunctionNode(nodeMap['@scope.function']);
@@ -280,6 +374,12 @@ export function emitJavaScopeCaptures(
       }
     }
 
+    // Structural receiver chain for a call whose receiver is itself an
+    // expression, so resolution can type it by folding over structure
+    // instead of re-parsing the receiver's source text. Self-gating: a
+    // non-call match, an absent receiver, or a chain with no nameable base
+    // all leave `grouped` untouched.
+    synthesizeReceiverChainCapture(grouped, nodeMap['@reference.receiver']);
     out.push(grouped);
   }
 
@@ -288,6 +388,9 @@ export function emitJavaScopeCaptures(
     filePath,
     captureJavaSpringConfigConsumerFacts(tree.rootNode, filePath),
   );
+  setJavaSpringAopFacts(filePath, springAopFacts);
+  setJavaSpringConditionalFacts(filePath, springConditionalFacts);
+  setJavaSpringDiFacts(filePath, springDiFacts);
 
   return [
     ...resolveVarTypeBindings(out),
@@ -300,8 +403,8 @@ export function emitJavaScopeCaptures(
 
 /**
  * Synthesize `@declaration.class` matches for anonymous class bodies
- * (`new Runnable() { ... }`), named by the same javac-style authority
- * (`synthesizeJavaAnonymousClassName` → `Worker$N`) the structure phase
+ * (`new Runnable() { ... }`), named by the same javac-compatible authority
+ * (`synthesizeJavaTypeIdentity` → `Worker$N`) the structure phase
  * uses — the two layers agree by construction (#2550).
  *
  * The anchor is the `class_body` node: it shares its range with the
@@ -314,13 +417,13 @@ export function emitJavaScopeCaptures(
 function synthesizeJavaAnonymousClassDeclarations(rootNode: SyntaxNode): CaptureMatch[] {
   const out: CaptureMatch[] = [];
   for (const oce of rootNode.descendantsOfType('object_creation_expression')) {
-    const name = synthesizeJavaAnonymousClassName(oce);
-    if (name === undefined) continue;
+    const identity = synthesizeJavaTypeIdentity(oce);
+    if (identity === undefined) continue;
     const body = oce.namedChildren.find((c) => c.type === 'class_body');
     if (body === undefined) continue;
     out.push({
       '@declaration.class': nodeToCapture('@declaration.class', body),
-      '@declaration.name': syntheticCapture('@declaration.name', body, name),
+      '@declaration.name': syntheticCapture('@declaration.name', body, identity.name),
     });
 
     // Inheritance: the anonymous class extends/implements its constructed
@@ -361,7 +464,7 @@ function synthesizeJavaAnonymousClassDeclarations(rootNode: SyntaxNode): Capture
         out.push({
           '@type-binding.annotation': nodeToCapture('@type-binding.annotation', declNode),
           '@type-binding.name': nodeToCapture('@type-binding.name', varName),
-          '@type-binding.type': syntheticCapture('@type-binding.type', oce, name),
+          '@type-binding.type': syntheticCapture('@type-binding.type', oce, identity.name),
         });
       }
     }
@@ -372,23 +475,49 @@ function synthesizeJavaAnonymousClassDeclarations(rootNode: SyntaxNode): Capture
   // constant's class extends its HOST ENUM (javac semantics), so the
   // inherits reference names the enum — giving `mroFor(E$N) ∋ E` and
   // keeping bare calls from the body to the enum's own helpers alive
-  // through the ownership gate's MRO arm. No receiver typeBinding piece:
-  // constants are not variable initializers; `E.A.hook()` dispatch rides
-  // the existing enum receiver machinery.
+  // through the ownership gate's MRO arm.
   for (const constant of rootNode.descendantsOfType('enum_constant')) {
-    const name = synthesizeJavaAnonymousClassName(constant);
-    if (name === undefined) continue;
-    const body = constant.childForFieldName?.('body');
-    if (body === null || body === undefined || body.type !== 'class_body') continue;
-    out.push({
-      '@declaration.class': nodeToCapture('@declaration.class', body),
-      '@declaration.name': syntheticCapture('@declaration.name', body, name),
-    });
     const hostEnum = javaEnclosingEnumNameOf(constant);
-    if (hostEnum !== undefined) {
+    const bodyNode = constant.childForFieldName?.('body');
+    const isBodied = bodyNode !== null && bodyNode !== undefined && bodyNode.type === 'class_body';
+    const bodiedIdentity = synthesizeJavaTypeIdentity(constant);
+    if (bodiedIdentity !== undefined && isBodied) {
       out.push({
-        '@reference.inherits': nodeToCapture('@reference.inherits', body),
-        '@reference.name': syntheticCapture('@reference.name', body, hostEnum),
+        '@declaration.class': nodeToCapture('@declaration.class', bodyNode),
+        '@declaration.name': syntheticCapture('@declaration.name', bodyNode, bodiedIdentity.name),
+      });
+      if (hostEnum !== undefined) {
+        out.push({
+          '@reference.inherits': nodeToCapture('@reference.inherits', bodyNode),
+          '@reference.name': syntheticCapture('@reference.name', bodyNode, hostEnum),
+        });
+      }
+    }
+
+    // Receiver dispatch (#2561): `E.CONST.method()` resolves through the
+    // generic compound-receiver chain walk, which looks up each dotted
+    // segment via the owning class scope's `typeBindings` map — the same
+    // mechanism a field declaration uses (`private User user;` binds
+    // `user` on the class scope). Binding the constant's own simple name
+    // there — to its synthesized `E$N` class when bodied (MRO includes E,
+    // so members inherited from the enum still resolve), or to the host
+    // enum itself when body-less — makes `E.CONST.method()` resolve with
+    // no changes to the shared receiver-binding machinery.
+    //
+    // A bodied constant binds ONLY to its `E$N` class, never the host enum:
+    // if name synthesis fails on a malformed/error-recovery tree (`bodiedName`
+    // undefined despite a real body), emit nothing rather than silently
+    // misattributing an OVERRIDING constant's receiver to the enum's own
+    // (non-overridden) method — a wrong edge is worse than no edge. Mirrors
+    // the `object_creation_expression` branch, which skips on synthesis
+    // failure. `hostEnum` is used only for genuinely body-less constants.
+    const constantNameNode = constant.childForFieldName?.('name');
+    const constantType = isBodied ? bodiedIdentity?.name : hostEnum;
+    if (constantNameNode !== null && constantNameNode !== undefined && constantType !== undefined) {
+      out.push({
+        '@type-binding.annotation': nodeToCapture('@type-binding.annotation', constant),
+        '@type-binding.name': nodeToCapture('@type-binding.name', constantNameNode),
+        '@type-binding.type': syntheticCapture('@type-binding.type', constant, constantType),
       });
     }
   }
@@ -502,40 +631,27 @@ function findEnclosingTypeDeclaration(node: SyntaxNode): SyntaxNode | null {
 }
 
 /**
- * Synthesize `@reference.inherits` captures from Java class heritage so the
- * registry-primary scope-resolution path emits EXTENDS / IMPLEMENTS edges
- * (mirrors C++ `emitCppInheritanceCaptures`). Without this, Java inheritance
- * edges came only from the legacy heritage-capture leg (removed in #942), which
- * is dropped for registry-primary languages in the worker pipeline (issue #1951).
+ * Synthesize `@reference.inherits` captures from Java type heritage for the
+ * authoritative registry-primary EXTENDS / IMPLEMENTS pre-pass (mirrors C++
+ * `emitCppInheritanceCaptures`).
  *
  * Scope covers `class_declaration` (`superclass` extends + `interfaces`
- * implements clauses) AND `interface_declaration` (`extends_interfaces` →
- * interface-to-interface EXTENDS), matching the legacy Java heritage query
- * (tree-sitter-queries.ts), which has a dedicated `interface_declaration
- * (extends_interfaces (type_list …))` arm. Without the interface arm the
- * registry-primary synth silently dropped every `interface IA extends IB`
- * edge while the legacy leg emitted it — the exact =0/=N parity break #1951
- * targets. Enum/record heritage stays unemitted (no legacy arm). Generic
- * bases (`extends Box<T>`, `implements IFoo<T>`) ARE emitted here: the legacy
- * heritage query was widened to capture the inner `type_identifier` of a
- * `generic_type` (tree-sitter-queries.ts), so both paths now agree on SIMPLE
- * (unqualified) generic bases — the more-correct behavior, consistent with
- * C#/Rust (#1951). Qualified bases (`a.b.Base`, `a.b.Box<T>`, `a.b.IFoo<T>`) are
- * ALSO now at parity (#1956 tri-review U2): the synth resolves them by their
- * `scoped_type_identifier` tail, and the legacy heritage query was widened
- * with matching `scoped_type_identifier` arms (plain + generic-wrapped). The
+ * implements clauses), `record_declaration` (`interfaces` implements clauses),
+ * and `interface_declaration` (`extends_interfaces` clauses). Interface
+ * inheritance was restored for registry-primary resolution in #1951. Record
+ * graph nodes became canonical link targets in #2801 / PR #2871, so their
+ * `implements` clauses must participate for interface dispatch (#2900). Java
+ * enum interface heritage remains a separately tracked gap (#2918).
+ *
+ * Generic bases (`extends Box<T>`, `implements IFoo<T>`) and qualified bases
+ * (`a.b.Base`, `a.b.Box<T>`, `a.b.IFoo<T>`) are normalized to their simple
+ * lookup-name tails, consistent with C#/Rust and the V1 binding contract. The
  * EXTENDS-vs-IMPLEMENTS split is decided downstream from the resolved target's
  * symbol kind (`preEmitInheritanceEdges`): a superclass resolves to a class
  * (EXTENDS), an implemented interface resolves to an interface (IMPLEMENTS).
  * An `interface IA extends IB` base resolves to an Interface too, so it is
- * emitted as IMPLEMENTS — matching the legacy `interface_declaration` arm,
- * which tagged the bases as implements (`kind: 'implements'`) and likewise
- * resolves them as interfaces. The synth therefore does not need to know the
- * declaration's own kind; it only emits inherits sites and lets the resolved
- * target decide the edge type.
- * Base names are normalized to their bare simple identifier (`Box<T>` → `Box`,
- * `java.io.Serializable` → `Serializable`) to match the V1 simple-name
- * `findClassBindingInScope` contract.
+ * emitted as IMPLEMENTS. The synth only emits inheritance sites and lets the
+ * resolved target decide the edge type.
  */
 function synthesizeJavaInheritanceReferences(root: SyntaxNode): CaptureMatch[] {
   const out: CaptureMatch[] = [];
@@ -547,6 +663,10 @@ function synthesizeJavaInheritanceReferences(root: SyntaxNode): CaptureMatch[] {
       if (superclass !== null) {
         for (const base of superclass.namedChildren) emitJavaInheritanceBase(out, base);
       }
+    }
+    if (node.type === 'class_declaration' || node.type === 'record_declaration') {
+      // Records cannot declare a superclass; they share only the class
+      // `interfaces` arm.
       const interfaces = node.childForFieldName('interfaces');
       if (interfaces !== null) {
         for (const typeList of interfaces.namedChildren) {
