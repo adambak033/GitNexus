@@ -120,10 +120,17 @@ and do not claim a complete graph-backed review.
    review surface: when the diff changes what gets emitted or persisted,
    verify every schema/version constant gating caches, incremental
    writebacks, and fingerprint baselines was bumped or regenerated — in
-   GitNexus itself, for example: `INCREMENTAL_SCHEMA_VERSION` (the
-   incremental write set covers only changed files, so new cross-file edges
-   never reach an existing index without the bump), the parse-store
-   `SCHEMA_BUMP`, and both bench fingerprint sets.
+   GitNexus itself, for example: graph DDL needs no manual bump, because
+   `SCHEMA_FINGERPRINT` (`gitnexus/src/core/lbug/schema.ts`) is derived
+   from `NODE_SCHEMA_QUERIES` + `REL_SCHEMA_QUERIES` and moves on its own;
+   the check there is whether the diff changed any string in those arrays,
+   and, if it added a new DDL array, whether that array was folded into the
+   fingerprint. The hand-maintained ritual still applies where no
+   declarative artifact describes the invalidated set: the parse-store
+   `SCHEMA_BUMP` and both bench fingerprint sets still need an explicit
+   bump, re-checked against the base branch right before merge. Semantic
+   changes that leave the DDL untouched are outside the fingerprint; they
+   rely on the analyzer runner-identity receipt in the index metadata.
 
 ## Expert lenses
 
@@ -181,8 +188,7 @@ dropping anything without a concrete failing scenario.
 ### Swarm lanes
 
 Six dispatchable lane definitions ship with this skill in `ci-personas/` —
-read-only reviewers restricted to Read/Glob/Grep plus the safe graph
-tools. Five are finder lanes: `ci-correctness-lens`, `ci-security-lens`,
+read-only reviewers restricted to file reads plus the safe graph tools. Five are finder lanes: `ci-correctness-lens`, `ci-security-lens`,
 `ci-blast-radius-lens`, `ci-coverage-lens`, and `ci-adversarial-lens`
 (which assumes the change is broken and constructs reachable failure
 scenarios the pattern checks miss). They carry the verification

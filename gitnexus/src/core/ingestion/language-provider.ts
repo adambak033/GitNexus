@@ -114,9 +114,17 @@ interface LanguageProviderConfig {
    * The current C++ UE-macro preprocessor relies on the practical fact that
    * UE reflection macros and module-export tokens are ASCII-only.
    *
-   * Must be a pure function — same input always yields the same output. Called
-   * once per file, on every code path that re-parses (parsing-processor, import
-   * processor, heritage processor, call processor, parse worker).
+   * Must be a pure function — same input always yields the same output, and
+   * re-applying it to its own output changes nothing.
+   *
+   * Applied by the parse worker (`parse-worker.ts`), by `extractParsedFile`
+   * (`scope-extractor-bridge.ts`) on the parse-cache-miss path, and by the
+   * embedding parse (`embeddings/ast-utils.ts`, which does not go through the
+   * bridge). Any *new* path that re-parses a file must apply it too, or the two
+   * halves of the pipeline analyze different programs — and note the set is not
+   * closed today: language-owned re-parse helpers reached through other
+   * provider hooks (e.g. `populateRangeBindings`) still see raw text.
+   * `test/unit/preprocess-source-parity.test.ts` pins the bridge equivalence.
    *
    * Default: undefined (no preprocessing — `file.content` is parsed verbatim).
    */
@@ -274,14 +282,22 @@ interface LanguageProviderConfig {
   ) => ExtractedRoute[];
 
   /**
-   * Extract decorator-style route annotations from a parsed file.
+   * Extract routes that a parsed file declares in its own AST.
    *
    * When defined, the parse worker calls this after per-file capture processing
-   * to extract framework route definitions that require AST-level analysis beyond
+   * to extract route definitions that require AST-level analysis beyond
    * generic `@decorator` captures (e.g., Java Spring class-level prefix joining,
    * multi-class handling). The returned routes are appended to `decoratorRoutes`.
    *
-   * Default: undefined (no language-specific decorator route extraction).
+   * Decorators are the common case and the reason for the name, but not the only
+   * shape: JS/TS uses this hook for hand-rolled dispatch guards
+   * (`route-extractors/dispatch-guard.ts`), where a raw `node:http` server
+   * declares a route by comparing the request path to a literal. Anything that
+   * yields a `(path, verb, handler)` triple from one file's AST belongs here —
+   * set `ExtractedDecoratorRoute.source` when the provenance is not a decorator,
+   * so the `HANDLES_ROUTE` edge does not claim one.
+   *
+   * Default: undefined (no language-specific route extraction).
    */
   readonly extractDecoratorRoutes?: (
     tree: Parser.Tree,
@@ -457,6 +473,20 @@ interface LanguageProviderConfig {
    * suffix — `@scope.function` → `'Function'`, etc.).
    */
   readonly resolveScopeKind?: (captures: CaptureMatch) => ScopeKind | null;
+
+  /**
+   * Report the receiver names this scope BINDS rather than inherits — see
+   * `Scope.ownsReceivers` (#2701).
+   *
+   * Called once per `@scope.*` capture during scope-tree construction.
+   * Return the shared frozen set for a scope that starts a fresh receiver
+   * (a JS/TS ordinary `function`, whose `this` is bound at call time), and
+   * `undefined` for one that inherits it (an arrow function, and every
+   * closure form in languages that capture the receiver lexically).
+   *
+   * Default: undefined everywhere — the receiver walk is unchanged.
+   */
+  readonly scopeOwnsReceivers?: (captures: CaptureMatch) => ReadonlySet<string> | undefined;
 
   /**
    * Override where a declaration's name becomes visible. By default the name

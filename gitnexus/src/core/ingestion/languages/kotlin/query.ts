@@ -81,13 +81,22 @@ const KOTLIN_SCOPE_QUERY = `
 (lambda_literal) @scope.block
 
 ;; Declarations — types
+;; The Kotlin grammar puts NO named fields on \`class_declaration\`, so the
+;; parameter list is matched positionally as an optional unnamed child, exactly
+;; as the name already is.
+;;
+;; Only the INLINE bound (\`<T : Repo>\`) is read. A \`where T : Repo\` clause is a
+;; separate \`type_constraints\` sibling and is left alone, so its bound reads as
+;; absent — "unknown", not "unbounded".
 (class_declaration
   "interface"
-  (type_identifier) @declaration.name) @declaration.interface
+  (type_identifier) @declaration.name
+  (type_parameters)? @declaration.type-parameters) @declaration.interface
 
 (class_declaration
   "class"
-  (type_identifier) @declaration.name) @declaration.class
+  (type_identifier) @declaration.name
+  (type_parameters)? @declaration.type-parameters) @declaration.class
 
 (object_declaration
   (type_identifier) @declaration.name) @declaration.class
@@ -114,6 +123,17 @@ const KOTLIN_SCOPE_QUERY = `
 ;; Declarations — functions / methods / properties
 (function_declaration
   (simple_identifier) @declaration.name) @declaration.function
+
+;; Lambda bound to a val/var: val handler = { x: Int -> target(x) }
+;; Anchor discipline (same contract as javascript/query.ts): @declaration.function
+;; sits on the INNER lambda_literal, NOT on the property_declaration wrapper, so
+;; anchor.range aligns with the (lambda_literal) @scope.block range. That
+;; alignment is what lets pickCallerCallableDef accept a Block-kind scope as a
+;; callable boundary: the scope IS the callable's body. The lambda stays
+;; @scope.block deliberately (#1757 smart casts) — do NOT re-kind it.
+(property_declaration
+  (variable_declaration (simple_identifier) @declaration.name)
+  (lambda_literal) @declaration.function)
 
 (property_declaration
   (variable_declaration

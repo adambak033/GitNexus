@@ -17,22 +17,23 @@ description: "Use when the user wants to know what will break if they change som
 ## Workflow
 
 ```
-1. impact({target: "X", direction: "upstream"})  → What depends on this
+1. impact({target: "X", direction: "upstream"}) or `node .gitnexus/run.cjs impact "X" --direction upstream --repo .`
 2. READ gitnexus://repo/{name}/processes                   → Check affected execution flows
-3. detect_changes()                               → Map current git changes to affected flows
+3. detect_changes({scope: "all"}) or `node .gitnexus/run.cjs detect-changes --scope all --repo .`
 4. Assess risk and report to user
 ```
 
 > If "Index is stale" → run `node .gitnexus/run.cjs analyze` in terminal.
+> If `.gitnexus/run.cjs` is missing, replace `node .gitnexus/run.cjs` with `npx gitnexus` in the fallback commands.
 
 ## Checklist
 
 ```
-- [ ] impact({target, direction: "upstream"}) to find dependents
+- [ ] impact({target, direction: "upstream"}) or CLI fallback to find dependents
 - [ ] Review d=1 items first (these WILL BREAK)
 - [ ] Check high-confidence (>0.8) dependencies
 - [ ] READ processes to check affected execution flows
-- [ ] detect_changes() for pre-commit check
+- [ ] detect_changes({scope: "all"}) or CLI fallback for pre-commit check
 - [ ] Assess risk level and report to user
 ```
 
@@ -52,10 +53,18 @@ description: "Use when the user wants to know what will break if they change som
 | 5-15 symbols, 2-5 processes    | MEDIUM   |
 | >15 symbols or many processes  | HIGH     |
 | Critical path (auth, payments) | CRITICAL |
+| **Zero callers found**         | **UNKNOWN** |
+
+`UNKNOWN` is not a low rung on this scale — it means the walk could not answer.
+An empty caller set is equally consistent with "genuinely unused" and "the
+callers are not resolvable by the index" (plain-object property access, dynamic
+dispatch, cross-language calls), so few-callers ⇒ LOW does **not** apply. The
+result carries a `riskNote` saying so. Confirm with a text search before
+treating the symbol as safe to change or delete.
 
 ## Tools
 
-**impact** — the primary tool for symbol blast radius:
+**impact** — the primary tool for symbol blast radius. If MCP is unavailable, use `node .gitnexus/run.cjs impact <symbol> --direction upstream --repo .` instead:
 
 ```
 impact({
@@ -73,10 +82,10 @@ impact({
   - authRouter (src/routes/auth.ts:22) [CALLS, 95%]
 ```
 
-**detect_changes** — git-diff based impact analysis:
+**detect_changes** — git-diff based impact analysis. If MCP is unavailable, use `node .gitnexus/run.cjs detect-changes --scope all --repo .` instead:
 
 ```
-detect_changes({scope: "staged"})
+detect_changes({scope: "all"})
 
 → Changed: 5 symbols in 3 files
 → Affected: LoginFlow, TokenRefresh, APIMiddlewarePipeline
@@ -86,7 +95,7 @@ detect_changes({scope: "staged"})
 ## Example: "What breaks if I change validateUser?"
 
 ```
-1. impact({target: "validateUser", direction: "upstream"})
+1. impact({target: "validateUser", direction: "upstream"}) or `node .gitnexus/run.cjs impact "validateUser" --direction upstream --repo .`
    → d=1: loginHandler, apiMiddleware (WILL BREAK)
    → d=2: authRouter, sessionManager (LIKELY AFFECTED)
 

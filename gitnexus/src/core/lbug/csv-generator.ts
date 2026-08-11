@@ -17,11 +17,16 @@ import { createWriteStream, WriteStream } from 'fs';
 import path from 'path';
 import type { GraphNode, GraphRelationship } from 'gitnexus-shared';
 import { KnowledgeGraph } from '../graph/types.js';
-import { NodeTableName, NODE_TABLES } from './schema.js';
-import { RelPairRouter } from './rel-pair-routing.js';
+import { NodeTableName, RELATION_SCHEMA } from './schema.js';
+import { VALID_NODE_TABLES, parseRelationSchemaPairs, RelPairRouter } from './rel-pair-routing.js';
 import { parseTruthyEnv } from '../ingestion/utils/env.js';
 import { SYMBOL_NODE_LABELS } from '../ingestion/utils/symbol-labels.js';
 import { applyCjkSegmentationIfEnabled } from '../search/cjk-segmentation.js';
+
+/** Computed once — `RELATION_SCHEMA` is a static template literal. Exported so
+ *  the streamed sinks (`GraphEmitSink`, `PdgEmitSink`) share this parse
+ *  instead of each re-deriving it from the same DDL string. */
+export const DECLARED_RELATION_PAIRS = parseRelationSchemaPairs(RELATION_SCHEMA);
 
 /**
  * Deterministic output ordering — optional (out-of-core / windowed-resolve
@@ -132,15 +137,44 @@ const formatCSVStringArray = (value: unknown): string => {
 // CONTENT EXTRACTION (lazy — reads from disk on demand)
 // ============================================================================
 
+const BINARY_SAMPLE_CHARS = 1000;
+const UNICODE_REPLACEMENT_CHAR = 0xfffd;
+
+/**
+ * Did this text come from a binary payload? Density of non-printables over the
+ * first {@link BINARY_SAMPLE_CHARS} characters, above 10%.
+ *
+ * U+FFFD counts, and it is the character that matters most here (#2889). Every
+ * source file enters the pipeline through a `utf-8` decode — the content cache
+ * below reads with `fs.readFile(path, 'utf-8')`, and the parse worker decodes
+ * the same way. That decode is lossy and total: an invalid byte sequence never
+ * survives as invalid bytes, it is REPLACED with U+FFFD. So the embedded-binary
+ * payloads #2889 describes (webpack bundles, class-file constant pools,
+ * serialized objects inside .js/.vue sources) arrive here as long runs of
+ * U+FFFD, not as the control bytes this scan was originally written to count —
+ * charCode 0xFFFD is neither `< 9`, nor between 13 and 32, nor 127, so the
+ * detector scored a wholly corrupt payload as clean text and every caller waved
+ * it through.
+ *
+ * The threshold stays at 10%: a legitimate source file carries no replacement
+ * characters at all unless it was mis-decoded, and a handful (a stray latin-1
+ * comment, one bad byte in a license header) still scores far under the bar.
+ * Density rather than "contains any binary run" is deliberate — a description
+ * that is mostly real prose with one stray replacement character is worth more
+ * indexed than dropped.
+ */
 export const isBinaryContent = (content: string): boolean => {
-  if (!content || content.length === 0) return false;
-  const sample = content.slice(0, 1000);
+  // `content &&` keeps the original tolerance for a null/undefined caller —
+  // `strict` is off in this package, so the type alone does not rule it out.
+  const end = content ? Math.min(content.length, BINARY_SAMPLE_CHARS) : 0;
+  if (end === 0) return false;
   let nonPrintable = 0;
-  for (let i = 0; i < sample.length; i++) {
-    const code = sample.charCodeAt(i);
-    if (code < 9 || (code > 13 && code < 32) || code === 127) nonPrintable++;
+  for (let i = 0; i < end; i++) {
+    const code = content.charCodeAt(i);
+    if (code < 9 || (code > 13 && code < 32) || code === 127 || code === UNICODE_REPLACEMENT_CHAR)
+      nonPrintable++;
   }
-  return nonPrintable / sample.length > 0.1;
+  return nonPrintable / end > 0.1;
 };
 
 /**
@@ -220,9 +254,21 @@ class FileContentCache {
  */
 export const normalizeFtsText = (text: string): string => text.replace(/[\r\n\t]+/g, ' ');
 
-/** Composes both FTS-text transforms for the `description` column — one place for the six emission sites below to call, instead of repeating the composition. */
+/**
+ * Composes both FTS-text transforms for the `description` column — one place for
+ * the six emission sites below to call, instead of repeating the composition.
+ *
+ * Binary-looking descriptions are dropped rather than transformed (#2889). The
+ * `content` column has always been gated on {@link isBinaryContent} inside
+ * {@link extractContent}; `description` never was, so a symbol whose "doc
+ * comment" is really a slice of an embedded binary payload had that payload
+ * copied verbatim into an FTS-indexed column. Dropping it here rather than at
+ * each of the six call sites keeps the gate in the same place as the transforms
+ * it guards. Empty string, not a sentinel: unlike `content`, a description has
+ * no reader that needs to be told why it is missing.
+ */
 const formatFtsDescription = (description: string): string =>
-  normalizeFtsText(applyCjkSegmentationIfEnabled(description));
+  isBinaryContent(description) ? '' : normalizeFtsText(applyCjkSegmentationIfEnabled(description));
 
 // Labels that get exact source-span content (no ±2 window). Single source of
 // truth in `symbol-labels.ts` — see there for why the exactness depends on the
@@ -511,7 +557,8 @@ export const streamAllCSVsToDisk = async (
       'Template',
       'Module',
     ] as const;
-    const propertyHeader = 'id,name,filePath,startLine,endLine,content,description,declaredType';
+    const propertyHeader =
+      'id,name,filePath,startLine,endLine,content,description,declaredType,isDetail';
     const multiLangWriters = new Map<string, BufferedCSVWriter>();
     for (const t of MULTI_LANG_TYPES) {
       multiLangWriters.set(
@@ -704,7 +751,13 @@ export const streamAllCSVsToDisk = async (
                   escapeCSVField(content),
                   escapeCSVField(formatFtsDescription(node.properties.description || '')),
                   ...(node.label === 'Property'
-                    ? [escapeCSVField(node.properties.declaredType || '')]
+                    ? [
+                        escapeCSVField(node.properties.declaredType || ''),
+                        // R3-4 detail symbols — see PROPERTY_SCHEMA. Written as
+                        // an explicit boolean so the column is never empty; an
+                        // empty BOOLEAN cell fails the COPY.
+                        node.properties.isDetail === true ? 'true' : 'false',
+                      ]
                     : []),
                 ].join(','),
               );
@@ -785,11 +838,16 @@ export const streamAllCSVsToDisk = async (
     // read once instead of twice. The router applies the SAME label-derivation +
     // validTables filter as the legacy splitRelCsvByLabelPair, so the per-pair
     // files are byte-identical (asserted by the differential test).
-    const relRouter = new RelPairRouter(csvDir, REL_CSV_HEADER, new Set<string>(NODE_TABLES));
+    const relRouter = new RelPairRouter(
+      csvDir,
+      REL_CSV_HEADER,
+      VALID_NODE_TABLES,
+      DECLARED_RELATION_PAIRS,
+    );
     try {
       let emitted = 0;
       for (const rel of orderedRelationships(graph, sortOutput)) {
-        const pending = relRouter.route(rel.sourceId, rel.targetId, buildRelRow(rel));
+        const pending = relRouter.route(rel.sourceId, rel.targetId, buildRelRow(rel), rel.type);
         if (pending) await pending;
         // Periodically hand the event loop back so the overlapped node COPY and
         // write-stream drains run instead of starving behind this synchronous

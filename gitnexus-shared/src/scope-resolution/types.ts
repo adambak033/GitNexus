@@ -128,6 +128,40 @@ export type ParsedImport =
        * duplicating `importedName`.
        */
       readonly targetIncludesImportedName?: boolean;
+      /**
+       * Set by providers whose import syntax *also* republishes the name from
+       * the importing module, so a third file can import it from there.
+       *
+       * Python has no dedicated re-export form: a module-level
+       * `from pkg.impl import X` binds `X` locally **and** publishes it as
+       * `pkg.X`, which is the standard way a package `__init__.py` declares
+       * its public surface. Languages with an explicit form (TS `export … from`,
+       * Rust `pub use`) emit `kind: 'reexport'` instead and leave this unset.
+       *
+       * **The flag must track actual republication, not syntax.** Only a
+       * module-level statement publishes: the same `from m import X` inside a
+       * `def` or `class` body binds locally and puts nothing in the module
+       * namespace, so flagging it fabricates a re-export of a name no importer
+       * can reach. `if` / `try` / `for` / `with` do not suppress it — Python
+       * has no block scope. A provider that cannot tell these apart at
+       * interpret time must carry the fact down from its capture emitter,
+       * where the syntax node is still available.
+       *
+       * **Why not `kind: 'reexport'`.** Not because that form drops the local
+       * binding — `materializeBindings` creates a module-scope `BindingRef`
+       * for every linked edge, re-export included. It is that `reexport`
+       * changes what the binding *is*: `origin` flips to `'reexport'`, which
+       * carries different evidence weight and `ORIGIN_PRIORITY`, and it
+       * misreports the parse-time syntax Python actually wrote. A flag adds
+       * the export-surface fact without restating the import as something the
+       * source does not say.
+       *
+       * Consumed by `buildReexportClosures` (`finalize-algorithm.ts`), which
+       * also documents how ambiguous duplicates of one published name are
+       * handled — the precedence rules that hold for an explicit re-export do
+       * not carry over.
+       */
+      readonly reexportsName?: boolean;
     }
   /**
    * Per-name import with rename.
@@ -146,6 +180,8 @@ export type ParsedImport =
       readonly importedSymbolKind?: 'type' | 'function' | 'const';
       /** See the same field on the `named` variant. */
       readonly targetIncludesImportedName?: boolean;
+      /** See the same field on the `named` variant. */
+      readonly reexportsName?: boolean;
     }
   /**
    * Qualified module handle, with or without rename. `importedName` is the
@@ -264,8 +300,24 @@ export type ParsedImport =
 export interface ParsedTypeBinding {
   /** The name being bound (parameter name, `self`, assignment LHS, …). */
   readonly boundName: string;
-  /** The raw type name as written in source (`'User'`, `'models.User'`, …). */
+  /** The type name AFTER this provider's normalization (`'User'`,
+   *  `'models.User'`, …) — see `TypeRef.rawName`. */
   readonly rawTypeName: string;
+  /**
+   * Optional override for `TypeRef.declaredSpelling`, for a grammar that does
+   * not keep the whole written type under `@type-binding.type`.
+   *
+   * The scope extractor derives the spelling from that capture by default,
+   * which is right for every language whose type node spans the annotation.
+   * C++ is the exception: `User* repos` parses with the `*` on the DECLARATOR,
+   * so the type capture is a bare `User` and the container-ness the index step
+   * needs is nowhere in the captures the extractor reads. A provider that can
+   * reconstruct it exactly sets it here.
+   *
+   * Leave undefined otherwise — the extractor's derivation is preferred to a
+   * per-language reimplementation of it.
+   */
+  readonly declaredSpelling?: string;
   readonly source: TypeRef['source'];
 }
 
@@ -351,6 +403,11 @@ export interface BindingRef {
   readonly origin: 'local' | 'import' | 'namespace' | 'wildcard' | 'reexport';
   /** Non-null for non-local origins; carries the `ImportEdge` that brought the name into this scope. */
   readonly via?: ImportEdge;
+  /**
+   * Optional semantic visibility evidence supplied by a language hook.
+   * Shared resolution consumes this without inspecting language syntax.
+   */
+  readonly visibility?: 'static-member-import';
 }
 
 // ─── §2.5 TypeRef ───────────────────────────────────────────────────────────
@@ -365,8 +422,36 @@ export interface BindingRef {
  * re-exports, and nested modules. Generics deferred to V2 via `typeArgs`.
  */
 export interface TypeRef {
-  /** The name as written in source (e.g., `'User'`, `'models.User'`, `'List'`). */
+  /**
+   * The type name AFTER the language's capture-time normalization — NOT
+   * necessarily what the source says. Every provider's `interpretTypeBinding`
+   * reduces the annotation before it gets here: TypeScript runs
+   * `stripGeneric` + `stripArraySuffix` to a FIXED POINT (`User[][]` → `User`),
+   * Go's `normalizeGoTypeName` drops `[]` and `map[K]`, C#/Python/Kotlin/Rust
+   * strip their single-arg collection wrappers. What survives is the name a
+   * class lookup can use (`'User'`, `'models.User'`, `'List'`).
+   *
+   * A consumer that needs the CONTAINER, not the element, must read
+   * `declaredSpelling` — see below.
+   */
   readonly rawName: string;
+  /**
+   * The annotation exactly as written, kept ONLY when `rawName` is not it.
+   *
+   * `rawName` alone cannot distinguish `repos: User[]` (a container the capture
+   * layer already reduced, so the position IS the element) from `grid: Grid`
+   * (an ordinary class the source happened to subscript). Both arrive as a bare
+   * class name that resolves. An index step reading only `rawName` therefore had
+   * no choice but to guess, and guessing "already reduced" typed `grid[0]` as
+   * `Grid` — a confidently WRONG owner for the next member.
+   *
+   * Absent when the provider's normalization was a no-op (nothing was lost, so
+   * `rawName` is already the written spelling), and absent for TypeRefs
+   * synthesized outside the capture path (a `this` receiver binding, a
+   * propagated return type). Consumers must treat absence as "no container
+   * evidence" and decline, never as "not a container".
+   */
+  readonly declaredSpelling?: string;
   /** Anchor for resolving `rawName` — the scope where the annotation/inference was written. */
   readonly declaredAtScope: ScopeId;
   readonly source:
@@ -409,6 +494,25 @@ export interface Scope {
 
   /** Local type facts visible from this scope (parameter annotations, `self` binding, etc.). */
   readonly typeBindings: ReadonlyMap<string, TypeRef>;
+
+  /** Lexically bound names that may have no definition or type fact of their
+   * own (for example, an untyped function parameter). Consumers use this only
+   * as a shadowing barrier; it never resolves a symbol by itself. */
+  readonly lexicalNames?: ReadonlySet<string>;
+
+  /** Receiver names this scope BINDS rather than inherits — `this`, `self`, … (#2701).
+   *
+   *  A receiver walk (`findReceiverTypeBinding`) that reaches such a scope
+   *  without finding the name in `typeBindings` stops here and reports the
+   *  receiver unresolved, instead of continuing up and borrowing an enclosing
+   *  scope's binding. In JavaScript/TypeScript an ordinary `function` binds its
+   *  own `this` (ECMA-262 `[[ThisMode]]`) while an arrow inherits one, so
+   *  `this.m()` inside a nested `function` must NOT reach the enclosing class.
+   *
+   *  Left unset by every language whose closures capture the receiver
+   *  lexically, which is nearly all of them — the walk is unchanged there.
+   *  Populated from `LanguageProvider.scopeOwnsReceivers`. */
+  readonly ownsReceivers?: ReadonlySet<string>;
 }
 
 // ─── §2.6 Resolution + ResolutionEvidence ───────────────────────────────────

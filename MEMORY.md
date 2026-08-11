@@ -258,3 +258,359 @@ ALWAYS run `gitnexus clean --force && gitnexus analyze --force` — `--force` al
 - `npm link` active (v1.6.8), `gitnexus` command → fork
 
 ---
+
+
+## 2026-07-21T11:40:41.085Z — Upstream sync v1.6.9 merge
+
+## Upstream Sync: v1.6.8 → v1.6.9 (258 commits merged)
+
+### Situation
+- Fork was 9 commits ahead, **258 commits behind** upstream (v1.6.9)
+- Upstream reorganized README structure + many bug fixes across scope-resolution, captures, query, parse-worker, processes files
+
+### Merge Process
+- `git fetch upstream && git merge upstream/main`
+- **All code files auto-merged cleanly**: `typescript/captures.ts`, `typescript/query.ts`, `tree-sitter-queries.ts`, `parse-worker.ts`, `local-backend.ts`, `typescript-captures.test.ts` — zero conflicts on our modified files
+- **Only 1 conflict**: `README.md` (upstream reorganized sections: removed `## CLI + MCP` wrapper, added `## Quick Start` directly, moved Star History to end, added new `## Why a Knowledge Graph`, `## What Your AI Agent Gets`, `## Editor Setup`, `## CLI Reference` sections)
+
+### README Conflict Resolution
+Took upstream's README entirely + re-inserted our `## Fork: betterGitNexus — tRPC & Curried-Call Support` section after the TL;DR (line 48), before `## Quick Start`. Fork section documents: 5 features (HOC-in-pair, curried calls, tRPC routes, dedup, tRPC handler resolution), install instructions (`npm link` workflow), upstream sync process, and `clean --force` cache caveat.
+
+### Pre-commit Hook Issue (resolved)
+First commit attempt failed: `CallableFlowSite` not exported, `callableFlowSites` property missing on `ParsedFile`, `ScopeKind` comparison with `"Object"` invalid. Root cause: `gitnexus-shared` types stale. Fix: `cd gitnexus-shared && npm run build` rebuilt types, then `npx tsc --noEmit` passed cleanly.
+
+### Validation Status
+- Merge committed as `d7b03091` (745 files changed, 108,115 insertions, 6,505 deletions)
+- Pre-commit hook passed (typecheck gitnexus + gitnexus-web)
+- **Pending**: full test suite, `npm run build`, `npm link`, Jurialis re-index verification
+
+### Git State
+- Fork: `adambak033/GitNexus` branch `main`
+- Now in sync with upstream v1.6.9 (was v1.6.8)
+- Key modified files by fork: `languages/typescript/query.ts`, `tree-sitter-queries.ts`, `languages/typescript.ts`, `languages/typescript/captures.ts`, `workers/parse-worker.ts`, `route-extractors/trpc.ts`, `framework-detection.ts`, `call-processor.ts` — all preserved through merge
+- New upstream features now available: Spring DI resolver, callable-value-flow pass, CJK segmentation, FastAPI route constant resolver, embeddings improvements, group cross-repo enhancements
+
+---
+
+
+## 2026-07-21T19:30:08.402Z — Upstream sync + test validation done
+
+## Upstream Sync v1.6.9 + Test Validation Complete
+
+### Merge Summary
+- Fork was 9 ahead, 258 behind upstream. Merged v1.6.8 → v1.6.9 (258 commits).
+- All code files auto-merged cleanly (zero conflicts on our modified files).
+- Only 1 conflict: README.md — took upstream's version entirely + re-inserted our `## Fork: betterGitNexus — tRPC & Curried-Call Support` section after TL;DR.
+- Merge commit: `d7b03091` (745 files changed, 108,115 insertions, 6,505 deletions)
+- Pre-commit hook passed. `gitnexus-shared` types had to be rebuilt (`cd gitnexus-shared && npm run build`) due to stale types.
+
+### Test Validation (post-merge)
+- **Initial run**: 14 failures (4 files) — appeared severe
+- **After rebuild + re-run**: 8 failures (2 files only)
+- **Root cause of the 6 that became passing**: stale `dist/` after merge. Tests that invoke the built CLI (`skip-git-cli.test.ts` → 2 tests, `incremental-orchestration.test.ts` → 4 tests) failed because they called the old binary. Rebuilding restored them: 7/7 and 19/19 respectively.
+
+### Remaining 8 Failures = PRE-EXISTING UPSTREAM PLATFORM BUGS
+
+**Verified by worktree test on pure upstream/main (commit `5c1c6c69`):** ran `analyzer-identity.test.ts` + `evidence-provenance-helper.test.ts` on pure upstream — same 8 failures, zero fork changes. These are NOT caused by our code.
+
+**Failure breakdown:**
+1. `analyzer-identity.test.ts` (4 failures): macOS-only. Tests use `os.tmpdir()` returning `/var/folders/...`, but macOS symlinks `/var` → `/private/var`. `path.resolve()` resolves through the symlink. Tests use literal string equality instead of normalizing. (Failing tests: 'is versioned, resolved, and changes when the analyzer build tree changes', 'supports only an absolute, pre-provisioned, external operator-trusted cache directory', 'invalidates an absent path guard when a nearer ancestor package lock appears', 'stable-reads symlinked package locks and rejects broken lock links'.)
+2. `evidence-provenance-helper.test.ts` (4 failures): Linux-only. Tests call code that requires `Linux /proc/self/fd and O_DIRECTORY/O_NOFOLLOW` for safe file descriptor anchoring. This filesystem feature does not exist on macOS. Error: 'Safe generated-plan writes require Linux /proc/self/fd and O_DIRECTORY/O_NOFOLLOW; refusing an unanchored write'. (Failing tests: 'has one golden digest for every dirty state and identical planner/executor bytes', 'rejects a worktree mutation observed after layer materialization', 'rejects an ignored cited path created during afterMaterialize', 'rejects an ignored cited path created during afterFirstGuardPass'.)
+
+**These 8 failures are environmental (macOS has no `/proc/self/fd`, has `/var` symlink) and identical on upstream. They cannot be fixed without changing upstream's platform abstractions.**
+
+### Post-merge Validation on Jurialis
+- `npm run build` succeeded; `npm link` active (v1.6.9)
+- `gitnexus clean --force && gitnexus analyze --force` on Jurialis
+- Results: **13,853 nodes, 40,045 edges, 610 clusters, 428 flows** (was 10,245/25,612/472/300 on v1.6.8)
+- **304 tRPC routes + 16 API routes = 320 total** (was 267 on v1.6.8 — even better)
+- `impact({target: "createTeamWorkflow"})`: 1 direct caller (procedure `create` in team.ts), LOW risk, status `exact`, module 'Routers'
+
+### Git State
+- Fork: `adambak033/GitNexus`, branch `main`, commit `d7b03091`
+- Pushed to origin/main (`49edf953..d7b03091`)
+- `MEMORY.md` untracked (working file)
+
+### Worktree Cleanup
+- `/tmp/gn-upstream-test` (pure upstream test) removed with `git worktree remove --force`
+
+### User Follow-up Questions
+- User wants 100% clean test suite. Answer: 8 remaining failures are pre-existing macOS/Linux-specific upstream bugs, confirmed by running them on pure upstream/main.
+- User wants deep verification of tRPC pattern detection (route → procedure → method → workflow → functions → sub-workflows), specifically example `cabinetRouter.create.input().mutation(handler with workflow inside)`.
+
+---
+
+
+## 2026-07-21T19:34:29.460Z — tRPC verification on Jurialis complete
+
+## Deep Verification of tRPC Pattern Detection on Jurialis (repo path: `/Users/adam/Documents/Developpement/Jurialis`)
+
+**IMPORTANT:** Two repos named "Jurialis" are registered — must pass repo as absolute path `/Users/adam/Documents/Developpement/Jurialis` to disambiguate from `/Users/adam/Documents/Developpement/feat-8-4-onboarding-fee`.
+
+### Example verified: `cabinet.ts:setProviderCap` (lines 270-282)
+Pattern: `setProviderCap: ownerOrCabinetAdminOnlyProcedure.input(z.object({...})).mutation(async ({ctx, input}) => setProviderCapWorkflow(ctx.db)(input, {...}))`
+
+**Full chain WORKS:**
+1. ✅ Route detected: `Route:POST /trpc/cabinet.setProviderCap` (handler: cabinet.ts)
+2. ✅ Procedure as Function node: `Function:jurialis/src/server/api/routers/cabinet.ts:setProviderCap` (startLine 270, endLine 282), `epistemic: "exact"`, status `"found"` (not ambiguous)
+3. ✅ Curried call CALLS edge: `Function:cabinet.ts:setProviderCap` → `Function:workflows/quota/provider-caps.ts:setProviderCapWorkflow`, confidence 0.85, reason `import-resolved`
+4. ✅ Workflow indexed: `Function:provider-caps.ts:setProviderCapWorkflow` (lines 87-123), with outgoing CALLS to `ValidationError` (Class) + `requireCabinetId` (Function) + ACCESSES to `tenantId` (Const)
+5. ❌ No Process attached: trace too short (only 3 steps: procedure → workflow → requireCabinetId/ValidationError). Process detection requires min 3-step traces and top-200 scoring — `setProviderCap` chain didn't make cutoff.
+6. ❌ No `ENTRY_POINT_OF` edge from the route (because no Process to link to)
+
+### Better example verified: `data-export.ts:request` (lines 10-42)
+**All 6 levels of chain WORK:**
+1. ✅ Route: `Route:POST /trpc/data-export.request` linked to **9 processes**
+2. ✅ Procedure: `Function:data-export.ts:request`, status `"found"`, outgoing CALLS to TWO workflows: `generateDataExportWorkflow` + `requestExportWorkflow` (both curried calls detected)
+3. ✅ Processes attached: 9 distinct processes (3-6 steps each): `Request → ValidationError`, `Request → ForbiddenError`, `Request → NotFoundError`, `Request → ConflictError`, `Request → DecryptionError`, `Request → Update`, `Request → FetchAllPaginated`, `Request → BudgetFindUnique`, `Request → GetCorrelationId`
+
+### Cross-graph metrics confirmed
+- **20/20 cabinet.ts procedures** detected as Function nodes (mine, updateSettings, updateInactivityConfig, setLogo, getById, list, getQuotaDistribution, setQuotaDistributionMode, setIndividualAllocation, getIaQuotaStatus, getCreditPackages, purchaseAdditionalCredits, getCreditPurchaseHistory, getSepaMandateStatus, createSepaMandateFlow, completeSepaMandateFlow, completeOnboarding, getProviderCaps, setProviderCap, getQuotaAttribution)
+- **All cabinet routes have correct HTTP methods**: queries → GET, mutations → POST
+- **35 tRPC routes linked to Processes via ENTRY_POINT_OF** (out of 304 tRPC routes total — the rest have shorter call chains that don't meet process-detection cutoff)
+- **187 total ENTRY_POINT_OF edges for tRPC routes** across action.ts, adminSystem.ts, consent.ts, data-export.ts, meeting.ts, webhooks.ts routers
+- **Sub-workflow calls detected**: `addMemberToTeamWorkflow → recalculateUserRoleFromTeams` (team/add-member.ts → team/recalculate-role.ts) — proves curried call detection works workflow-to-workflow
+
+### Cypher query gotcha
+Route node IDs include HTTP method prefix: `Route:POST /trpc/cabinet.setProviderCap` (not `Route:/trpc/...`). Cypher queries must use `STARTS WITH 'Route:POST /trpc/'` or `STARTS WITH 'Route:GET /trpc/'`, not `STARTS WITH 'Route:/trpc/'`.
+
+### context() display quirk
+`context({name: "setProviderCapWorkflow"})` shows `incoming.calls` as only test files, but Cypher confirms the procedure→workflow CALLS edge DOES exist. The `context` tool's display may filter or truncate incoming edges — Cypher is the source of truth.
+
+### Noise issue noticed (not blocking)
+Many workflow→workflow CALLS edges point to `.test.ts` files (e.g., `acceptActionClientWorkflow → updateManyMock` in `billing/process-quota-rollover.test.ts`). Test files leak mock function definitions into the call graph. This is upstream behavior, not our fork's responsibility.
+
+### VERDICT: tRPC pattern detection works end-to-end
+All 4 fork features (HOC-in-pair, curried calls, tRPC routes, dedup) are operational after the v1.6.9 upstream sync. The complete chain `route → procedure → method handler → workflow → sub-workflows` is correctly indexed for Jurialis routers. Process linking works for procedures with ≥3-step call traces.
+
+---
+
+
+## 2026-07-21T21:50:00.476Z — Fix A-G implementation + validation done
+
+## User Request: Make tRPC chain visible via context/query (not Cypher)
+
+User observed that the tRPC chain (route → procedure → workflow → sub-workflows), verified working via raw Cypher in (b17), was NOT visible via the standard `context` and `query` MCP tools that AI agents actually use. Asked: "Penses-tu qu'il serait possible de retravailler l'extension afin de faire ressortir toute notre chaine en utilisant query et context plutôt que cypher ?"
+
+## Diagnostic (2 parallel explore tasks confirmed)
+
+**Problem 1 — `context` hides procedure callers:** incoming CALLS query at `local-backend.ts:3095-3104` had `LIMIT 30` with **no `ORDER BY`**. When a workflow has >30 callers (mostly tests), the procedure is silently dropped. No test-file exclusion (unlike `impact`).
+
+**Problem 2 — `query` doesn't surface tRPC naturally:**
+- `Route`/`Tool`/`Process` absent from `FTS_INDEXES` (only Function/Class/Method/Interface/etc. indexed)
+- `set*`/`get*` utility penalty (0.3×) cancels tRPC framework boost (3.0×) → net 0.9 (below 1.0 baseline)
+- `max_symbols: 10` default truncates the procedure→workflow chain
+- `ENTRY_POINT_OF` edges never consulted by `query` (only `STEP_IN_PROCESS`)
+- `route_map`/`api_impact` return only Process names, not the chain
+
+## Implementation: 7 Fixes (ALL COMPLETED + PUSHED-READY)
+
+**Fix A** — `local-backend.ts:3095` (incoming) and `:3223` (outgoing): Added ORDER BY test-last via CASE WHEN ... CONTAINS '.test.'/.spec.'/etc., raised LIMIT 30→100. Same pattern in both queries. LadybugDB has no `=~` regex operator — used CONTAINS instead.
+
+**Fix B** — `local-backend.ts:1981` (STEP_IN_PROCESS query): Added `p.entryPointId` column. Added new batched ENTRY_POINT_OF lookup block (~lines 2126-2173) that fetches Route.name per process via two UNION ALL edge shapes: (1) `Route -[ENTRY_POINT_OF]-> Process`, (2) `Route -[ENTRY_POINT_OF]-> <entryFn>` (older variant). Added `route`/`method` fields to process output.
+
+**Fix C** — `local-backend.ts:2222` (process_symbols): Added `is_entry_point: true` marker when `s.id === p.entryPointId`. Requires entryPointId from Fix B.
+
+**Fix D** — `entry-point-scoring.ts:130`: Added `isTrpcRouter` + `skipUtilityPenalty` check. When `filePath` matches `/(routers|trpc/routers|server/routers)/i` AND `detectFrameworkFromPath(filePath).framework === 'trpc'`, UTILITY_PATTERNS penalty (0.3×) is skipped. Restores full framework boost (3.0×) for procedures like `setProviderCap`.
+
+**Fix E** — `fts-schema.ts:46`: Added Route entry with `properties: ['name']` (Route has no description/content columns per ROUTE_SCHEMA). Route URLs like `/trpc/cabinet.setProviderCap` now keyword-searchable.
+
+**Fix F** — `tools.ts:167` (schema) + `local-backend.ts:1871` (default): Bumped `max_symbols` default 10 → 25 so a procedure→workflow→helper chain fits in one page.
+
+**Fix G** — `tools.ts:315` (schema) + `local-backend.ts:3118+` (param) + new `_computeContextChain` method (~line 3486): Added optional `chain_depth` param (0-3, default 0). When >0, walks CALLS edges in BOTH directions (upstream callers + downstream callees) up to N hops with cycle detection via `visited` set, returns layered result as `chain` field. Test-file nodes deprioritized via ORDER BY. Cap 50 nodes per direction per layer.
+
+## Validation
+- `tsc --noEmit`: 0 errors (after fixing `route: undefined as string | undefined` typing issue and adding `entryPointId` to processMap type)
+- `npm run test:unit`: **10,325 passed, 8 failed** — the 8 failures are the EXACT same pre-existing platform bugs from (b16): 4× `analyzer-identity.test.ts` (macOS `/var` symlink) + 4× `evidence-provenance-helper.test.ts` (Linux `/proc/self/fd`). **Zero new failures.**
+- `npm run build`: succeeded (rebuilt 362 files)
+- Reindexed Jurialis: **13,868 nodes, 40,094 edges, 610 clusters, 433 flows** (was 13,853/40,045/610/428 — slight increases from Fix D promoting more tRPC procedures to Process entry points)
+
+## Testing Status (BLOCKED on stale MCP server)
+
+**CRITICAL GOTCHA:** killed 4 stale `gitnexus mcp` processes (oldest 2d11h old) to force opencode to spawn fresh MCP server with new code. The FIRST `context({name: "setProviderCapWorkflow"})` call after rebuild returned OLD behavior (only test files in incoming.calls, no procedure caller) — confirming the opencode MCP server was a long-running process with OLD dist loaded in memory.
+
+Cypher confirmed the data is correct: 2 CALLS edges to `setProviderCapWorkflow`:
+1. `Function:cabinet.ts:setProviderCap` (the procedure — should now appear)
+2. `File:provider-caps.test.ts` (the test)
+
+**Next step:** Call `gitnexus_context({name: "setProviderCapWorkflow", repo: "/Users/adam/Documents/Developpement/Jurialis", kind: "Function"})` again — opencode should respawn a fresh MCP server with the new dist code, and the procedure caller should appear in `incoming.calls` ahead of test files (Fix A).
+
+Then test:
+- `gitnexus_context({name: "setProviderCapWorkflow", chain_depth: 3})` → should return `chain` field with layered callers/callees (Fix G)
+- `gitnexus_query({search_query: "setProviderCap", repo: ...})` → processes should include `route: "/trpc/cabinet.setProviderCap"` field (Fix B), entry-point symbol should have `is_entry_point: true` (Fix C)
+
+## Files Modified (Final State)
+| File | Fixes |
+|------|-------|
+| `gitnexus/src/mcp/local/local-backend.ts` | A (incoming/outgoing queries), B (ENTRY_POINT_OF lookup + entryPointId), C (is_entry_point marker), F (max_symbols default), G (_computeContextChain method + chain_depth param) |
+| `gitnexus/src/mcp/tools.ts` | F (max_symbols schema), G (chain_depth schema) |
+| `gitnexus/src/core/ingestion/entry-point-scoring.ts` | D (tRPC UTILITY_PATTERNS exemption) |
+| `gitnexus/src/core/search/fts-schema.ts` | E (Route added) |
+
+## Git State
+- Fork: `adambak033/GitNexus`, branch `main`
+- Working tree has uncommitted changes (all 4 files)
+- `npm link` active, `gitnexus` CLI → fork v1.6.9
+- Dist rebuilt at `/Users/adam/Documents/Developpement/betterGitNexus/gitnexus/dist/`
+- Jurialis index: 13,868 nodes (rebuilt with new code)
+
+---
+
+
+## 2026-07-21T22:08:06.090Z — Fix H LadybugDB IN bug + full validation
+
+## Fix H: LadybugDB `IN` Operator Bug + Full Validation of Fixes A-G
+
+### Root Cause Discovery: LadybugDB `IN` Bug on Relationship Properties
+
+User asked "Il faut build et faire un npm install puis link non ?" after `context` still showed only test files. Investigation revealed the dist WAS correctly built, but a deeper bug was at play.
+
+**The bug:** LadybugDB/KuzuDB's `WHERE r.type IN [...]` operator on relationship properties **silently drops edges**. Confirmed via direct Cypher comparison on the same target `Function:provider-caps.ts:setProviderCapWorkflow`:
+- `WHERE r.type = 'CALLS'` (equality) → returns BOTH edges (procedure Function + test File) ✓
+- `WHERE r.type IN ['CALLS']` (IN list, even 1 element) → returns ONLY the test File edge ✗
+- `WHERE r.type IN ['CALLS', 'IMPORTS', ...]` → same bug, only test File returned
+- `list_contains(['CALLS'], r.type)` → same bug
+- `WHERE r.type = 'CALLS' OR r.type = 'IMPORTS' OR ...` → returns ALL edges correctly ✓
+
+This means the `IN` operator (and `list_contains`) is fundamentally broken for relationship property matching in LadybugDB. The `OR` chain is the only working workaround.
+
+### Fix H: Replaced all `r.type IN [...]` with `OR` chains (7 occurrences across 3 files)
+
+| File | Lines | Context |
+|------|-------|---------|
+| `gitnexus/src/mcp/local/local-backend.ts` | 3179 (incoming) | Full 11-type list → OR chain |
+| `gitnexus/src/mcp/local/local-backend.ts` | 3238 (constructor callers) | 6-type list → OR chain |
+| `gitnexus/src/mcp/local/local-backend.ts` | 3250 (file callers) | 2-type list → OR chain |
+| `gitnexus/src/mcp/local/local-backend.ts` | 3264 (typed property callers) | 6-type list → OR chain. NOTE: had to unescape `Property` backtick — edit tool stripped the escape |
+| `gitnexus/src/mcp/local/local-backend.ts` | 3319 (outgoing) | Full 11-type list → OR chain |
+| `gitnexus/src/mcp/local/pdg-impact.ts` | 1171 | CDG/REACHING_DEF probe query |
+| `gitnexus/src/mcp/local/pdg-impact.ts` | 1324 | CDG/REACHING_DEF BFS frontier query |
+| `gitnexus/src/core/wiki/graph-queries.ts` | 84 | HAS_METHOD/HAS_PROPERTY export query |
+
+### Validation: ALL 7 Fixes Confirmed Working
+
+**Fix A + H (context shows procedure caller):** ✓ `gitnexus context setProviderCapWorkflow` now returns:
+```json
+"incoming": {
+  "calls": [
+    {"uid": "Function:cabinet.ts:setProviderCap", ...},  // PROCEDURE FIRST
+    {"uid": "File:provider-caps.test.ts", ...}             // test file SECOND (deprioritized)
+  ]
+}
+```
+
+**Fix B (query route field):** ✓ `gitnexus query "data export request"` returns processes with:
+```json
+{"id": "proc_349_get", "route": "/api/cron/import-reconcile", ...}
+```
+
+**Fix C (is_entry_point marker):** ✓ `query` process_symbols include:
+```json
+{"id": "Function:.../route.ts:GET", "is_entry_point": true, ...}
+```
+
+**Fix E (Route in FTS):** ✓ `gitnexus query setProviderCap` returns Route node in definitions:
+```json
+{"id": "Route:POST /trpc/cabinet.setProviderCap", "name": "/trpc/cabinet.setProviderCap"}
+```
+
+**Fix G (chain_depth BFS):** ✓ `context({name: "setProviderCapWorkflow", chain_depth: 3})` returns `chain` array:
+```json
+[
+  {"depth": 1, "upstream": [setProviderCap procedure, test], "downstream": [ValidationError, requireCabinetId]},
+  {"depth": 2, "downstream": [NotFoundError, ...]}
+]
+```
+
+### Test Results
+- `npx tsc --noEmit`: 0 errors
+- `npm run build`: succeeded (362 files rewritten)
+- `npm run test:unit`: **10,325 passed, 8 failed** (same pre-existing platform bugs: 4× analyzer-identity macOS `/var` symlink + 4× evidence-provenance-helper Linux `/proc/self/fd`). **Zero new failures.**
+
+### Git State (uncommitted)
+- Fork: `adambak033/GitNexus`, branch `main`
+- Working tree has uncommitted changes in 5 files:
+  - `gitnexus/src/mcp/local/local-backend.ts` (Fixes A, B, C, F, G, H)
+  - `gitnexus/src/mcp/tools.ts` (Fixes F, G schemas)
+  - `gitnexus/src/core/ingestion/entry-point-scoring.ts` (Fix D)
+  - `gitnexus/src/core/search/fts-schema.ts` (Fix E)
+  - `gitnexus/src/mcp/local/pdg-impact.ts` (Fix H)
+  - `gitnexus/src/core/wiki/graph-queries.ts` (Fix H)
+- `npm link` active, `gitnexus` CLI → fork v1.6.9
+- Dist rebuilt at `/Users/adam/Documents/Developpement/betterGitNexus/gitnexus/dist/`
+- Jurialis index: 13,868 nodes (no reindex needed — DB data was correct, only queries were buggy)
+
+### CLI Limitation Note
+The `gitnexus context` CLI command does NOT expose `chain_depth` (MCP-only param). To test chain_depth via CLI, use a Node script importing `LocalBackend` from dist:
+```js
+import { LocalBackend } from '.../dist/mcp/local/local-backend.js';
+const backend = new LocalBackend(); await backend.init();
+await backend.callTool('context', {name: '...', repo: '...', chain_depth: 3});
+```
+
+### Summary of All 8 Fixes (A-H)
+| Fix | What | Status |
+|-----|------|--------|
+| A | context: ORDER BY test-last + LIMIT 100 | ✓ (was blocked by Fix H bug, now works) |
+| B | query: ENTRY_POINT_OF lookup + route field | ✓ |
+| C | query: is_entry_point marker | ✓ |
+| D | entry-point-scoring: tRPC UTILITY_PATTERNS exemption | ✓ |
+| E | fts-schema: Route added to FTS_INDEXES | ✓ |
+| F | tools: max_symbols default 10 → 25 | ✓ |
+| G | context: chain_depth BFS param (0-3) | ✓ |
+| H | **LadybugDB bug workaround: replace `r.type IN [...]` with `OR` chains** | ✓ (7 occurrences) |
+
+---
+
+
+## 2026-07-21T22:29:26.359Z — Fix #2 #3 context routes + limit
+
+## Fixes #2 + #3: context() is_entry_point/routes + query limit 10 (COMMITTED `004f5b0b`)
+
+### Validation Feedback (from Jurialis opencode session)
+A separate opencode session ran the 4-test validation scenario on Jurialis and confirmed all 8 fixes (A-H) work:
+- **Test 1** (Fix A+H): `context(setProviderCapWorkflow)` — procedure caller now FIRST, test file relegated. ✅
+- **Test 2** (Fix G): `context(chain_depth:3)` — `chain` field present with layered depth 1 (upstream=setProviderCap procedure, downstream=ValidationError+requireCabinetId) and depth 2 (downstream=NotFoundError). ✅
+- **Test 3** (Fix D+B+C+E): `query(setProviderCap)` — Fix E ✅ (Route in definitions), but `processes:[]` for setProviderCap (3-step chain too short for BFS — expected/normal per prior analysis).
+- **Test 4** (long chain): `query(data export request workflow)` — 3/9 data-export flows surfaced (limit:5 ate slots), Fix B ✅ (`route:"/trpc/data-export.request"`), Fix C ✅ (`is_entry_point:true` on `data-export.ts:request`).
+
+A separate bmad-dev mimic scenario also validated: `context(validateActionWorkflow)` returned rich data (incoming=router+batch workflow, outgoing=8 callees, 8 processes), `cypher` found 20 router→workflow chains in action domain.
+
+**3 gotchas reported back to fork author (me):**
+1. `workflows/` is PLURAL in real paths — AGENTS.md/Jurialis docs use singular `workflow/budget` (typo in doc, not in fork).
+2. `is_entry_point`/`route` only surfaced via `query`, not `context` — forces a 2nd call.
+3. `limit:5` default too tight for dense domains.
+
+### Implementation of #2 (priority) + #3
+
+User asked to implement both, #2 first (most leverage — context() is the mandatory pre-edit tool per AGENTS.md).
+
+**#2 — context() now self-sufficient (2 edits in `local-backend.ts`):**
+- Modified STEP_IN_PROCESS query (line ~3340) to return `p.entryPointId`.
+- Added ENTRY_POINT_OF lookup block after processRows: queries `MATCH (route:Route)-[ENTRY_POINT_OF]->(target) WHERE target.id=$symId OR target.id IN $entryPids`. Routes attributed ONLY from processes where symbol is the entry point (middle steps don't own the route) OR direct Route→symbol edges (tRPC procedures outside any Process, emitted by call-processor.ts handler resolution). Dedup by URL.
+- Computed `isEntryPoint = processRows.some(r => r.entryPointId === symId)`.
+- Added to output (before `processes:`): `...(isEntryPoint ? { is_entry_point: true } : {})` and `...(routes.length > 0 ? { routes } : {})`. Additive — only emitted when non-empty.
+
+**#3 — query limit 5→10 (2 edits):**
+- `local-backend.ts:1870`: `params.limit || 10` (was 5).
+- `tools.ts:160-166`: schema default 10, updated description.
+
+### Validation
+- `tsc --noEmit`: 0 errors
+- `test/unit/mcp`: 133 passed
+- `test/unit/mcp-repository-policy` + `ai-context` + `shape-check-regression`: 70 passed
+- `npm run build`: succeeded (362 files)
+- Pre-commit hook passed (prettier + eslint + typecheck)
+
+### Git State
+- Commit `004f5b0b` pushed to origin/main (on top of `c24df0ad`)
+- Fork now 2 commits ahead of upstream with fixes A-H + #2 + #3
+- `npm link` active, dist rebuilt
+- Jurialis index unchanged (13,868 nodes — these are query-time changes, no reindex needed)
+
+### How to verify on Jurialis (after restarting opencode for fresh MCP server)
+- `context({name:"validateActionWorkflow", repo:"/Users/adam/Documents/Developpement/Jurialis"})` → should now include `is_entry_point:true` and `routes:[{url:"/trpc/action.validate", method:"POST"}]`
+- `context({name:"setProviderCapWorkflow", ...})` → `routes` should include `/trpc/cabinet.setProviderCap` (via direct Route→symbol edge even though no Process)
+- `query({search_query:"data export"})` → should now return up to 10 processes (was 5), surfacing more of the 9 data-export flows
+
+---

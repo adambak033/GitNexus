@@ -29,6 +29,14 @@ function ctorRefs(src: string) {
     }));
 }
 
+/** All synthesized inheritance references in `src`, reduced to lookup names. */
+function inheritanceRefs(src: string): string[] {
+  return emitJavaScopeCaptures(src, 'C.java')
+    .filter((m) => m['@reference.inherits'] !== undefined)
+    .flatMap((m) => m['@reference.name']?.text ?? [])
+    .sort();
+}
+
 describe('emitJavaScopeCaptures — constructor reference names (F35 #1928)', () => {
   it('binds the simple name for an unqualified `new User()`', () => {
     const refs = ctorRefs(wrapExpr('new User()'));
@@ -79,6 +87,21 @@ describe('emitJavaScopeCaptures — constructor reference names (F35 #1928)', ()
     expect(ctorRefs(wrapExpr('new pkg.Foo()')).length).toBe(1);
     expect(ctorRefs(wrapExpr('new pkg.Box<String>()')).length).toBe(1);
     expect(ctorRefs(wrapExpr('new a.b.Foo()')).length).toBe(1);
+  });
+});
+
+describe('emitJavaScopeCaptures — record interface heritage (#2900)', () => {
+  it('captures simple, generic, and qualified record interfaces by lookup name', () => {
+    const refs = inheritanceRefs(
+      'record User(int id) implements Named, Comparable<User>, audit.Auditable {}',
+    );
+
+    expect(refs).toEqual(['Auditable', 'Comparable', 'Named']);
+  });
+
+  it('does not yet emit enum heritage (#2918)', () => {
+    // Delete this characterization when #2918 adds enum interface heritage.
+    expect(inheritanceRefs('enum Status implements Named { ACTIVE }')).toEqual([]);
   });
 });
 
@@ -144,5 +167,132 @@ class C {
 }
 `;
     expect(invokeFactsFor(src)).toBe(1);
+  });
+});
+
+describe('emitJavaScopeCaptures — local-type identities (#2562)', () => {
+  it('uses the source-type-relative identity for the definition and the simple lexical binding', () => {
+    const matches = emitJavaScopeCaptures(
+      'class Outer { void m() { class Local {} new Local(); } }',
+      'Outer.java',
+    );
+    const local = matches.find((m) => m['@declaration.name']?.text === 'Outer$1Local');
+
+    expect(local?.['@declaration.binding-name']?.text).toBe('Local');
+  });
+
+  it('leaves non-local class declarations unchanged', () => {
+    const matches = emitJavaScopeCaptures('class Outer { class Member {} }', 'Outer.java');
+    const member = matches.find((m) => m['@declaration.name']?.text === 'Member');
+
+    expect(member?.['@declaration.binding-name']).toBeUndefined();
+  });
+
+  it('recognizes a local class inside a record compact constructor', () => {
+    const matches = emitJavaScopeCaptures(
+      'record R(int x) { R { class Local {} new Runnable() {}; } }',
+      'R.java',
+    );
+    const names = matches.flatMap((m) => m['@declaration.name']?.text ?? []);
+
+    expect(names).toContain('R$1Local');
+    expect(names).toContain('R$1');
+  });
+
+  it('uses javac-compatible independent sequences for anonymous and named local types', () => {
+    const matches = emitJavaScopeCaptures(
+      `class Outer {
+         void first() {
+           new Runnable() {};
+           class Local {}
+           class Other {}
+           new Runnable() {};
+         }
+         void second() { class Local {} }
+       }`,
+      'Outer.java',
+    );
+    const names = matches.flatMap((m) => m['@declaration.name']?.text ?? []);
+
+    expect(names).toEqual(
+      expect.arrayContaining([
+        'Outer$1',
+        'Outer$2',
+        'Outer$1Local',
+        'Outer$2Local',
+        'Outer$1Other',
+      ]),
+    );
+  });
+
+  it('synthesizes every legal local type kind with its lexical binding name', () => {
+    const matches = emitJavaScopeCaptures(
+      `class Outer {
+         void types() {
+           class C {}
+           enum E { A }
+           record R(int x) {}
+           interface I { void run(); }
+         }
+       }`,
+      'Outer.java',
+    );
+
+    for (const [tag, identityName, bindingName] of [
+      ['@declaration.class', 'Outer$1C', 'C'],
+      ['@declaration.enum', 'Outer$1E', 'E'],
+      ['@declaration.record', 'Outer$1R', 'R'],
+      ['@declaration.interface', 'Outer$1I', 'I'],
+    ] as const) {
+      const declaration = matches.find(
+        (match) => match[tag] !== undefined && match['@declaration.name']?.text === identityName,
+      );
+      expect(declaration?.['@declaration.binding-name']?.text).toBe(bindingName);
+    }
+  });
+
+  it('detects local types from block position in initializers, lambdas, and anonymous bodies', () => {
+    const matches = emitJavaScopeCaptures(
+      `class Outer {
+         static { class StaticLocal {} }
+         { record InstanceLocal(int x) {} }
+         Runnable task = () -> { interface LambdaLocal {} };
+         Runnable anon = new Runnable() {
+           { enum AnonymousLocal { A } }
+           public void run() {}
+         };
+       }`,
+      'Outer.java',
+    );
+    const names = matches.flatMap((match) => match['@declaration.name']?.text ?? []);
+
+    expect(names).toEqual(
+      expect.arrayContaining([
+        'Outer$1StaticLocal',
+        'Outer$1InstanceLocal',
+        'Outer$1LambdaLocal',
+        'Outer$1$1AnonymousLocal',
+      ]),
+    );
+  });
+
+  it('emits declaration-to-block visibility scopes for local types', () => {
+    const matches = emitJavaScopeCaptures(
+      `class Outer {
+         void blocks() {
+           new Local();
+           class Local {}
+           new Local();
+         }
+       }`,
+      'Outer.java',
+    );
+    const local = matches.find((match) => match['@declaration.name']?.text === 'Outer$1Local');
+    const visibility = matches.find(
+      (match) =>
+        match['@scope.block']?.range.startLine === local?.['@declaration.class']?.range.startLine,
+    );
+
+    expect(visibility?.['@scope.block']?.range.endLine).toBe(6);
   });
 });
