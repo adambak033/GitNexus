@@ -373,6 +373,8 @@ function makeEdgeDrafts(
       targetFile: null,
       targetExportedName: extractExportedName(parsed),
       kind: edgeKindFor(parsed),
+      ...typeOnlyFor(parsed),
+      ...runsOnlyWhenCalledFor(parsed),
       linkStatus: 'unresolved',
     };
     return [
@@ -392,7 +394,13 @@ function makeEdgeDrafts(
   // and resolved-dynamic imports are terminal at the file level — no
   // `targetDefId` needed since they materialize no `BindingRef`. Pre-
   // finalize them here so the fixpoint loop skips them entirely.
-  const targetFiles = Array.isArray(targetFile) ? targetFile : [targetFile];
+  // Annotated rather than inferred: `isArray`'s `arg is any[]` predicate widens
+  // the true branch to a MUTABLE array, and a resolver may hand back a cached,
+  // frozen candidate list (Kotlin's `dirChildren` buckets do). Only `.map` is
+  // wanted here, so pinning `readonly` makes an in-place `.sort()`/`.push()` —
+  // which would reorder that resolver's index for the rest of the run — a
+  // compile error rather than a runtime TypeError.
+  const targetFiles: readonly string[] = Array.isArray(targetFile) ? targetFile : [targetFile];
   const isFileLevelTerminal = parsed.kind === 'side-effect' || parsed.kind === 'dynamic-resolved';
   return targetFiles.map((tf) => {
     const base: ImportEdge = {
@@ -403,6 +411,8 @@ function makeEdgeDrafts(
         hooks.isNamespaceImport?.(parsed, tf, file.filePath) === true
           ? 'namespace'
           : edgeKindFor(parsed),
+      ...typeOnlyFor(parsed),
+      ...runsOnlyWhenCalledFor(parsed),
     };
     return {
       source: parsed,
@@ -418,6 +428,73 @@ function makeEdgeDrafts(
 function edgeKindFor(parsed: ParsedImport): ImportEdge['kind'] {
   if (parsed.kind === 'wildcard') return 'wildcard-expanded';
   return parsed.kind;
+}
+
+/**
+ * Carry `ParsedImport.typeOnly` onto the edge — the erasure fact `check
+ * --cycles` needs and cannot re-derive, because `kind` is identical for the
+ * erased and the runtime spelling of the same import (`import type D` and
+ * `import D` both arrive as `alias`).
+ *
+ * `'typeOnly' in parsed` rather than a switch over the erasable kinds: only
+ * four variants declare the property, so `parsed.typeOnly` does not compile
+ * against the whole union, and `in` narrows it without naming them. That is
+ * also the safer shape — an enumeration has to be updated when a variant gains
+ * the property or the fact silently stops reaching the edge, while this form
+ * handles a new variant correctly whether or not it declares one.
+ *
+ * Returns a spreadable object rather than a `boolean` so an edge that is not
+ * type-only keeps the exact property set it had before this field existed.
+ * Every `finalized` edge is built by spreading `base`, so setting it here is
+ * enough for all of them.
+ */
+function typeOnlyFor(parsed: ParsedImport): { typeOnly?: true } {
+  return 'typeOnly' in parsed && parsed.typeOnly === true ? { typeOnly: true } : {};
+}
+
+/**
+ * Re-carry both runtime-presence flags from an existing edge onto a derived
+ * one.
+ *
+ * `expandWildcard` builds each `wildcard-expanded` edge from scratch rather
+ * than spreading the source (three fields differ per exported name), so every
+ * field it does not name is dropped. That is exactly how both flags were lost
+ * once already. Naming the pair here keeps "these two travel together" in one
+ * place, so a third presence flag is added in one place too.
+ */
+function carriedPresenceFlags(edge: Pick<ImportEdge, 'typeOnly' | 'runsOnlyWhenCalled'>): {
+  typeOnly?: true;
+  runsOnlyWhenCalled?: true;
+} {
+  return {
+    ...(edge.typeOnly === true ? { typeOnly: true } : {}),
+    ...(edge.runsOnlyWhenCalled === true ? { runsOnlyWhenCalled: true } : {}),
+  };
+}
+
+/**
+ * Carry `ParsedImport.runsOnlyWhenCalled` onto the edge — the position fact
+ * `check --cycles` needs and, unlike every other property of an import, cannot
+ * look up for itself.
+ *
+ * The scope an import was written in does not survive to here:
+ * `FinalizeFile.parsedImports` is a flat per-file list, and Phase 4 publishes
+ * the finalized edges under `file.moduleScope` (see `linkedByScope.set` above),
+ * so the consumer's map is keyed by the Module scope for every file. Walking
+ * that map's key to look for an enclosing `Function` therefore always starts —
+ * and ends — at a `Module`. Only the extractor still knows, so the edge has to
+ * carry what it decided.
+ *
+ * No `in` guard, unlike {@link typeOnlyFor}: position is a property of where
+ * the statement sits, so every variant declares `runsOnlyWhenCalled` and
+ * `parsed.runsOnlyWhenCalled` compiles against the whole union. A new variant
+ * that omits it is a build break here, which is the right outcome.
+ *
+ * Returns a spreadable object rather than a `boolean` so an edge that is not
+ * deferred keeps the exact property set it had before this field existed.
+ */
+function runsOnlyWhenCalledFor(parsed: ParsedImport): { runsOnlyWhenCalled?: true } {
+  return parsed.runsOnlyWhenCalled === true ? { runsOnlyWhenCalled: true } : {};
 }
 
 function extractLocalName(parsed: ParsedImport): string {
@@ -1060,6 +1137,35 @@ function expandWildcard(
       kind: 'wildcard-expanded',
       targetModuleScope: edge.targetModuleScope,
       targetDefId: def.nodeId,
+      // Every expanded edge inherits the presence facts of the ONE statement it
+      // came from. They are built fresh rather than spread from `edge` because
+      // `localName`, `targetExportedName` and `targetDefId` all differ per name
+      // — which is exactly how a property added to the wildcard edge upstream
+      // gets silently dropped here, and how `runsOnlyWhenCalled` was.
+      //
+      // `runsOnlyWhenCalled`: Ruby's `def f; require './m'; end` is one
+      // statement inside one method body — and every Ruby `require` is a
+      // wildcard, since the required file's whole surface becomes visible — so
+      // each name it brings in is bound only when `f` runs. Losing the flag
+      // here re-reports the pair as an initialization dependency and
+      // suppresses nothing — it INVENTS a cycle (`check --cycles`), which is
+      // why this is carried and not derived.
+      //
+      // Ruby is the reachable spelling. Python has no function-local
+      // `from x import *` — it is a SyntaxError — and Rust's `fn f() { use
+      // m::*; }`, which IS legal, is not deferred at all: `use` is a
+      // compile-time path alias, so the Rust provider opts out of the position
+      // rule (`LanguageProvider.importsExecuteWhereWritten`).
+      //
+      // `typeOnly`: unreachable today and deliberately kept. No provider emits
+      // a type-only wildcard — `reexport-wildcard` returns `kind: 'wildcard'`
+      // with no `typeOnly` because `export type *` is unparseable by the
+      // vendored grammar (documented on `ParsedImport`'s `wildcard` variant).
+      // It is propagated so the day that gap closes does not silently
+      // reintroduce this same defect for erasure. Do not delete it as dead
+      // code; `typeOnlyFor` is the gate that decides whether it can ever be
+      // set, and it is where the correspondence is enforced.
+      ...carriedPresenceFlags(edge),
     });
   }
   return expanded;

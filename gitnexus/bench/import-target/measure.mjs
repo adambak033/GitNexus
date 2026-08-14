@@ -82,12 +82,27 @@
  *     component of the IMPORTER, so per-import cost is quadratic in path depth:
  *     measured depth_ratio 7.39, by far the largest here, and the reason its
  *     depth budget is 11 rather than the ~2 most languages carry.
- *   - javascript, typescript, vue: one resolver (`resolveTsTarget`) behind
+ *   - javascript, typescript, vue: one resolver (`resolveTsModule`) behind
  *     three adapters, so the three corpora are the same shape and differ only
- *     in what actually differs — the extension list (`.js` vs `.ts`) and, for
- *     Vue, the tsconfig alias branch (see `VUE_TSCONFIG`). All three are
- *     miss-dominated bare specifiers, because a relative import resolves by
- *     exact `Set.has` and never reaches the leg that had no index.
+ *     in what actually differs — the extension list (`.js` vs `.ts`) and which
+ *     config leg the arm exercises (`tsBaseUrlConfig` vs `vueTsconfig`). All
+ *     three are miss-dominated bare specifiers.
+ *
+ *     What they measure CHANGED with #2953. The leg used to be `suffixResolve`,
+ *     a repo-wide search for a path ending in the specifier; these three no
+ *     longer have it, and resolve only against a declared tsconfig mapping or a
+ *     package manifest. Two consequences the numbers show:
+ *
+ *       - the arms need a `resolutionConfig` to resolve anything at all. With
+ *         none they all reported `resolved: 0` — every import correctly
+ *         external — while still printing a clean scaling ratio, which is a
+ *         bench measuring an empty branch and passing exactly like one
+ *         measuring a full one.
+ *       - `depth_ratio` is now structurally flat for them, and that is the
+ *         result rather than a weakened arm: declared resolution never walks
+ *         path components, so the `deep` arm's uniform prefix reaches the
+ *         config (see `tsBaseUrlFor`) and its cost is the same keyed lookup the
+ *         other arms pay.
  *   - c, cpp: `resolveCppImportTarget` delegates to `resolveCImportTarget`, so
  *     the two share a resolver and differ in extension set and in which adapter
  *     builds the augmented set. Cost is a basename bucket walk with a
@@ -196,9 +211,10 @@
  *   - of the eight added later, swift (3.28) and c/cpp (2.54/2.64) are the two
  *     that scan a bucket, and they scan DIFFERENT buckets: swift's is the
  *     module's own file list, which it returns, and C's is the basename bucket
- *     its suffix fallback walks. python, javascript, typescript and vue answer
- *     from keyed maps and sit at 1.03-1.10, so they keep the linear budget and
- *     that immunity is their assertion, exactly as for ruby and kotlin;
+ *     its suffix fallback walks. python answers from keyed maps and sits at
+ *     1.03-1.10, and javascript, typescript and vue answer from a declared
+ *     config (#2953) — so all four keep the linear budget and that immunity is
+ *     their assertion, exactly as for ruby and kotlin;
  *   - rust's collide arm is the one that is NOT a shared-leaf layout, and the
  *     reason is in the list above: file count is not an axis its cost has, so a
  *     shared-leaf rust arm would have been an arm that cannot fail. Its collide
@@ -270,9 +286,12 @@
  *      of eight, so go, dart and kotlin were excluded silently. All three
  *      retain a real per-pass structure: go's `PackageDirIndex` reads
  *      2 998 464 B, dart's basename buckets 7 834 200 B, and kotlin's
- *      `suffixByStem` cascade 48 073 096 B (45.85 MiB) — the second-largest
- *      reading in this file, above ruby's 39.12 and java's 33.34, both of which
- *      carry a full budget.
+ *      `suffixByStem` cascade 42 802 456 B (40.82 MiB) — above ruby's 39.12 and
+ *      java's 33.34, both of which carry a full budget. (Read 48 073 096 B when
+ *      this paragraph was written and described as "the second-largest reading
+ *      in this file", which it was not even then: csharp_csproj and php both
+ *      read higher. #2881 then compacted kotlin's `dirChildren` buckets and
+ *      took 11% off it.)
  *   2. TWO OF THE STATED REASONS NO LONGER HOLD. swift was excluded as "below
  *      its own noise floor" on 0.98 MB at 8000 files against 0.29 MB at 32 000;
  *      it now reads 969 120 B and 3 449 216 B, growing the right way. COBOL was
@@ -553,23 +572,44 @@ const HEAP_BUDGETED = [
   'ruby',
   'php',
   'java',
-  'javascript',
   'python',
   'c',
   // Promoted once every language was actually measured. Each retains a real
   // per-pass structure and each grows LINEARLY with the file count (ratio
   // 0.996-1.004 against a 1.25 budget over 8000 -> 32000 files), so each can
   // carry the full ceiling + floor + ratio set rather than a bound alone.
-  // kotlin's 45.85 MiB is the second-largest reading in this file — larger than
-  // ruby's and java's, both of which were budgeted from the start — and it had
-  // no stated exclusion reason at all.
+  // kotlin's 40.82 MiB is larger than ruby's and java's, both of which were
+  // budgeted from the start, and it had no stated exclusion reason at all.
+  //
+  // Its ceiling is also the one TIGHT ceiling in this file — 1.0747x its
+  // reading where every other is 1.5x — because it is the only one gating a
+  // size REDUCTION being preserved rather than a footprint not growing.
+  // #2881 compacts `dirChildren`'s buckets, and deleting that `slice()` is
+  // invisible to every other instrument in the repository: output-identical,
+  // so no fingerprint moves; capacity has no reflective surface, so no unit
+  // assertion moves; and both heap scales grow together, so `heap_ratio_budget`
+  // divides it out. It shows up here and nowhere else, at +12.57%. See
+  // `_heap_compaction_gate` in baselines.json for the measurement, the
+  // arithmetic behind the 5.4 MB, and how to tell a lost compaction from a
+  // runner's heapUsed accounting moving under the whole file.
   'kotlin',
   'dart',
   'go',
-  'typescript',
-  'vue',
   'cpp',
 ];
+// javascript, typescript and vue were budgeted here until #2953 and are now
+// BOUNDED, which is a demotion in gate strength and a promotion in what the
+// number means. They retained ~26.7 MiB each because they built a per-pass
+// `SuffixIndex` over the whole file list; they no longer build one at all,
+// because declared resolution derives nothing from the file set — a candidate
+// comes from a tsconfig mapping or a manifest and is checked with one
+// `Set.has`. The readings are 0-16 B.
+//
+// A floor over a reading at or below its own noise gates the noise, which is
+// the same reason rust sits in this tier at 16 B — so they take a bound and no
+// floor. The bound is what still matters: it catches these three growing an
+// index again, which is the re-entry condition for the cost #2911 and #1918
+// were about.
 
 /**
  * The arms handed the fifth `context` argument — `{ parsedFiles, parsedImport }`
@@ -635,17 +675,57 @@ const CSPROJ_CONFIGS = [
   { rootNamespace: 'Lib', projectDir: '' },
 ];
 /**
- * The `tsconfigPaths` the Vue arm threads as `resolutionConfig`.
+ * The `resolutionConfig` the ts-family arms thread (#2953).
  *
- * The Vue adapter is `resolveTsTarget` with `language: TypeScript` and nothing
- * else, so with a null config its arm would be a byte-for-byte re-run of the
- * TypeScript one over a differently-spelled corpus. The alias branch
- * (`standard.ts:57-70`) is the one leg of the shared resolver that neither the
- * `javascript` arm (which pins `tsconfigPaths: null`) nor the `typescript` arm
- * here reaches, so wiring it is what makes this a third measurement rather than
- * a third copy — and every local Vue import below is spelled `@/…`.
+ * These three used to run with `tsconfigPaths: null` for javascript and
+ * typescript and an alias map for vue, because the leg being measured was
+ * `suffixResolve` — a repo-wide search for a path ending in the specifier,
+ * which needs no configuration to answer and answered even when nothing
+ * declared the import. #2953 deleted that leg for the ts family: a specifier
+ * now resolves only against a declared tsconfig mapping or a package manifest.
+ *
+ * With no config, therefore, all three arms resolve NOTHING — every import is
+ * correctly external — and the bench measures an empty branch while reporting a
+ * perfect scaling ratio. A bench that measures nothing passes exactly like one
+ * that measures something, so each arm is given the config its corpus is
+ * spelled for, and the two configs cover the two legs the new resolver has:
+ *
+ *  - `TS_BASE_URL` — `baseUrl` at the repo root, so `src/mod3/file7` resolves
+ *    the way a `baseUrl` project's absolute import does. Used by javascript and
+ *    typescript.
+ *  - `vueTsconfig` — a `paths` PATTERN, which is a different branch:
+ *    longest-prefix selection and `*` substitution, then a candidate probe per
+ *    target. Every local Vue import below is spelled `@/…`, so the vue arm
+ *    stays a third measurement rather than a third copy — the same role it had
+ *    before, now against the branch that replaced the alias rewrite.
+ *
+ * Not covered here: the workspace-manifest leg
+ * (`node-workspace-packages.ts`), which is a `Map.get` on a package name and
+ * does not scale with the file set.
  */
-const VUE_TSCONFIG = { tsconfigPaths: { aliases: new Map([['@/', 'src/']]), baseUrl: '.' } };
+const tsBaseUrlConfig = (baseUrl) => ({
+  tsconfigs: { scopes: [{ dir: '', baseUrl, paths: [] }] },
+  nodeWorkspacePackages: null,
+});
+const vueTsconfig = (baseUrl) => ({
+  tsconfigs: {
+    scopes: [
+      { dir: '', baseUrl, paths: [{ pattern: '@/*', targets: [joinBase(baseUrl, 'src/*')] }] },
+    ],
+  },
+  nodeWorkspacePackages: null,
+});
+const joinBase = (baseUrl, rest) => (baseUrl === '' ? rest : `${baseUrl}/${rest}`);
+/**
+ * The `deep` arm prepends a UNIFORM `d0/…/d15/` prefix to every path
+ * (`buildFiles`), and the import spellings do not change. Under the old suffix
+ * matcher that was the point: the resolver walked path components, so depth was
+ * the cost. Declared resolution never walks — the config names an exact base —
+ * so the prefix has to reach the config or the whole arm resolves nothing and
+ * measures the miss path at depth instead of the hit path at depth.
+ */
+const tsBaseUrlFor = (pad) =>
+  pad === 0 ? '' : Array.from({ length: pad }, (_, n) => `d${n}`).join('/');
 /** Keyed by LAYOUT name, so there is no `csharp_csproj` row: `buildFiles`
  *  aliases that arm to `csharp` before this table is read. */
 const EXTENSION = {
@@ -726,12 +806,33 @@ function unwiredLanguage(where, lang) {
  * UNIQUE-LEAF layout: one directory name per index, so no two directories share
  * a last segment and no two files share a basename. Every index bucket holds
  * exactly one entry. A nested same-name directory in one repo slice is the
- * shape whose handling the first-`indexOf` tie-break decides (see
- * package-dir-index.ts), and the shape Kotlin's `dirChildren` resolves the same
- * way.
+ * shape the first-`indexOf` tie-break used to reject (see package-dir-index.ts);
+ * #2881 removed that tie-break from every resolver that had it, so the go,
+ * csharp, java and kotlin arms all resolve their `d % 7` slice now.
+ *
+ * A repeat the query cannot ask about leaves the arm blind, which is why go's
+ * slice repeats the WHOLE package path: a Go import addresses `src/pkg{d}`, and
+ * `…/internal/pkg{d}` does not end with that, so the old rule was never even
+ * reached and every go arm sat still through the fix. Java, C# and Kotlin query
+ * the whole dotted path FIRST and only fall back to the tail through
+ * progressive stripping, so their slices — which repeat the last segment only —
+ * move through that fallback rather than the primary query. The consequence is
+ * measured and worth knowing: a partial revert that reinstates first-occurrence
+ * only for multi-segment package paths is caught on the go arm alone.
  */
 function uniqueDir(lang, d, i) {
-  if (lang === 'go') return d % 7 === 0 ? `src/pkg${d}/internal/pkg${d}` : `src/pkg${d}`;
+  // Go's nested slice repeats the WHOLE queried path (`src/pkg{d}`), not just
+  // its last segment. `src/pkg{d}/internal/pkg{d}` repeated only `pkg{d}`, so
+  // the query `src/pkg{d}` failed on "the directory ends with the package path"
+  // and never reached the first-occurrence rule at all — Go's arms did not move
+  // when #2881 removed that rule, which would have shipped a widened bucket
+  // with no bench coverage while C# and Java were re-baselined for it.
+  if (lang === 'go') return d % 7 === 0 ? `src/pkg${d}/internal/src/pkg${d}` : `src/pkg${d}`;
+  // Leaf-only repeat, deliberately: this layout is shared with the
+  // `csharp_csproj` arm, whose configs mint `dirPrefix` against `src/Ns{d}`, so
+  // deepening it to the full `App/Ns{d}` query path resolves that arm to ZERO
+  // and breaks its same-workload invariant. C# therefore exercises the removed
+  // rule through progressive stripping rather than through its primary query.
   if (lang === 'csharp') return d % 7 === 0 ? `src/Ns${d}/Sub/Ns${d}` : `src/Ns${d}`;
   if (lang === 'dart') return d % 3 === 0 ? `lib/feature${d}` : `pkg/feature${d}`;
   if (lang === 'kotlin') {
@@ -782,14 +883,52 @@ function uniqueDir(lang, d, i) {
  */
 function collideDir(lang, d, i) {
   if (lang === 'go') {
-    if (d % 7 === 0) return `svc${d}/internal/sub/internal`;
+    // `…/sub/internal` repeats only the last segment, which the ends-with test
+    // answers on its own; `…/internal/sub/svc{d}/internal` is the shape the
+    // removed first-occurrence rule used to reject (see `uniqueDir`).
+    if (d % 7 === 0) return `svc${d}/internal/sub/svc${d}/internal`;
     return d % 5 === 1 ? `svc${d}/internal/shared` : `svc${d}/internal`;
   }
+  // Leaf-only repeat here too, and unlike the kotlin arm below that is not a
+  // blind spot — measured, base against head over this exact corpus. C#'s match
+  // test is an unanchored ends-with and its cascade strips leading segments, so
+  // `App.Src{d}.Models` reaches `Models` after two strips and finds
+  // `Src{d}/Models/Inner/Models`, whose FIRST `/Models/` is not its last: the
+  // removed first-occurrence rule rejected it and the current one takes it. The
+  // `csharp` collide fingerprint therefore moves across #2881 (03c9afe33276
+  // head, 89d0a054b617 base) with the resolved count unchanged at 1153 — the
+  // arm sees the change, it just sees it as different ANSWERS rather than more
+  // of them. Deepening the slice to `Src{d}/Models/Inner/Src{d}/Models` only
+  // moves which strip level finds it; both layouts move base -> head, so it
+  // buys nothing here.
+  //
+  // And it costs, because the `csharp_csproj` constraint binds this arm too —
+  // differently from the way it binds `uniqueDir`. There, deepening resolves
+  // that arm to ZERO. Here it resolves MORE: `Lib` has `projectDir: ''`, so its
+  // `dirPrefix` is `Src{d}/Models`, which is not a segment suffix of
+  // `…/Inner/Models` and is one of `…/Inner/Src{d}/Models`. Measured, the
+  // csproj arm's collide `resolved` goes 979 -> 1153 against its `small` 979,
+  // which is the same-workload invariant `--check` asserts. (Worth recording
+  // while it is measured: with the shipped layout BOTH csproj arms are blind to
+  // #2881 — unique and collide fingerprints identical base and head — because
+  // `getFilesInDir` is keyed on segment-aligned directory SUFFIXES and neither
+  // nested slice is one. Closing that is the deepening plus a mirrored miss for
+  // the csproj arm's `d % 7` slice, i.e. a corpus redesign and four
+  // re-baselines, not this edit.)
   if (lang === 'csharp') return d % 7 === 0 ? `Src${d}/Models/Inner/Models` : `Src${d}/Models`;
   if (lang === 'dart') return `pkg${d}/lib/src`;
   if (lang === 'kotlin') {
     return d % 7 === 0
-      ? `mod${d}/src/main/kotlin/com/example/models/inner/models`
+      ? // Repeats the WHOLE queried path (`com.example.models`), not just the
+        // `models` leaf. With a leaf-only repeat this arm was structurally
+        // blind to the #2881 rule: a full revert of the Kotlin guards left both
+        // collide fingerprints unmoved, because `com/example/models` is not a
+        // suffix of `…/models/inner/models` and the query never reached the
+        // rule. Deepening it is the only corpus edit in this file that buys
+        // coverage — the same deepening applied to the java and kotlin UNIQUE
+        // arms was measured and reverted, because progressive stripping lands
+        // those queries on the same file either way.
+        `mod${d}/src/main/kotlin/com/example/models/inner/com/example/models`
       : `mod${d}/src/main/kotlin/com/example/models`;
   }
   if (lang === 'php') return `svc${d}/src/Models`;
@@ -1203,11 +1342,13 @@ function collideTarget(lang, { local, r, d, j, dirs }) {
   }
   if (lang === 'csharp') {
     return local
-      ? // `Vendor` has no directory anywhere, mirroring the unique arm's
-        // nested-same-name slice, which also resolves to nothing.
-        d % 7 === 0
-        ? `App.Src${d}.Vendor`
-        : `App.Src${d}.Models`
+      ? // This used to send the `d % 7` slice to `App.Src{d}.Vendor`, a
+        // namespace with no directory anywhere, to mirror the unique arm's
+        // nested-same-name slice, which also resolved to nothing. #2881 made
+        // that slice resolve, so the mirror has to as well — otherwise this arm
+        // stops resolving as many imports as `small`, which is the invariant
+        // that makes the two timings comparable and is asserted below.
+        `App.Src${d}.Models`
       : (r >>> 3) % 2 === 0
         ? ['System', 'System.Threading.Tasks', 'System.Collections.Generic'][(r >>> 4) % 3]
         : `Ghost${(r >>> 4) % 97}.Deep.Missing`;
@@ -1246,13 +1387,18 @@ function collideTarget(lang, { local, r, d, j, dirs }) {
           `package:ext${(r >>> 4) % 97}/other/mod${(r >>> 4) % 8}.dart`;
   }
   if (lang === 'kotlin') {
-    // Same wildcard share as the unique arm; `vendor${d}` is the collide
-    // layout's spelling of a package that exists nowhere.
+    // Same wildcard share as the unique arm. This used to send the `d % 7`
+    // nested slice to `com.example.vendor${d}`, a package that exists nowhere,
+    // to mirror the unique arm's nested slice — which missed, because
+    // `dirChildren` required the parent to be the FIRST occurrence of its own
+    // name and `…/com/example/pkg${d}/inner/pkg${d}` therefore did not belong to
+    // `pkg${d}`. #2881 removed that rule, so the unique arm's nested wildcards
+    // resolve and the mirror has to as well, or this arm stops resolving as
+    // many imports as `small` — which is the invariant that makes the two
+    // timings comparable, and it is asserted below.
     return local
       ? (r >>> 3) % 3 === 0
-        ? d % 7 === 0
-          ? `com.example.vendor${d}.*`
-          : `com.example.models.*`
+        ? `com.example.models.*`
         : `com.example.models.File${j}`
       : (r >>> 3) % 2 === 0
         ? ['java.util.List', 'kotlin.collections.Map', 'kotlinx.coroutines.flow.Flow'][
@@ -1282,13 +1428,13 @@ function collideTarget(lang, { local, r, d, j, dirs }) {
     // every directory now ends in, so `firstFileDirectlyInPkgDir` walks the
     // whole `model` bucket twice — at the direct match and again after the
     // first strip — before the third strip finds `model` on its own. That walk
-    // is the non-constant term this arm exists to measure. `vendor` buckets to
-    // nothing, mirroring the unique arm's nested slice, which also misses.
+    // is the non-constant term this arm exists to measure. The `d % 7` slice
+    // used to import `com.svc{d}.vendor`, which buckets to nothing, mirroring
+    // the unique arm's nested slice — which missed until #2881 and resolves
+    // now, so the mirror follows it or the same-workload invariant below breaks.
     return local
       ? (r >>> 3) % 3 === 0
-        ? d % 7 === 0
-          ? `com.svc${d}.vendor.*`
-          : `com.svc${d}.model.*`
+        ? `com.svc${d}.model.*`
         : `com.example.model.File${j}`
       : (r >>> 3) % 2 === 0
         ? ['java.util.List', 'java.io.IOException', 'java.util.concurrent.ConcurrentHashMap'][
@@ -1461,14 +1607,22 @@ function buildRepo(lang, fileCount, pad = 0, shape = 'unique') {
  * `perFileSet` memos keyed on this ARRAY's identity, so reusing one array would
  * hide their build from rep 2 onward and `fastest()` reports the minimum.
  */
-function newPass(lang, files) {
+function newPass(lang, files, pad = 0) {
   if (HEADER_EXTENSION[lang] !== undefined) {
     const sources = [];
     const headers = [];
     for (const f of files) (f.endsWith(HEADER_EXTENSION[lang]) ? headers : sources).push(f);
     return { allFilePaths: new Set(sources), config: new Set(headers) };
   }
-  if (lang === 'vue') return { allFilePaths: new Set(files), config: VUE_TSCONFIG };
+  if (lang === 'vue') {
+    return { allFilePaths: new Set(files), config: vueTsconfig(tsBaseUrlFor(pad)) };
+  }
+  // javascript and typescript resolve their `src/mod{d}/file{j}` locals through
+  // `baseUrl`; without a config every arm would correctly resolve nothing and
+  // measure an empty branch (#2953 — see `tsBaseUrlConfig`).
+  if (lang === 'javascript' || lang === 'typescript') {
+    return { allFilePaths: new Set(files), config: tsBaseUrlConfig(tsBaseUrlFor(pad)) };
+  }
   if (CONTEXT_LANGS.includes(lang)) {
     const parsedFiles = buildParsedFiles(lang, files);
     return {
@@ -1493,8 +1647,8 @@ const contextFor = (pass, parsedImport) =>
 
 /** The timed loop. One `newPass` per pass, so every pass pays exactly one index
  *  build — see `newPass`. */
-function resolveAll(lang, files, imports) {
-  const pass = newPass(lang, files);
+function resolveAll(lang, files, imports, pad = 0) {
+  const pass = newPass(lang, files, pad);
   let sink = 0;
   for (const [from, target] of imports) {
     const hit = resolveOne(lang, from, target, pass);
@@ -1585,7 +1739,9 @@ function resolveOne(lang, from, target, pass) {
       { fromFile: from, allFilePaths, parsedFiles: pass.parsedFiles },
     );
   }
-  if (lang === 'javascript') return jsResolveImportTarget(target, from, allFilePaths);
+  if (lang === 'javascript') {
+    return jsResolveImportTarget(target, from, allFilePaths, pass.config);
+  }
   if (lang === 'vue') return vueResolveImportTarget(target, from, allFilePaths, pass.config);
   // TypeScript, C and C++ go through the registered `ScopeResolver` hook rather
   // than an inner resolver, because for all three the thing under test lives IN
@@ -1594,7 +1750,7 @@ function resolveOne(lang, from, target, pass) {
   // is private to theirs. Calling past it would benchmark a copy of the adapter
   // instead of the adapter.
   if (lang === 'typescript') {
-    return typescriptScopeResolver.resolveImportTarget(target, from, allFilePaths, undefined);
+    return typescriptScopeResolver.resolveImportTarget(target, from, allFilePaths, pass.config);
   }
   if (lang === 'c') {
     return cScopeResolver.resolveImportTarget(target, from, allFilePaths, pass.config);
@@ -1628,8 +1784,8 @@ function resolveOne(lang, from, target, pass) {
  *  Deliberately NOT shared with `resolveAll`, which is the TIMED loop: the memo
  *  that makes this pass cheap is exactly what would hide the cost that loop
  *  exists to measure. */
-function identityPass(lang, files, imports) {
-  const pass = newPass(lang, files);
+function identityPass(lang, files, imports, pad = 0) {
+  const pass = newPass(lang, files, pad);
   const outcomes = new Set();
   const wasNullByKey = new Map();
   let resolved = 0;
@@ -1667,12 +1823,12 @@ function fastest(values) {
   return Math.min(...values);
 }
 
-function timeResolution(lang, files, imports, reps) {
-  for (let w = 0; w < WARMUP; w++) resolveAll(lang, files, imports);
+function timeResolution(lang, files, imports, reps, pad = 0) {
+  for (let w = 0; w < WARMUP; w++) resolveAll(lang, files, imports, pad);
   const samples = [];
   for (let r = 0; r < reps; r++) {
     const t0 = performance.now();
-    resolveAll(lang, files, imports);
+    resolveAll(lang, files, imports, pad);
     samples.push(performance.now() - t0);
   }
   return fastest(samples);
@@ -1694,10 +1850,10 @@ function timeResolution(lang, files, imports, reps) {
  * reads several times high, which would push the expensive languages to
  * `REPS_MIN` for the wrong reason.
  */
-function probeMs(lang, files, imports) {
-  for (let w = 0; w < WARMUP; w++) resolveAll(lang, files, imports);
+function probeMs(lang, files, imports, pad = 0) {
+  for (let w = 0; w < WARMUP; w++) resolveAll(lang, files, imports, pad);
   const t0 = performance.now();
-  resolveAll(lang, files, imports);
+  resolveAll(lang, files, imports, pad);
   return performance.now() - t0;
 }
 
@@ -1733,8 +1889,8 @@ function probeMs(lang, files, imports) {
  * Set, which is part of what they hold; for every language it includes the one
  * or two resolve-cache entries the probe leaves behind.
  */
-function retainedPassBytes(lang, files, probeTarget) {
-  const pass = newPass(lang, files);
+function retainedPassBytes(lang, files, probeTarget, pad = 0) {
+  const pass = newPass(lang, files, pad);
   // See `HEAP_RETAINED`: nothing built for this language is released until the
   // next one starts, so no deferred collection can land between the two samples
   // below and cancel part of the delta.
@@ -1820,8 +1976,9 @@ const HEAP_PROBE_TARGET = {
   javascript: 'vendor0/lib/missing',
   python: 'vendor0.deep.missing',
   c: 'vendor0/missing.h',
-  // The nine below are the BOUNDED tier — see `HEAP_BOUNDED`. Same rule as the
-  // eight above: a spelling `uniqueTarget` already mints for that language, and
+  // The entries below cover the BOUNDED tier — see `HEAP_BOUNDED`, which
+  // derives to cobol, swift and rust; the rest were promoted. Same rule as the
+  // budgeted ones above: a spelling `uniqueTarget` already mints for that language, and
   // one that MISSES, so the reading is the index and the cascade runs to the
   // end. Chosen from the miss family that reaches furthest into each cascade:
   //   - `go` takes the GOPATH fallback, one `filesDirectlyInPkgDir` per path
@@ -2088,8 +2245,8 @@ for (const lang of LANGS) {
   let reps = null;
   for (const [name, fileCount, pad, shape] of ARMS) {
     const { files, imports } = buildRepo(lang, fileCount, pad, shape);
-    const { outcomes, resolved } = identityPass(lang, files, imports);
-    if (reps === null) reps = repsFor(probeMs(lang, files, imports));
+    const { outcomes, resolved } = identityPass(lang, files, imports, pad);
+    if (reps === null) reps = repsFor(probeMs(lang, files, imports, pad));
     scales[name] = {
       files: files.length,
       imports: imports.length,
@@ -2097,7 +2254,7 @@ for (const lang of LANGS) {
       // resolved share would still produce a "valid" fingerprint over far less.
       resolved,
       distinct_outcomes: outcomes.size,
-      ms: Number(timeResolution(lang, files, imports, reps).toFixed(3)),
+      ms: Number(timeResolution(lang, files, imports, reps, pad).toFixed(3)),
       fingerprint: fingerprint(outcomes),
     };
   }
@@ -2578,9 +2735,12 @@ for (const lang of HEAP_BUDGETED) {
  * TIER TWO, the bounded arms: ONE comparison, and what it is a comparison FOR.
  *
  * `heap_bound_bytes` is the "exclusion still holds" bound. It does not claim
- * these nine indexes are small enough, which is what a ceiling claims about a
+ * these indexes are small enough, which is what a ceiling claims about a
  * budgeted one; it claims each is still the SIZE the decision to leave it out
- * was taken on. The re-entry condition the MEMORY section states — "if any of
+ * was taken on. `HEAP_BOUNDED` derives to THREE today — cobol, swift, rust.
+ * The prose below still counts nine because six were promoted to tier one
+ * after it was written; read the counts as history, and `HEAP_BOUNDED` itself
+ * as the answer. The re-entry condition the MEMORY section states — "if any of
  * the four ever diverges in what it ASKS, it earns an arm the same way" — is a
  * claim about growth, and this is the only thing in the file that can see it.
  *
@@ -2588,13 +2748,12 @@ for (const lang of HEAP_BUDGETED) {
  * because it builds nothing, so any floor at all would be a floor on noise and
  * `1.5 x 0 B` is 0 — its bound is ABSOLUTE (1 MiB) for the same reason: a
  * multiplier on 16 B fails on the first byte of anything. The other eight are
- * stable enough today to floor (0.24% peak-to-peak at worst over five runs) and
- * two of them — kotlin at 45.85 MiB and dart at 7.47 — are larger than budgeted
- * arms, so a floor there would be worth having. That is a promotion to tier one,
- * with a ceiling and a recorded reading, and it is not this change: a floor
- * without them would assert "still measuring" against a number nothing else
- * bounds. What this tier is NOT is a weaker version of tier one — it is the
- * different question, asked of every language instead of eight.
+ * stable enough today to floor (0.24% peak-to-peak at worst over five runs).
+ * The two this paragraph named as floor candidates, kotlin and dart, TOOK that
+ * promotion: both now carry a ceiling and a recorded reading in tier one, which
+ * is what the paragraph said the promotion had to be. What this tier is NOT is a
+ * weaker version of tier one — it is a different question, asked of the
+ * languages tier one does not ask it of.
  */
 const heapBoundScope =
   `That leaves the arm bounded by nothing, which is the state all nine of these were in before ` +
