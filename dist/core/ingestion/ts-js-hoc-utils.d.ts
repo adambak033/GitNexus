@@ -1,0 +1,12 @@
+import type { SyntaxNode } from './utils/ast-helpers.js';
+export declare const ARRAY_METHOD_HOC_BLOCKLIST: readonly ["map", "filter", "reduce", "forEach", "find", "findIndex", "some", "every", "flatMap", "sort", "splice", "slice", "concat", "fill", "copyWithin", "join", "flat", "at", "entries", "keys", "values", "indexOf", "lastIndexOf", "includes", "pop", "push", "shift", "unshift", "reverse", "reduceRight", "toSorted", "toReversed", "toSpliced", "with"];
+export declare const ARRAY_METHOD_HOC_BLOCKLIST_SET: ReadonlySet<string>;
+export declare const DEFAULT_EXPORT_IDENTIFIER_BLOCKLIST: readonly ["setTimeout", "setInterval", "queueMicrotask", "requestAnimationFrame", "requestIdleCallback"];
+export declare const DEFAULT_EXPORT_IDENTIFIER_BLOCKLIST_SET: ReadonlySet<string>;
+export declare const ARRAY_CALLBACK_METHODS: ReadonlySet<string>;
+export declare function buildNotAnyOfPredicate(captureName: string, values: readonly string[]): string;
+export declare const ARRAY_METHOD_NOT_ANY_OF_PREDICATE: string;
+export declare const DEFAULT_EXPORT_IDENTIFIER_NOT_ANY_OF_PREDICATE: string;
+export declare function deriveDefaultExportHocName(filePath: string): string;
+export declare function isDefaultExportHocFunctionNode(node: SyntaxNode): boolean;
+export declare function isBlockedDefaultExportHoc(node: SyntaxNode): boolean;

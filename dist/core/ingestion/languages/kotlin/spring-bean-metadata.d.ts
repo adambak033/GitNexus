@@ -1,0 +1,2 @@
+/** Kotlin wiring for the language-neutral Spring candidate engine. */
+export declare const attachKotlinSpringBeanCandidateMetadata: (graph: import("../../../graph/types.js").KnowledgeGraph, parsedFiles: readonly import('../../../../_shared/index.js').ParsedFile[], nodeLookup: import("../../scope-resolution/graph-bridge/node-lookup.js").GraphNodeLookup, indexes: import("../../model/scope-resolution-indexes.js").ScopeResolutionIndexes) => void;

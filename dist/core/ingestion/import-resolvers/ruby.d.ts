@@ -1,0 +1,14 @@
+/**
+ * Ruby require/require_relative import resolution — internal helpers.
+ *
+ * Strategy lives in configs/ruby.ts.
+ * This file only contains the low-level helper used by the strategy.
+ */
+import type { SuffixIndex } from './utils.js';
+/**
+ * Resolve a Ruby require/require_relative path to a matching .rb file (low-level helper).
+ *
+ * require_relative paths are pre-normalized to './' prefix by the caller.
+ * require paths use suffix matching (gem-style paths like 'json', 'net/http').
+ */
+export declare function resolveRubyImportInternal(importPath: string, normalizedFileList: readonly string[], allFileList: readonly string[], index?: SuffixIndex): string | null;

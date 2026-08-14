@@ -1,0 +1,39 @@
+/**
+ * Dev-mode runtime validator for the post-finalize binding-channel
+ * lifecycle (Contract Invariant I8 in `contract/scope-resolver.ts`).
+ *
+ * The two channels:
+ *   - `indexes.bindings` — finalize-output channel. After
+ *     `finalizeScopeModel` returns, every inner `BindingRef[]` array
+ *     here is deep-frozen by `materializeBindings`. NO post-finalize
+ *     hook should ever mutate this map's inner arrays — drift here
+ *     manifests at runtime as the `Cannot add property N, object is
+ *     not extensible` crash (issue #1066) or, more insidiously, as
+ *     a hook silently mutating one of the frozen arrays (a no-op in
+ *     production where freezes can be elided, a `TypeError` in dev).
+ *
+ *   - `indexes.bindingAugmentations` — post-finalize append-only
+ *     channel. Inner arrays here are NEVER frozen; hooks like
+ *     `populateNamespaceSiblings` `push()` directly. Walkers consult
+ *     both channels via `lookupBindingsAt`.
+ *
+ * This validator runs after every post-finalize hook has executed
+ * (so the dev-mode envelope captures the FULL surface area visible
+ * to `resolveReferenceSites`) and asserts:
+ *
+ *   1. Every inner `BindingRef[]` array in `indexes.bindings` is
+ *      `Object.isFrozen` — i.e. finalize produced a frozen bucket
+ *      AND no hook accidentally `set()`-back a mutable replacement.
+ *
+ *   2. Every inner `BindingRef[]` array in
+ *      `indexes.bindingAugmentations` is NOT frozen — i.e. the
+ *      hook used the augmentation channel as designed (mutable
+ *      `push()`) and didn't accidentally freeze its own scratch
+ *      arrays. Self-documenting; mostly a sanity net.
+ *
+ * Mirrors `validateOwnershipParity` (#909): warns via `onWarn`,
+ * never throws, and is opt-in outside development. Gated by
+ * `isSemanticModelValidatorEnabled()` (`utils/env.ts`).
+ */
+import type { ScopeResolutionIndexes } from '../../model/scope-resolution-indexes.js';
+export declare function validateBindingsImmutability(indexes: ScopeResolutionIndexes, onWarn: (message: string) => void): number;

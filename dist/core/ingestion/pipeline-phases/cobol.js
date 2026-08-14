@@ -1,0 +1,46 @@
+/**
+ * Phase: cobol
+ *
+ * Processes COBOL and JCL files via regex extraction (no tree-sitter).
+ *
+ * @deps    structure
+ * @reads   scannedFiles, allPaths (from structure phase)
+ * @writes  graph (COBOL program/paragraph/section nodes, JCL job/step nodes)
+ */
+import { getPhaseOutput } from './types.js';
+import { processCobol, isCobolFile, isJclFile } from '../cobol-processor.js';
+import { readFileContents } from '../filesystem-walker.js';
+import { isDev } from '../utils/env.js';
+import { logger } from '../../logger.js';
+export const cobolPhase = {
+    name: 'cobol',
+    deps: ['structure'],
+    async execute(ctx, deps) {
+        const { scannedFiles, allPathSet } = getPhaseOutput(deps, 'structure');
+        const cobolScanned = scannedFiles.filter((f) => isCobolFile(f.path) || isJclFile(f.path));
+        if (cobolScanned.length === 0) {
+            return { programs: 0, paragraphs: 0, sections: 0 };
+        }
+        const cobolContents = await readFileContents(ctx.repoPath, cobolScanned.map((f) => f.path));
+        const cobolFiles = cobolScanned
+            .filter((f) => cobolContents.has(f.path))
+            .map((f) => ({ path: f.path, content: cobolContents.get(f.path) }));
+        const cobolResult = processCobol(ctx.graph, cobolFiles, allPathSet);
+        if (isDev) {
+            logger.info(`  COBOL: ${cobolResult.programs} programs, ${cobolResult.paragraphs} paragraphs, ${cobolResult.sections} sections from ${cobolFiles.length} files`);
+            if (cobolResult.execSqlBlocks > 0 ||
+                cobolResult.execCicsBlocks > 0 ||
+                cobolResult.entryPoints > 0) {
+                logger.info(`  COBOL enriched: ${cobolResult.execSqlBlocks} SQL blocks, ${cobolResult.execCicsBlocks} CICS blocks, ${cobolResult.entryPoints} entry points, ${cobolResult.moves} moves, ${cobolResult.fileDeclarations} file declarations`);
+            }
+            if (cobolResult.jclJobs > 0) {
+                logger.info(`  JCL: ${cobolResult.jclJobs} jobs, ${cobolResult.jclSteps} steps`);
+            }
+        }
+        return {
+            programs: cobolResult.programs,
+            paragraphs: cobolResult.paragraphs,
+            sections: cobolResult.sections,
+        };
+    },
+};

@@ -1,0 +1,292 @@
+/**
+ * Augmentation Engine
+ *
+ * Lightweight, fast-path enrichment of search patterns with knowledge graph context.
+ * Designed to be called from platform hooks (Claude Code PreToolUse, Cursor postToolUse)
+ * when an agent runs grep/glob/read/search.
+ *
+ * Performance target: <500ms cold start, <200ms warm.
+ *
+ * Design decisions:
+ * - Uses only BM25 search (no semantic/embedding) for speed
+ * - Clusters used internally for ranking, NEVER in output
+ * - Output is pure relationships: callers, callees, process participation
+ * - Graceful failure: any error → return empty string
+ */
+import path from 'path';
+import { listRegisteredRepos } from '../../storage/repo-manager.js';
+import { escapeCypherString } from '../lbug/cypher-escape.js';
+/**
+ * Find the best matching repo for a given working directory.
+ * Matches by checking if cwd is within the repo's path.
+ */
+async function findRepoForCwd(cwd) {
+    try {
+        const entries = await listRegisteredRepos({ validate: true });
+        const resolved = path.resolve(cwd);
+        // Normalize to lowercase on Windows (drive letters can differ: D: vs d:)
+        const isWindows = process.platform === 'win32';
+        const normalizedCwd = isWindows ? resolved.toLowerCase() : resolved;
+        const sep = path.sep;
+        // Find the LONGEST matching repo path (most specific match wins)
+        let bestMatch = null;
+        let bestLen = 0;
+        for (const entry of entries) {
+            const repoResolved = path.resolve(entry.path);
+            const normalizedRepo = isWindows ? repoResolved.toLowerCase() : repoResolved;
+            // Check if cwd is inside repo OR repo is inside cwd
+            // Must match at a path separator boundary to avoid false positives
+            // (e.g. /projects/gitnexusv2 should NOT match /projects/gitnexus)
+            let matched = false;
+            if (normalizedCwd === normalizedRepo) {
+                matched = true;
+            }
+            else {
+                const repoPrefix = normalizedRepo.endsWith(sep) ? normalizedRepo : normalizedRepo + sep;
+                const cwdPrefix = normalizedCwd.endsWith(sep) ? normalizedCwd : normalizedCwd + sep;
+                if (normalizedCwd.startsWith(repoPrefix)) {
+                    matched = true;
+                }
+                else if (normalizedRepo.startsWith(cwdPrefix)) {
+                    matched = true;
+                }
+            }
+            if (matched && normalizedRepo.length > bestLen) {
+                bestMatch = entry;
+                bestLen = normalizedRepo.length;
+            }
+        }
+        if (!bestMatch)
+            return null;
+        return {
+            name: bestMatch.name,
+            storagePath: bestMatch.storagePath,
+            lbugPath: path.join(bestMatch.storagePath, 'lbug'),
+        };
+    }
+    catch {
+        return null;
+    }
+}
+/**
+ * Augment a search pattern with knowledge graph context.
+ *
+ * 1. BM25 search for the pattern
+ * 2. For top matches, fetch callers/callees/processes
+ * 3. Rank by internal cluster cohesion (not exposed)
+ * 4. Format as structured text block
+ *
+ * Returns empty string on any error (graceful failure).
+ */
+export async function augment(pattern, cwd) {
+    if (!pattern || pattern.length < 3)
+        return '';
+    const patternFirstWord = escapeCypherString(pattern.trim()).split(/\s+/)[0];
+    if (!patternFirstWord || patternFirstWord.length < 2)
+        return '';
+    const workDir = cwd || process.cwd();
+    try {
+        const repo = await findRepoForCwd(workDir);
+        if (!repo)
+            return '';
+        // Lazy-load lbug adapter (skip unnecessary init)
+        const { initLbug, executeQuery, isLbugReady } = await import('../lbug/pool-adapter.js');
+        const { searchFTSFromLbug } = await import('../search/bm25-index.js');
+        const repoId = repo.name.toLowerCase();
+        // Init LadybugDB if not already
+        if (!isLbugReady(repoId)) {
+            await initLbug(repoId, repo.lbugPath);
+        }
+        // Step 1: BM25 search (fast, no embeddings)
+        const { results: bm25Results, ftsAvailable } = await searchFTSFromLbug(pattern, 10, repoId);
+        // Step 2: Map BM25 file results to symbols
+        const symbolMatches = [];
+        for (const result of bm25Results.slice(0, 5)) {
+            const escaped = escapeCypherString(result.filePath);
+            try {
+                const symbols = await executeQuery(repoId, `
+          MATCH (n) WHERE n.filePath = '${escaped}'
+          AND n.name CONTAINS '${patternFirstWord}'
+          RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath
+          ORDER BY id
+          LIMIT 3
+        `);
+                for (const sym of symbols) {
+                    symbolMatches.push({
+                        nodeId: sym.id || sym[0],
+                        name: sym.name || sym[1],
+                        type: sym.type || sym[2],
+                        filePath: sym.filePath || sym[3],
+                        score: result.score,
+                    });
+                }
+            }
+            catch {
+                /* skip */
+            }
+        }
+        // When FTS indexes are unavailable (read-only DB, first run before indexes are built),
+        // fall back to a direct name CONTAINS query so enrichment still works.
+        if (symbolMatches.length === 0 && !ftsAvailable) {
+            const fallbackRows = await executeQuery(repoId, `
+        MATCH (n)
+        WHERE n.name CONTAINS '${patternFirstWord}'
+        RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath
+        ORDER BY id
+        LIMIT 5
+      `).catch(() => []);
+            for (const sym of fallbackRows) {
+                symbolMatches.push({
+                    nodeId: sym.id || sym[0],
+                    name: sym.name || sym[1],
+                    type: sym.type || sym[2],
+                    filePath: sym.filePath || sym[3],
+                    score: 1.0,
+                });
+            }
+        }
+        if (symbolMatches.length === 0)
+            return '';
+        // Step 3: Batch-fetch callers/callees/processes/cohesion for top matches
+        // Uses batched WHERE n.id IN [...] queries instead of per-symbol queries
+        const uniqueSymbols = symbolMatches
+            .slice(0, 5)
+            .filter((sym, i, arr) => arr.findIndex((s) => s.nodeId === sym.nodeId) === i);
+        if (uniqueSymbols.length === 0)
+            return '';
+        const idList = uniqueSymbols.map((s) => `'${escapeCypherString(s.nodeId)}'`).join(', ');
+        // Callers/callees are windowed PER SYMBOL, not out of one shared budget.
+        // A single `n.id IN [...] ... ORDER BY targetId LIMIT 15` sorts by the very
+        // column the rows are grouped by, which turns the cap into a single-bucket
+        // prefix: the alphabetically-first target takes every row (the hottest
+        // symbol in this repo's own index has 2163 callers) and the other four
+        // render with no callers at all. Raising the cap does not bound that, and
+        // ordering caller-major only moves the bucket. A per-target window is not
+        // expressible in one statement either — LadybugDB does not preserve a
+        // per-branch ORDER BY through UNION ALL — so fan out one bounded query per
+        // symbol (#2787).
+        //
+        // `id STARTS WITH 'File:'` sorts container nodes last: node ids are
+        // `Label:path:name`, so a bare `ORDER BY id` puts `File:` ahead of
+        // `Function:`/`Method:` and the "Called by" line renders bare filenames
+        // instead of the calling symbols the hint exists to name.
+        const NEIGHBOUR_CAP = 3;
+        const neighbourNames = async (nodeId, incoming) => {
+            const edge = incoming
+                ? `(other)-[:CodeRelation {type: 'CALLS'}]->(n)`
+                : `(n)-[:CodeRelation {type: 'CALLS'}]->(other)`;
+            const rows = await executeQuery(repoId, `
+        MATCH ${edge}
+        WHERE n.id = '${escapeCypherString(nodeId)}'
+        RETURN other.name AS name
+        ORDER BY other.id STARTS WITH 'File:', other.id
+        LIMIT ${NEIGHBOUR_CAP}
+      `).catch(() => []);
+            const names = [];
+            for (const r of rows) {
+                const name = r.name || r[0];
+                if (name)
+                    names.push(name);
+            }
+            return names;
+        };
+        // Keyed by nodeId, like the process/cohesion enrichments below — positional
+        // arrays would put two lookup disciplines in one object literal and make
+        // "stays index-aligned with uniqueSymbols" an unenforced invariant.
+        const neighbourMap = async (incoming) => new Map(await Promise.all(uniqueSymbols.map(async (s) => [s.nodeId, await neighbourNames(s.nodeId, incoming)])));
+        // Batch fetch processes
+        const fetchProcesses = async () => {
+            const byNode = new Map();
+            try {
+                const rows = await executeQuery(repoId, `
+        MATCH (n)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
+        WHERE n.id IN [${idList}]
+        RETURN n.id AS nodeId, p.heuristicLabel AS label, r.step AS step, p.stepCount AS stepCount
+      `);
+                for (const r of rows) {
+                    const nid = r.nodeId || r[0];
+                    const label = r.label || r[1];
+                    const step = r.step || r[2];
+                    const stepCount = r.stepCount || r[3];
+                    if (nid && label) {
+                        if (!byNode.has(nid))
+                            byNode.set(nid, []);
+                        byNode.get(nid).push(`${label} (step ${step}/${stepCount})`);
+                    }
+                }
+            }
+            catch {
+                /* skip */
+            }
+            return byNode;
+        };
+        // Batch fetch cohesion
+        const fetchCohesion = async () => {
+            const byNode = new Map();
+            try {
+                const rows = await executeQuery(repoId, `
+        MATCH (n)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
+        WHERE n.id IN [${idList}]
+        RETURN n.id AS nodeId, c.cohesion AS cohesion
+      `);
+                for (const r of rows) {
+                    const nid = r.nodeId || r[0];
+                    const coh = r.cohesion ?? r[1] ?? 0;
+                    if (nid)
+                        byNode.set(nid, coh);
+                }
+            }
+            catch {
+                /* skip */
+            }
+            return byNode;
+        };
+        // One wave, not three. `augment` runs from the Claude Code PreToolUse hook
+        // in a cold process against a <500ms budget, so nothing amortizes — and the
+        // process/cohesion queries depend only on `idList`, never on the neighbour
+        // results, so serializing them behind the fan-out bought nothing. Each query
+        // keeps its own try/catch, so one failing still degrades to an empty map
+        // instead of taking the others down.
+        const [callerMap, calleeMap, processesMap, cohesionMap] = await Promise.all([
+            neighbourMap(true),
+            neighbourMap(false),
+            fetchProcesses(),
+            fetchCohesion(),
+        ]);
+        // Assemble enriched results
+        const enriched = [];
+        for (const sym of uniqueSymbols) {
+            enriched.push({
+                name: sym.name,
+                filePath: sym.filePath,
+                callers: callerMap.get(sym.nodeId) || [],
+                callees: calleeMap.get(sym.nodeId) || [],
+                processes: processesMap.get(sym.nodeId) || [],
+                cohesion: cohesionMap.get(sym.nodeId) || 0,
+            });
+        }
+        if (enriched.length === 0)
+            return '';
+        // Step 4: Rank by cohesion (internal signal) and format
+        enriched.sort((a, b) => b.cohesion - a.cohesion);
+        const lines = [`[GitNexus] ${enriched.length} related symbols found:`, ''];
+        for (const item of enriched) {
+            lines.push(`${item.name} (${item.filePath})`);
+            if (item.callers.length > 0) {
+                lines.push(`  Called by: ${item.callers.join(', ')}`);
+            }
+            if (item.callees.length > 0) {
+                lines.push(`  Calls: ${item.callees.join(', ')}`);
+            }
+            if (item.processes.length > 0) {
+                lines.push(`  Flows: ${item.processes.join(', ')}`);
+            }
+            lines.push('');
+        }
+        return lines.join('\n').trim();
+    }
+    catch {
+        // Graceful failure — never break the original tool
+        return '';
+    }
+}

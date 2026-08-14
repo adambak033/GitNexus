@@ -1,0 +1,2473 @@
+import { parentPort, threadId, workerData } from 'node:worker_threads';
+import { boundCallableStartRow, localIdentity, nestedCallableQualifiedName, } from './callable-id.js';
+import Parser from 'tree-sitter';
+import JavaScript from 'tree-sitter-javascript';
+import TypeScript from 'tree-sitter-typescript';
+import Python from 'tree-sitter-python';
+import Java from 'tree-sitter-java';
+import CPP from 'tree-sitter-cpp';
+// Explicit subpath import — see parser-loader.ts for rationale (#1013).
+import CSharp from 'tree-sitter-c-sharp/bindings/node/index.js';
+import Go from 'tree-sitter-go';
+import Rust from 'tree-sitter-rust';
+import PHP from 'tree-sitter-php';
+import Ruby from 'tree-sitter-ruby';
+import { requireVendoredGrammar } from '../../tree-sitter/vendored-grammars.js';
+import { SupportedLanguages } from '../../../_shared/index.js';
+import { getProvider } from '../languages/index.js';
+import { getTreeSitterBufferSize, getTreeSitterContentByteLength, TREE_SITTER_MAX_BUFFER, } from '../constants.js';
+import { ARRAY_METHOD_HOC_BLOCKLIST_SET, DEFAULT_EXPORT_IDENTIFIER_BLOCKLIST_SET, deriveDefaultExportHocName, } from '../ts-js-hoc-utils.js';
+import { parseSourceSafe } from '../../tree-sitter/safe-parse.js';
+import { postResultCloneSafe } from './post-result.js';
+import { mergeResult } from './result-merge.js';
+// ── Worker grammar loading — enforcement boundary (#2091/#2093, #2101) ───────
+// The worker maintains its own grammar table (the guarded vendored-grammar
+// loads below + `languageMap`) and intentionally does NOT consult the runtime
+// `GITNEXUS_SKIP_OPTIONAL_GRAMMARS` opt-out. It does not need to: the MAIN
+// THREAD's `parseableScanned` filter (pipeline-phases/parse-impl.ts, gated on
+// `parser-loader.isLanguageAvailable`, which honors the runtime opt-out and a
+// genuinely-absent binding alike) excludes files of an unavailable/opted-out
+// language BEFORE any chunk is dispatched, so the worker never receives them.
+// That main-thread filter is the single enforcement point. Any future change
+// that dispatches files to the worker WITHOUT first passing them through
+// `isLanguageAvailable` must re-introduce the gate here. (The cleaner end-state
+// — routing this table through `parser-loader.getLanguageGrammar` so there is
+// one loader — is the deferred Tier-1 consolidation.)
+// Swift/Dart/Kotlin/C are vendored grammars loaded from `vendor/` by absolute
+// path (NEVER copied into node_modules — see vendored-grammars.ts / #2111). Each
+// may be absent on a platform without a prebuild or a toolchain-less /
+// `--ignore-scripts` install, so every load is guarded so a missing binding
+// cannot crash the worker at module-load (#2091/#2093, #2116).
+let Swift = null;
+try {
+    Swift = requireVendoredGrammar('tree-sitter-swift');
+}
+catch { }
+let Dart = null;
+try {
+    Dart = requireVendoredGrammar('tree-sitter-dart');
+}
+catch { }
+let Kotlin = null;
+try {
+    Kotlin = requireVendoredGrammar('tree-sitter-kotlin');
+}
+catch { }
+let C = null;
+try {
+    C = requireVendoredGrammar('tree-sitter-c');
+}
+catch { }
+import { getLanguageFromFilename } from '../../../_shared/index.js';
+import { buildDefinitionPreScan, FUNCTION_NODE_TYPES, findAncestorBeforeBoundary, findSplitBodyCallableAncestor, SPLIT_SIGNATURE_NODE_TYPES, getDefinitionNodeFromCaptures, findEnclosingClassInfo, findObjectLiteralBindingInfo, findReturnShapeOwnerInfo, isReturnShapeProperty, findMemberAssignmentOwnerInfo, isCjsDefaultExportAssignment, getLabelFromCaptures, genericFuncName, inferFunctionLabel, isSuppressedConcreteTypedefDuplicate, isValueDefinitionLabel, isQualifiableScopeLabel, MEMBER_OWNER_NODE_TYPES, qualifyByEnclosingModScope, qualifyRustImplTargetByModScope, CLASS_CONTAINER_TYPES, PARAMETER_LIST_NODE_TYPES, LOCAL_SCOPE_BODY_NODE_TYPES, } from '../utils/ast-helpers.js';
+import { isPositionQualifiedLocalLabel } from '../utils/callable-labels.js';
+import { extractCallArgTypes } from '../utils/call-analysis.js';
+import { buildTypeEnv } from '../type-env.js';
+import { detectFrameworkFromAST } from '../framework-detection.js';
+import { generateId } from '../../../lib/utils.js';
+import { defaultExportNameCollides } from '../languages/typescript/cjs-export-assignment.js';
+import { extractVueScript, extractTemplateComponents, isVueSetupTopLevel, } from '../vue-sfc-extractor.js';
+import { buildMethodProps, arityForIdFromInfo, typeTagForId, constTagForId, buildCollisionGroups, parameterShapeIdTag, methodInfoKey, } from '../utils/method-props.js';
+import { extractTemplateArguments, templateArgumentsIdTag, templateConstraintsIdTag, } from '../utils/template-arguments.js';
+import { extractParsedFile } from '../scope-extractor-bridge.js';
+import { persistParsedFileShardSync, persistDurableParsedFileShardSync, } from '../../../storage/parsedfile-store.js';
+import { extractLaravelRoutes } from '../route-extractors/laravel.js';
+import { extractTrpcRoutes } from '../route-extractors/trpc.js';
+import { collectFunctionCfgs, DEFAULT_PDG_MAX_FUNCTION_LINES, } from '../cfg/collect.js';
+import { logger } from '../../logger.js';
+// ── ParsedFile store (#1983 parallel serialization) ─────────────────────────
+// Read ONCE at worker init from `workerData` (immutable for the run, inherited
+// by respawned workers via the pool's factory closure). When set, this worker
+// writes its own ParsedFile shards to disk at each job flush instead of
+// returning them over the MessageChannel — parallelizing serialization off the
+// main thread. `undefined` ⇒ return ParsedFiles in the result (no-store
+// fallback). `shardSeq` makes each shard name unique within this worker; global
+// uniqueness for the run rests on the process-monotonic `threadId` (never reused
+// across respawns) plus the per-run store clear on the main thread.
+const PARSED_FILE_STORE_STORAGE_PATH = workerData?.parsedFileStoreStoragePath;
+// Durable, content-addressed ParsedFile store dir (#2038 warm-cache coverage).
+// When set AND the flush carries a chunk hash, the worker ALSO writes its
+// ParsedFiles to `<durableDir>/<chunkHash>/` so a future warm parse-cache hit
+// restores them without re-parsing. `undefined` ⇒ no durable write.
+const DURABLE_PARSED_FILE_STORAGE_PATH = workerData?.durableParsedFileStoragePath;
+let shardSeq = 0;
+// ── PDG/CFG opt-in (#2081 M1) ───────────────────────────────────────────────
+// Read ONCE at worker init from `workerData` (the worker never sees
+// PipelineOptions — config arrives via the pool factory's `workerData`, see
+// KTD7 / U5). When `pdg` is set, the worker builds a per-function control-flow
+// graph from the tree-sitter AST (where it lives) and serializes it onto
+// `ParsedFile.cfgSideChannel`. Off ⇒ no CFG work and no field — the default for
+// every run today. `pdgMaxFunctionLines` bounds per-function CFG cost
+// (0/undefined ⇒ no cap; see collectFunctionCfgs).
+const PDG_ENABLED = workerData?.pdg === true;
+const PDG_MAX_FUNCTION_LINES = workerData?.pdgMaxFunctionLines ??
+    DEFAULT_PDG_MAX_FUNCTION_LINES;
+// ── Bootstrap-stage diagnostics (#1741) ────────────────────────────────────
+// When GITNEXUS_WORKER_BOOTSTRAP=1 (or --verbose sets GITNEXUS_VERBOSE), each
+// worker reports its startup stage timings to stderr — which the pool tees
+// and captures (worker-pool.ts captureWorkerStderr). This makes a slow or
+// crashing startup diagnosable: you can see whether a worker reached
+// "grammars loaded", "ready sent", or never emitted a line at all (=> it
+// crashed in a native binding load before this code ran). The pool then
+// attaches whatever stderr it captured to its readiness-failure message,
+// so the operator sees the real cause instead of "did not report ready".
+const BOOTSTRAP_LOG = process.env.GITNEXUS_WORKER_BOOTSTRAP === '1' || process.env.GITNEXUS_VERBOSE === '1';
+const bootstrapStart = performance.now();
+const bootstrapLog = (stage) => {
+    if (!BOOTSTRAP_LOG)
+        return;
+    const ms = Math.round(performance.now() - bootstrapStart);
+    process.stderr.write(`[parse-worker bootstrap] thread=${threadId} ${stage} (+${ms}ms)\n`);
+};
+// First line we can emit: every static import above (tree-sitter native
+// bindings, language grammars, helper modules) has already resolved by the
+// time this module-body statement runs.
+bootstrapLog('imports + grammars loaded');
+// ============================================================================
+// Worker-local parser + language map
+// ============================================================================
+const parser = new Parser();
+const languageMap = {
+    [SupportedLanguages.JavaScript]: JavaScript,
+    [SupportedLanguages.TypeScript]: TypeScript.typescript,
+    [`${SupportedLanguages.TypeScript}:tsx`]: TypeScript.tsx,
+    [SupportedLanguages.Python]: Python,
+    [SupportedLanguages.Java]: Java,
+    ...(C ? { [SupportedLanguages.C]: C } : {}),
+    [SupportedLanguages.CPlusPlus]: CPP,
+    [SupportedLanguages.CSharp]: CSharp,
+    [SupportedLanguages.Go]: Go,
+    [SupportedLanguages.Rust]: Rust,
+    ...(Kotlin ? { [SupportedLanguages.Kotlin]: Kotlin } : {}),
+    [SupportedLanguages.PHP]: PHP.php_only,
+    [SupportedLanguages.Ruby]: Ruby,
+    [SupportedLanguages.Vue]: TypeScript.typescript,
+    ...(Dart ? { [SupportedLanguages.Dart]: Dart } : {}),
+    ...(Swift ? { [SupportedLanguages.Swift]: Swift } : {}),
+};
+/**
+ * Check if a language grammar is available in this worker.
+ * Duplicated from parser-loader.ts because workers can't import from the main thread.
+ * Extra filePath parameter needed to distinguish .tsx from .ts (different grammars
+ * under the same SupportedLanguages.TypeScript key).
+ */
+const isLanguageAvailable = (language, filePath) => {
+    const key = language === SupportedLanguages.TypeScript && filePath.endsWith('.tsx')
+        ? `${language}:tsx`
+        : language;
+    return key in languageMap && languageMap[key] != null;
+};
+const setLanguage = (language, filePath) => {
+    const key = language === SupportedLanguages.TypeScript && filePath.endsWith('.tsx')
+        ? `${language}:tsx`
+        : language;
+    const lang = languageMap[key];
+    if (!lang)
+        throw new Error(`Unsupported language: ${language}`);
+    parser.setLanguage(lang);
+};
+// ============================================================================
+// Per-file O(1) memoization — avoids repeated parent-chain walks per symbol.
+// Three bare Maps cleared at file boundaries. Map.get() returns undefined for
+// missing keys, so `cached !== undefined` distinguishes "not computed" from
+// a stored null (enclosing class/function not found = top-level).
+// ============================================================================
+const classIdCache = new Map();
+const functionIdCache = new Map();
+const exportCache = new Map();
+const clearCaches = () => {
+    classIdCache.clear();
+    functionIdCache.clear();
+    exportCache.clear();
+    fieldInfoCache.clear();
+    methodInfoCache.clear();
+};
+// ============================================================================
+// FieldExtractor cache — extract field metadata once per class, reuse for each property.
+// Keyed by class node startIndex (unique per AST node within a file).
+// ============================================================================
+const fieldInfoCache = new Map();
+/**
+ * Walk up from a definition node to find the nearest enclosing class/struct/interface
+ * AST node. Returns the SyntaxNode itself (not an ID) for passing to FieldExtractor.
+ */
+function findEnclosingClassNode(node) {
+    let current = node.parent;
+    while (current) {
+        if (CLASS_CONTAINER_TYPES.has(current.type)) {
+            // Return singleton_class directly so the method extractor sees it as
+            // the owner node and correctly marks methods as static. Name resolution
+            // for qualified names is handled separately by findEnclosingClassInfo.
+            return current;
+        }
+        current = current.parent;
+    }
+    return null;
+}
+/**
+ * For C++ out-of-class method definitions (e.g. `void Foo::bar() {}`), extract the
+ * class name from the qualified_identifier scope and find the class declaration in the
+ * file's AST. Returns the class SyntaxNode or null if not found.
+ *
+ * Handles pointer/reference return types where function_declarator is nested inside
+ * pointer_declarator or reference_declarator.
+ */
+function findClassNodeByQualifiedName(node) {
+    const declarator = node.childForFieldName('declarator');
+    if (!declarator)
+        return null;
+    // Find the function_declarator, recursively unwrapping pointer_declarator /
+    // reference_declarator chains (e.g. int** Foo::bar() has
+    // pointer_declarator → pointer_declarator → function_declarator).
+    let funcDecl = null;
+    if (declarator.type === 'function_declarator') {
+        funcDecl = declarator;
+    }
+    else {
+        let current = declarator;
+        while (current && !funcDecl) {
+            for (let i = 0; i < current.namedChildCount; i++) {
+                const child = current.namedChild(i);
+                if (child?.type === 'function_declarator') {
+                    funcDecl = child;
+                    break;
+                }
+            }
+            if (!funcDecl) {
+                const next = current.namedChildren.find((c) => c.type === 'pointer_declarator' || c.type === 'reference_declarator');
+                current = next ?? null;
+            }
+        }
+    }
+    if (!funcDecl)
+        return null;
+    // Check if the inner declarator is a qualified_identifier (Foo::bar)
+    const innerDecl = funcDecl.childForFieldName('declarator');
+    if (!innerDecl || innerDecl.type !== 'qualified_identifier')
+        return null;
+    const scope = innerDecl.childForFieldName('scope');
+    if (!scope)
+        return null;
+    const className = scope.text;
+    // Search the file for a matching class/struct specifier, including inside
+    // namespace_definition blocks (the majority of production C++ uses namespaces).
+    const root = node.tree.rootNode;
+    const classTypes = new Set(['class_specifier', 'struct_specifier']);
+    const searchIn = (parent) => {
+        for (let i = 0; i < parent.namedChildCount; i++) {
+            const child = parent.namedChild(i);
+            if (!child)
+                continue;
+            if (classTypes.has(child.type)) {
+                const nameNode = child.childForFieldName('name');
+                if (nameNode?.text === className)
+                    return child;
+            }
+            // Recurse into namespace blocks
+            if (child.type === 'namespace_definition') {
+                const found = searchIn(child);
+                if (found)
+                    return found;
+            }
+        }
+        return null;
+    };
+    return searchIn(root);
+}
+/**
+ * Minimal no-op SymbolTable stub for FieldExtractorContext in the worker.
+ * Field extraction only uses symbolTable.lookupExactAll for optional type
+ * resolution — returning [] causes the extractor to use the raw type
+ * string, which is fine for us. Every other method is a no-op so the
+ * stub remains safe if a future FieldExtractor consults it through the
+ * full {@link SymbolTableReader} surface.
+ */
+const NOOP_SYMBOL_TABLE = {
+    lookupExact: () => undefined,
+    lookupExactFull: () => undefined,
+    lookupExactAll: () => [],
+    lookupCallableByName: () => [],
+    getFiles: () => [][Symbol.iterator](),
+    getStats: () => ({ fileCount: 0 }),
+};
+/**
+ * Get (or extract and cache) field info for a class node.
+ * Returns a name→FieldInfo map, or undefined if the provider has no field extractor
+ * or the class yielded no fields.
+ */
+function getFieldInfo(classNode, provider, context) {
+    if (!provider.fieldExtractor)
+        return undefined;
+    const cacheKey = classNode.startIndex;
+    let cached = fieldInfoCache.get(cacheKey);
+    if (cached)
+        return cached;
+    const result = provider.fieldExtractor.extract(classNode, context);
+    if (!result?.fields?.length)
+        return undefined;
+    cached = new Map();
+    for (const field of result.fields) {
+        cached.set(field.name, field);
+    }
+    fieldInfoCache.set(cacheKey, cached);
+    return cached;
+}
+// ============================================================================
+// MethodExtractor cache — extract method metadata once per class, reuse for each method.
+// Keyed by class node startIndex (unique per AST node within a file).
+// ============================================================================
+const methodInfoCache = new Map();
+/**
+ * Get (or extract and cache) method info for a class node.
+ * Returns a "name:line:column" → MethodInfo map, or undefined if the provider has no method
+ * extractor or the class yielded no methods.
+ * Keyed by name:line:column (not name, and not name:line) to support overloaded methods in
+ * Java/Kotlin AND to keep a callable SYNTHESIZED at another node's position from evicting the
+ * source-written one that starts on the same line (#2936). Every lookup site MUST pass the
+ * column of the SAME node it takes the line from — see `methodInfoKey`.
+ */
+function getMethodInfo(classNode, provider, context) {
+    if (!provider.methodExtractor)
+        return undefined;
+    const cacheKey = classNode.startIndex;
+    let cached = methodInfoCache.get(cacheKey);
+    if (cached)
+        return cached;
+    const result = provider.methodExtractor.extract(classNode, context);
+    if (!result?.methods?.length)
+        return undefined;
+    cached = new Map();
+    for (const method of result.methods) {
+        cached.set(methodInfoKey(method.name, method.line, method.column), method);
+    }
+    methodInfoCache.set(cacheKey, cached);
+    return cached;
+}
+// ============================================================================
+// Enclosing function detection (for call extraction) — cached
+// ============================================================================
+/**
+ * Qualified-name prefix naming the enclosing CALLABLE chain of `node`, or
+ * `undefined` when nothing callable encloses it (#2699).
+ *
+ * Graph node ids are file-scoped, so before this a function-local callable and
+ * a file-level one with the same name collapsed onto a single node: a
+ * top-level `save()` and `run() { const save = … }` both keyed
+ * `Function:<file>:save`, and `run`'s call to its OWN local was attributed to
+ * the top-level function — a wrong edge, not a missing one, so `impact` on
+ * `save` reported a caller that never calls it. Qualifying the local as
+ * `run.save` separates them, mirroring how class members already qualify as
+ * `Class.member` (and SCIP's document-scoped `local <id>` keyspace).
+ *
+ * **This pair is the lockstep guarantee.** The definition phase and the
+ * caller-attribution phase (`findEnclosingFunctionId`) each build ids
+ * independently, and an id they compute differently is not a test failure —
+ * it is a caller silently attaching to a node that does not exist, and the
+ * edge vanishing. Both phases therefore derive the nesting prefix from THIS
+ * function and nothing else. Keep it that way: any per-phase variation here
+ * fails silently.
+ *
+ * Only a callable that is genuinely nested inside another callable gains a
+ * prefix. Top-level functions and ordinary class methods hit the `null` branch
+ * and keep their existing ids byte-for-byte, which is what bounds the id churn
+ * this change forces.
+ *
+ * `localIdentity` completes it, and both it and the shared
+ * `nestedCallableQualifiedName` rule now live in `./callable-id.ts`: this
+ * module posts a `ready` message to `parentPort` at import, so a unit test
+ * cannot value-import it, and a rule three phases must agree on has to be
+ * testable rather than merely commented (#2714).
+ */
+/**
+ * Boundary for the enclosing-callable walk (#2699).
+ *
+ * `CLASS_CONTAINER_TYPES` lists class DECLARATIONS only. A class can also own
+ * members without any declaration node — Java anonymous classes
+ * (`object_creation_expression > class_body`), enum-constant bodies, and
+ * interface/annotation bodies — and those owners must still stop the walk, or a
+ * member of one gets re-keyed as a function-local of the surrounding method.
+ *
+ * (The dead `NO_QUALIFIED_NAME` sentinel that used to sit below this — which also
+ * contained a literal NUL byte — was removed; the cache is two-state: absent =
+ * not yet computed, any string = computed.)
+ */
+const CALLABLE_PREFIX_BOUNDARY_TYPES = new Set([
+    ...CLASS_CONTAINER_TYPES,
+    // Class bodies (Java, JS/TS, Kotlin) — the owner when the declaration is
+    // anonymous or the grammar nests members under a body node.
+    'class_body',
+    'interface_body',
+    'annotation_type_body',
+    'enum_body',
+    'enum_body_declarations',
+    'enum_constant',
+    // Anonymous-class construction sites.
+    'object_creation_expression', // Java: new Runnable() { ... }
+    'object_literal', // Kotlin: object : Runnable { ... }
+    'anonymous_object_creation_expression', // C#
+]);
+const enclosingCallablePrefix = (node, filePath, provider) => {
+    // Boundary on class-likes: a method's owner is its CLASS, not whatever
+    // function that class happens to sit inside. `CLASS_CONTAINER_TYPES` alone is
+    // NOT enough for that — it lists only DECLARATION nodes, and an anonymous or
+    // body-form class has none. A Java anonymous class is
+    // `object_creation_expression > class_body > method_declaration` with no
+    // `class_declaration` anywhere, so the walk sailed straight through it to the
+    // enclosing method and re-keyed `Worker$1.run` as `Worker.makeHandler.run@7:12`,
+    // destroying the javac-compatible JLS identity of #2550/#2555/#2562 (4 existing
+    // Java tests). Adding the body/anonymous forms restores the boundary.
+    //
+    // Over-inclusion here is the SAFE direction: an extra boundary only suppresses
+    // the nesting prefix, which falls back to the pre-#2699 class qualification.
+    const fnNode = findAncestorBeforeBoundary(node, LOCAL_SCOPE_BODY_NODE_TYPES, CALLABLE_PREFIX_BOUNDARY_TYPES) ??
+        // Signature/body-split grammars: the enclosing callable is a SIBLING of the
+        // body, not an ancestor, so the walk above returns null for every local
+        // inside it. Dart is the case in hand (`function_signature` +
+        // `function_body` as siblings) — without this a Dart closure gets no
+        // prefix, so two same-named closures in one file collapse onto ONE node and
+        // the graph asserts a CALLS edge that does not exist in the source (#2699).
+        //
+        // SPLIT_SIGNATURE_NODE_TYPES, NOT FUNCTION_NODE_TYPES: only a callable that
+        // cannot hold its own body can be an enclosing callable of a SIBLING. Using
+        // the wider set mis-qualified a file-level PHP `$handler = function …` as
+        // `target.$handler` by grabbing the preceding `function target() {…}`.
+        findSplitBodyCallableAncestor(node, SPLIT_SIGNATURE_NODE_TYPES, CALLABLE_PREFIX_BOUNDARY_TYPES);
+    if (fnNode === null)
+        return undefined;
+    return callableOwnQualifiedName(fnNode, filePath, provider);
+};
+/**
+ * A callable node's own qualified name, including its enclosing-callable chain.
+ * Mutually recursive with `enclosingCallablePrefix`; recursion depth is source
+ * nesting depth and every level is memoized, so a file costs O(callables).
+ *
+ * An ANONYMOUS callable still gets a name — its own source position
+ * (`fn@12:9`). ECMAScript creates an environment record for EVERY function
+ * whether or not it has a name, so the `save` in
+ * `outer() { (function () { const save = … })() }` is a genuinely distinct
+ * binding from a file-level `save`. Name-only qualification cannot express
+ * that; position can. It is unique by construction (two functions cannot start
+ * at the same offset) and deterministic across reparses of the same source.
+ * Same reasoning as clang's USR for a function-local (`name@offset`) and
+ * Kythe's C++ indexer: a local is not addressable from outside its document,
+ * so its identity only has to be unique within it, and source position is the
+ * cheapest thing that is. NOT SCIP — SCIP's `local <id>` is a per-document
+ * counter and the spec is explicit that locals do not encode the name, so it
+ * is prior art for the document-scoped keyspace but not for this key shape.
+ */
+const callableOwnQualifiedName = (fnNode, filePath, provider) => {
+    const cached = callableQualifiedNameCache.get(fnNode);
+    if (cached !== undefined)
+        return cached;
+    const efnResult = provider.methodExtractor?.extractFunctionName?.(fnNode, filePath);
+    // An anonymous callable has no name of its own, so it IS its position: the
+    // `ownName === null` branch below carries the position INSTEAD of a name,
+    // never in addition to one, so the two spellings cannot stack.
+    const ownName = efnResult?.funcName ?? genericFuncName(fnNode) ?? null;
+    const prefix = enclosingCallablePrefix(fnNode, filePath, provider);
+    const classInfo = prefix === undefined
+        ? cachedFindEnclosingClassInfo(fnNode, filePath, provider.resolveEnclosingOwner)
+        : null;
+    const owner = prefix ?? classInfo?.className;
+    const result = prefix !== undefined
+        ? nestedCallableQualifiedName(prefix, fnNode, ownName ?? 'fn')
+        : ownName === null
+            ? localIdentity(fnNode, 'fn')
+            : owner
+                ? `${owner}.${ownName}`
+                : ownName;
+    callableQualifiedNameCache.set(fnNode, result);
+    return result;
+};
+/** Sentinel distinguishing "computed, anonymous" from "not yet computed". */
+const callableQualifiedNameCache = new WeakMap();
+/** Walk up AST to find enclosing function, return its generateId or null for top-level.
+ *  Applies provider.labelOverride so the label matches the definition phase (single source of truth). */
+const findEnclosingFunctionId = (node, filePath, provider) => {
+    const cached = functionIdCache.get(node);
+    if (cached !== undefined)
+        return cached;
+    let current = node.parent;
+    while (current) {
+        if (FUNCTION_NODE_TYPES.has(current.type)) {
+            const efnResult = provider.methodExtractor?.extractFunctionName?.(current, filePath);
+            const funcName = efnResult?.funcName ?? genericFuncName(current);
+            const label = efnResult?.label ?? inferFunctionLabel(current.type);
+            if (funcName) {
+                // Apply labelOverride so label matches definition phase (e.g., Kotlin Function→Method).
+                // null means "skip as definition" — keep original label for scope identification.
+                let finalLabel = label;
+                if (provider.labelOverride) {
+                    const override = provider.labelOverride(current, label);
+                    if (override !== null)
+                        finalLabel = override;
+                }
+                // Qualify with enclosing class to match definition-phase node IDs
+                const classInfo = cachedFindEnclosingClassInfo(current, filePath, provider.resolveEnclosingOwner);
+                const encLang = getLanguageFromFilename(filePath);
+                const standaloneMethodInfo = (finalLabel === 'Method' || finalLabel === 'Constructor') &&
+                    encLang === SupportedLanguages.Go &&
+                    provider.methodExtractor?.extractFromNode
+                    ? provider.methodExtractor.extractFromNode(current, {
+                        filePath,
+                        language: encLang,
+                    })
+                    : null;
+                // A nested callable is qualified by its enclosing callable (#2699) and
+                // wins over the class/receiver owner: a closure inside a method belongs
+                // to the METHOD, not directly to the class, and a Go receiver method can
+                // never itself be nested inside another callable.
+                const nestedPrefix = enclosingCallablePrefix(current, filePath, provider);
+                const ownerName = nestedPrefix ?? classInfo?.className ?? standaloneMethodInfo?.receiverType ?? undefined;
+                // Lockstep with the other two id-building phases — see
+                // `nestedCallableQualifiedName`, which is the shared rule. When a
+                // nested prefix exists it IS `ownerName`, so this branch and the
+                // owner branch below cannot disagree about which prefix applies.
+                const qualifiedName = nestedPrefix !== undefined
+                    ? nestedCallableQualifiedName(nestedPrefix, current, funcName)
+                    : ownerName
+                        ? `${ownerName}.${funcName}`
+                        : funcName;
+                // Include #<arity> suffix to match definition-phase Method/Constructor IDs.
+                // Use the same MethodExtractor (getMethodInfo) as the definition phase.
+                // When same-arity collisions exist, also append ~type1,type2.
+                let arity;
+                let encTypeTag = '';
+                if (finalLabel === 'Method' || finalLabel === 'Constructor') {
+                    if (standaloneMethodInfo) {
+                        arity = standaloneMethodInfo.parameters.some((p) => p.isVariadic)
+                            ? undefined
+                            : standaloneMethodInfo.parameters.length;
+                    }
+                    else {
+                        const classNode = findEnclosingClassNode(current) ?? findClassNodeByQualifiedName(current);
+                        if (classNode && encLang) {
+                            const methodMap = getMethodInfo(classNode, provider, {
+                                filePath,
+                                language: encLang,
+                            });
+                            const defLine = current.startPosition.row + 1;
+                            const info = methodMap?.get(methodInfoKey(funcName, defLine, current.startPosition.column));
+                            if (info) {
+                                arity = info.parameters.some((p) => p.isVariadic)
+                                    ? undefined
+                                    : info.parameters.length;
+                                if (methodMap && arity !== undefined) {
+                                    const g = buildCollisionGroups(methodMap);
+                                    encTypeTag =
+                                        typeTagForId(methodMap, funcName, arity, info, encLang, g) +
+                                            constTagForId(methodMap, funcName, arity, info, g);
+                                }
+                            }
+                        }
+                    }
+                }
+                const arityTag = arity !== undefined ? `#${arity}${encTypeTag}` : '';
+                const result = generateId(finalLabel, `${filePath}:${qualifiedName}${arityTag}`);
+                functionIdCache.set(node, result);
+                return result;
+            }
+        }
+        // Language-specific enclosing function resolution (e.g., Dart where
+        // function_body is a sibling of function_signature, not a child).
+        if (provider.enclosingFunctionFinder) {
+            const customResult = provider.enclosingFunctionFinder(current);
+            if (customResult) {
+                let finalLabel = customResult.label;
+                if (provider.labelOverride) {
+                    const override = provider.labelOverride(current.previousSibling, finalLabel);
+                    if (override !== null)
+                        finalLabel = override;
+                }
+                // Qualify custom result with enclosing class
+                const classInfo = cachedFindEnclosingClassInfo(current.previousSibling ?? current, filePath, provider.resolveEnclosingOwner);
+                // Same nesting rule as the generic branch above (#2699). Anchored on
+                // `sigNode`-equivalent (`current.previousSibling ?? current`) so Dart,
+                // whose body is a SIBLING of the signature, walks from the same node
+                // the class lookup already uses.
+                const nestedPrefix2 = enclosingCallablePrefix(current.previousSibling ?? current, filePath, provider);
+                const customOwner = nestedPrefix2 ?? classInfo?.className;
+                const qualifiedName = customOwner
+                    ? `${customOwner}.${customResult.funcName}`
+                    : customResult.funcName;
+                // Include #<arity> suffix to match definition-phase Method/Constructor IDs.
+                // When same-arity collisions exist, also append ~type1,type2.
+                const sigNode = current.previousSibling ?? current;
+                let arity2;
+                let encTypeTag2 = '';
+                if (finalLabel === 'Method' || finalLabel === 'Constructor') {
+                    const encLang2 = getLanguageFromFilename(filePath);
+                    const classNode2 = findEnclosingClassNode(sigNode) ?? findClassNodeByQualifiedName(sigNode);
+                    if (classNode2 && encLang2) {
+                        const methodMap2 = getMethodInfo(classNode2, provider, {
+                            filePath,
+                            language: encLang2,
+                        });
+                        const defLine2 = sigNode.startPosition.row + 1;
+                        const info2 = methodMap2?.get(methodInfoKey(customResult.funcName, defLine2, sigNode.startPosition.column));
+                        if (info2) {
+                            arity2 = info2.parameters.some((p) => p.isVariadic)
+                                ? undefined
+                                : info2.parameters.length;
+                            if (methodMap2 && arity2 !== undefined) {
+                                const g2 = buildCollisionGroups(methodMap2);
+                                encTypeTag2 =
+                                    typeTagForId(methodMap2, customResult.funcName, arity2, info2, encLang2, g2) +
+                                        constTagForId(methodMap2, customResult.funcName, arity2, info2, g2);
+                            }
+                        }
+                    }
+                }
+                const arityTag2 = arity2 !== undefined ? `#${arity2}${encTypeTag2}` : '';
+                const result = generateId(finalLabel, `${filePath}:${qualifiedName}${arityTag2}`);
+                functionIdCache.set(node, result);
+                return result;
+            }
+        }
+        current = current.parent;
+    }
+    functionIdCache.set(node, null);
+    return null;
+};
+/** Cached wrapper for findEnclosingClassInfo — avoids repeated parent walks. */
+const cachedFindEnclosingClassInfo = (node, filePath, resolveEnclosingOwner, getQualifiedOwnerName) => {
+    const cached = classIdCache.get(node);
+    if (cached !== undefined)
+        return cached;
+    const result = findEnclosingClassInfo(node, filePath, resolveEnclosingOwner, getQualifiedOwnerName);
+    classIdCache.set(node, result);
+    return result;
+};
+/** Cached wrapper for export checking — avoids repeated parent walks per symbol. */
+const cachedExportCheck = (checker, node, name) => {
+    const cached = exportCache.get(node);
+    if (cached !== undefined)
+        return cached;
+    const result = checker(node, name);
+    exportCache.set(node, result);
+    return result;
+};
+// Label detection moved to shared getLabelFromCaptures in utils.ts
+// DEFINITION_CAPTURE_KEYS and getDefinitionNodeFromCaptures imported from ../utils.js
+// ============================================================================
+// Process a batch of files
+// ============================================================================
+const processBatch = (files, onProgress) => {
+    const result = {
+        nodes: [],
+        relationships: [],
+        symbols: [],
+        calls: [],
+        assignments: [],
+        routes: [],
+        fetchCalls: [],
+        fetchWrapperDefs: [],
+        decoratorRoutes: [],
+        routerIncludes: [],
+        routerImports: [],
+        routerConstructorPrefixes: [],
+        routerModuleAliases: [],
+        toolDefs: [],
+        ormQueries: [],
+        constructorBindings: [],
+        fileScopeBindings: [],
+        parsedFiles: [],
+        skippedLanguages: {},
+        cfgSkipped: {},
+        fileCount: 0,
+    };
+    // Group by language to minimize setLanguage calls
+    const byLanguage = new Map();
+    for (const file of files) {
+        const lang = getLanguageFromFilename(file.path);
+        if (!lang)
+            continue;
+        let list = byLanguage.get(lang);
+        if (!list) {
+            list = [];
+            byLanguage.set(lang, list);
+        }
+        list.push(file);
+    }
+    let totalProcessed = 0;
+    let lastReported = 0;
+    const PROGRESS_INTERVAL = Math.max(1, Math.min(100, Math.ceil(files.length / 10)));
+    const onFileProcessed = onProgress
+        ? () => {
+            totalProcessed++;
+            if (totalProcessed - lastReported >= PROGRESS_INTERVAL) {
+                lastReported = totalProcessed;
+                onProgress(totalProcessed);
+            }
+        }
+        : undefined;
+    for (const [language, langFiles] of byLanguage) {
+        const provider = getProvider(language);
+        const queryString = provider.treeSitterQueries;
+        if (!queryString) {
+            // Standalone providers (regex-based, no tree-sitter) that implement
+            // emitScopeCaptures resolve via the scope-resolution pipeline, which
+            // re-extracts from source on the main thread.
+            if (provider.emitScopeCaptures) {
+                // The worker no longer builds `ParsedFile`s for standalone providers
+                // either — scope-resolution re-extracts on the main thread, and for
+                // standalone COBOL the graph nodes come from cobolPhase, not this
+                // artifact (#1983). Count one unit of progress per file, as before.
+                for (let i = 0; i < langFiles.length; i++) {
+                    result.fileCount++;
+                    onFileProcessed?.();
+                }
+            }
+            continue;
+        }
+        const tsxFiles = [];
+        const regularFiles = [];
+        if (language === SupportedLanguages.TypeScript) {
+            for (const f of langFiles) {
+                if (f.path.endsWith('.tsx')) {
+                    tsxFiles.push(f);
+                }
+                else {
+                    regularFiles.push(f);
+                }
+            }
+        }
+        else {
+            // Manual loop (not spread) — `push(...arr)` blows the stack on very
+            // large arrays when langFiles has tens of thousands of entries.
+            for (const f of langFiles)
+                regularFiles.push(f);
+        }
+        // Process regular files for this language
+        if (regularFiles.length > 0) {
+            if (isLanguageAvailable(language, regularFiles[0].path)) {
+                try {
+                    setLanguage(language, regularFiles[0].path);
+                    processFileGroup(regularFiles, language, queryString, result, onFileProcessed);
+                }
+                catch (err) {
+                    // A throw here drops the whole language group — surface it to the pool
+                    // (#2264) instead of silently skipping. The old empty catch hid real
+                    // extractor/parser failures, not just an unavailable grammar.
+                    reportWarning(`Skipped ${regularFiles.length} ${language} file(s) after a processing error: ${err instanceof Error ? err.message : String(err)}`);
+                }
+            }
+            else {
+                result.skippedLanguages[language] =
+                    (result.skippedLanguages[language] || 0) + regularFiles.length;
+            }
+        }
+        // Process tsx files separately (different grammar)
+        if (tsxFiles.length > 0) {
+            if (isLanguageAvailable(language, tsxFiles[0].path)) {
+                try {
+                    setLanguage(language, tsxFiles[0].path);
+                    processFileGroup(tsxFiles, language, queryString, result, onFileProcessed);
+                }
+                catch (err) {
+                    // See above — surface a tsx-group processing failure rather than
+                    // silently dropping every file in it (#2264).
+                    reportWarning(`Skipped ${tsxFiles.length} ${language} (tsx) file(s) after a processing error: ${err instanceof Error ? err.message : String(err)}`);
+                }
+            }
+            else {
+                result.skippedLanguages[language] =
+                    (result.skippedLanguages[language] || 0) + tsxFiles.length;
+            }
+        }
+    }
+    if (onProgress && totalProcessed !== lastReported) {
+        onProgress(totalProcessed);
+    }
+    return result;
+};
+// Express/Hono method names that register routes
+const EXPRESS_ROUTE_METHODS = new Set([
+    'get',
+    'post',
+    'put',
+    'delete',
+    'patch',
+    'all',
+    'use',
+    'route',
+]);
+/**
+ * Walk a tree-sitter AST subtree looking for a call to the global `fetch()` function.
+ * Returns `true` if found within `maxDepth` levels of nesting — keeps the check
+ * lightweight so it doesn't slow down parse-worker on large function bodies.
+ */
+const checkForFetchCall = (node, depth = 0, maxDepth = 5) => {
+    if (depth > maxDepth)
+        return false;
+    if (node.type === 'call_expression') {
+        const fn = node.childForFieldName('function');
+        if (fn?.type === 'identifier' && fn.text === 'fetch')
+            return true;
+    }
+    for (let i = 0; i < node.childCount; i++) {
+        if (checkForFetchCall(node.child(i), depth + 1, maxDepth))
+            return true;
+    }
+    return false;
+};
+// HTTP client methods that are ONLY used by clients, not Express route registration.
+// Methods like get/post/put/delete/patch overlap with Express — those are captured by
+// the express_route handler as route definitions, not consumers. The fetch() global
+// function is captured separately by the route.fetch query.
+const HTTP_CLIENT_ONLY_METHODS = new Set(['head', 'options', 'request', 'ajax']);
+// Known HTTP client receivers u2014 skip these, they're API consumers not routes
+const HTTP_CLIENT_RECEIVERS = new Set([
+    'axios',
+    'request',
+    'fetch',
+    'http',
+    'https',
+    'got',
+    'ky',
+    'superagent',
+    'needle',
+    'undici',
+    'apiclient',
+    'client',
+    'httpclient',
+    'api',
+    '$http',
+    'session',
+    'httpservice',
+    'conn',
+]);
+// Decorator names that indicate HTTP route handlers (NestJS, Flask, FastAPI, Spring)
+const ROUTE_DECORATOR_NAMES = new Set([
+    'Get',
+    'Post',
+    'Put',
+    'Delete',
+    'Patch',
+    'Route',
+    'get',
+    'post',
+    'put',
+    'delete',
+    'patch',
+    'route',
+    'RequestMapping',
+    'GetMapping',
+    'PostMapping',
+    'PutMapping',
+    'DeleteMapping',
+    'PatchMapping',
+]);
+// ============================================================================
+// ORM Query Detection (Prisma + Supabase)
+// ============================================================================
+const PRISMA_QUERY_RE = /\bprisma\.(\w+)\.(findMany|findFirst|findUnique|findUniqueOrThrow|findFirstOrThrow|create|createMany|update|updateMany|delete|deleteMany|upsert|count|aggregate|groupBy)\s*\(/g;
+const SUPABASE_QUERY_RE = /\bsupabase\.from\s*\(\s*['"](\w+)['"]\s*\)\s*\.(select|insert|update|delete|upsert)\s*\(/g;
+/**
+ * Extract ORM query calls from file content via regex.
+ * Appends results to the provided array (avoids allocation when no matches).
+ */
+export function extractORMQueries(filePath, content, out) {
+    const hasPrisma = content.includes('prisma.');
+    const hasSupabase = content.includes('supabase.from');
+    if (!hasPrisma && !hasSupabase)
+        return;
+    if (hasPrisma) {
+        PRISMA_QUERY_RE.lastIndex = 0;
+        let m;
+        while ((m = PRISMA_QUERY_RE.exec(content)) !== null) {
+            const model = m[1];
+            if (model.startsWith('$'))
+                continue;
+            out.push({
+                filePath,
+                orm: 'prisma',
+                model,
+                method: m[2],
+                lineNumber: content.substring(0, m.index).split('\n').length - 1,
+            });
+        }
+    }
+    if (hasSupabase) {
+        SUPABASE_QUERY_RE.lastIndex = 0;
+        let m;
+        while ((m = SUPABASE_QUERY_RE.exec(content)) !== null) {
+            out.push({
+                filePath,
+                orm: 'supabase',
+                model: m[1],
+                method: m[2],
+                lineNumber: content.substring(0, m.index).split('\n').length - 1,
+            });
+        }
+    }
+}
+// ============================================================================
+// FastAPI router prefix detection (Python)
+// ============================================================================
+//
+// The extraction lives in `../route-extractors/fastapi-router-bindings`
+// (a pure-function module — NOT a worker, no `worker_threads`, no
+// `parentPort`). It's imported here only so the worker entry can call it
+// per file; this module does not re-export it. Downstream consumers
+// import the function and its types directly from `route-extractors/`.
+import { extractFastAPIRouterBindings } from '../route-extractors/fastapi-router-bindings.js';
+import { extractPythonModuleConstants, parseConstOperands, } from '../route-extractors/python-const-resolver.js';
+/**
+ * Report a non-fatal worker issue to the pool over IPC so a caught error is not
+ * invisible to the operator (#2264). The pool logs it on the main thread AND
+ * resets the worker idle timer (so a worker grinding through failing files isn't
+ * falsely idle-evicted). Falls back to the local logger when there's no parent —
+ * this code also runs on the main thread in tests / the non-worker path. Fatal,
+ * group-aborting errors go through the message handler's
+ * `{ type: 'error', errorStack }` channel instead.
+ */
+function reportWarning(message) {
+    if (parentPort) {
+        parentPort.postMessage({ type: 'warning', message });
+    }
+    else {
+        logger.warn(message);
+    }
+}
+const processFileGroup = (files, language, queryString, result, onFileProcessed) => {
+    let query;
+    try {
+        const lang = parser.getLanguage();
+        query = new Parser.Query(lang, queryString);
+    }
+    catch (err) {
+        reportWarning(`Query compilation failed for ${language}: ${err instanceof Error ? err.message : String(err)}`);
+        return;
+    }
+    for (const file of files) {
+        // Skip files larger than the max tree-sitter buffer (32 MB)
+        if (getTreeSitterContentByteLength(file.content) > TREE_SITTER_MAX_BUFFER)
+            continue;
+        // Authoritative in-flight signal for the pool: lets `WorkerPool` exclude
+        // exactly this file if the worker dies during parse/extract, instead of
+        // guessing from `items[lastProgress]` (which the language-grouped order
+        // here would defeat). The pool gracefully ignores this when running an
+        // older worker build that doesn't emit it.
+        if (parentPort) {
+            parentPort.postMessage({ type: 'starting-file', path: file.path });
+        }
+        // Vue SFC preprocessing: extract <script> block content
+        let parseContent = file.content;
+        let scopeSourceKind = 'full-file';
+        let lineOffset = 0;
+        let isVueSetup = false;
+        if (language === SupportedLanguages.Vue) {
+            const extracted = extractVueScript(file.content);
+            if (!extracted)
+                continue; // skip .vue files with no script block
+            parseContent = extracted.scriptContent;
+            scopeSourceKind = 'pre-extracted-script';
+            lineOffset = extracted.lineOffset;
+            isVueSetup = extracted.isSetup;
+        }
+        // Per-language source-text transform (e.g., UE macro stripping for C++).
+        // Length-preserving — see LanguageProvider.preprocessSource contract.
+        parseContent =
+            getProvider(language).preprocessSource?.(parseContent, file.path) ?? parseContent;
+        clearCaches(); // Reset memoization before each new file
+        let tree;
+        try {
+            tree = parseSourceSafe(parser, parseContent, undefined, {
+                bufferSize: getTreeSitterBufferSize(parseContent),
+            }, file.path);
+        }
+        catch (err) {
+            reportWarning(`Failed to parse file ${file.path}: ${err instanceof Error ? err.message : String(err)}`);
+            continue;
+        }
+        result.fileCount++;
+        onFileProcessed?.();
+        let matches;
+        try {
+            matches = query.matches(tree.rootNode);
+        }
+        catch (err) {
+            reportWarning(`Query execution failed for ${file.path}: ${err instanceof Error ? err.message : String(err)}`);
+            continue;
+        }
+        const provider = getProvider(language);
+        // #2687: ONE pass over `matches` yields both suppression sets — the
+        // definition-name claims by rank (callable > Property > value), so the dedup
+        // below cannot depend on tree-sitter's match order, and the concrete-typedef
+        // ranges the typedef guard consumes.
+        const definitionPreScan = buildDefinitionPreScan(matches, provider);
+        const concreteTypedefRanges = definitionPreScan.concreteTypedefRanges;
+        // Produce the `ParsedFile` for the scope-resolution pipeline HERE, reusing
+        // the tree we just parsed (no second tree-sitter parse). Scope-resolution
+        // consumes these via the disk-backed parsedfile-store instead of
+        // re-extracting each file from source on the main thread — which
+        // accumulated an unbounded native tree-sitter leak on huge repos (#1983;
+        // see parsedfile-store.ts). parse-impl flushes `result.parsedFiles` to disk
+        // per chunk and does NOT retain them in main-thread heap, so this no longer
+        // costs ~1× the semantic model in RAM during parse.
+        const parsedFile = extractParsedFile(provider, parseContent, file.path, reportWarning, tree, scopeSourceKind);
+        if (parsedFile !== undefined) {
+            // Capture-time side-channel (#1983): `extractParsedFile` just ran the
+            // provider's `emitScopeCaptures`, which (for C++ ADL/namespace marks,
+            // C `static`-linkage names, and Kotlin companion scopes) populated
+            // module-level maps as a SIDE EFFECT that is NOT on `parsedFile`'s
+            // scopes/defs. Snapshot
+            // that per-file state as plain data onto `ParsedFile.captureSideChannel`
+            // so the main thread can restore it (via `ScopeResolver.applyCaptureSideChannel`)
+            // WITHOUT a re-parse, after this ParsedFile crosses the worker boundary /
+            // disk store. Providers without capture-time side effects leave the hook
+            // undefined and this is a no-op. `undefined` return ⇒ no field added.
+            //
+            // `extractParsedFile` returns a frozen ParsedFile, so re-wrap (shallow
+            // copy — scopes/defs are carried by reference) to attach the field rather
+            // than mutate the frozen object.
+            const sideChannel = provider.collectCaptureSideChannel?.(file.path);
+            let withChannels = sideChannel !== undefined ? { ...parsedFile, captureSideChannel: sideChannel } : parsedFile;
+            // CFG side-channel (#2081 M1): build the per-function control-flow graph
+            // here, where the tree-sitter AST is still in hand, and attach it as plain
+            // serializable data. Only on a --pdg run and only for languages with a
+            // cfgVisitor (TS/JS in M1). The same disk-store/warm-cache machinery that
+            // carries captureSideChannel carries this — its coherence rests on the
+            // SCHEMA_BUMP + the pdg-folded chunk-hash key (see parse-cache.ts).
+            if (PDG_ENABLED && provider.cfgVisitor) {
+                // Isolate the CFG build per file: a throw here (an unexpected tree-sitter
+                // node shape) must NOT propagate — it would escape processFileGroup to the
+                // language-group catch, which treats any throw as "parser unavailable" and
+                // silently drops EVERY remaining file in the group. Skip CFG for this one
+                // file; parsing + scope resolution proceed unaffected (CFG is a
+                // strictly-additive opt-in). collectFunctionCfgs ALSO isolates per
+                // FUNCTION now (#2195) — a deep-nesting bail or a single malformed function
+                // is counted in `skipped` and skipped, not allowed to lose the whole file.
+                try {
+                    const { cfgs, skipped } = collectFunctionCfgs(tree.rootNode, provider.cfgVisitor, file.path, PDG_MAX_FUNCTION_LINES, 
+                    // Embedded scripts (Vue SFC <script>) parse at row 0 but live at
+                    // `lineOffset` in the file — shift the CFG into file coordinates so
+                    // it joins its graph node and BasicBlock lines map to source.
+                    lineOffset);
+                    if (cfgs.length)
+                        withChannels = { ...withChannels, cfgSideChannel: cfgs };
+                    // Surface per-function CFG skips per-language (#2195): merged + logged
+                    // in mergeChunkResults. Only accumulate when something was skipped so
+                    // the common (nothing-skipped) case stays a no-op.
+                    if (skipped.tooManyLines || skipped.tooDeeplyNested || skipped.buildError) {
+                        const agg = (result.cfgSkipped ??= {});
+                        const prev = agg[language] ?? { tooManyLines: 0, tooDeeplyNested: 0, buildError: 0 };
+                        agg[language] = {
+                            tooManyLines: prev.tooManyLines + skipped.tooManyLines,
+                            tooDeeplyNested: prev.tooDeeplyNested + skipped.tooDeeplyNested,
+                            buildError: prev.buildError + skipped.buildError,
+                        };
+                    }
+                }
+                catch (err) {
+                    reportWarning(`CFG build failed for ${file.path}: ${err instanceof Error ? err.message : String(err)}`);
+                }
+            }
+            result.parsedFiles.push(withChannels);
+        }
+        // Build per-file type environment + constructor bindings in a single AST walk.
+        // The legacy heritage pre-pass that seeded a file-local parentMap for
+        // buildTypeEnv was removed in RING4-1 (#942) along with the rest of the
+        // call-resolution DAG. Inheritance is now emitted by scope-resolution
+        // (preEmitInheritanceEdges + @reference.inherits), so buildTypeEnv runs with
+        // an empty parentMap — cross-file inheritance was never resolved here anyway.
+        const parentMap = new Map();
+        const typeEnv = buildTypeEnv(tree, language, {
+            filePath: file.path,
+            parentMap,
+            enclosingFunctionFinder: provider?.enclosingFunctionFinder,
+            extractFunctionName: provider?.methodExtractor?.extractFunctionName,
+        });
+        const callRouter = provider.callRouter;
+        if (typeEnv.constructorBindings.length > 0) {
+            result.constructorBindings.push({
+                filePath: file.path,
+                bindings: [...typeEnv.constructorBindings],
+            });
+        }
+        // Serialize file-scope bindings for BindingAccumulator. These feed the
+        // ExportedTypeMap enrichment loop in pipeline.ts — the only current
+        // consumer of worker-path binding data.
+        //
+        // Historical note: we previously serialized all scopes
+        // (`typeEnv.allScopes()`), which pushed ~4.9 MB of function-scope
+        // bindings across the IPC boundary on every worker batch with zero
+        // downstream readers. Narrowing to `fileScope()` recovers that cost.
+        // See the `FileScopeBindings` JSDoc above for the Phase 9 reversion
+        // path when a function-scope consumer lands.
+        const fileScope = typeEnv.fileScope();
+        if (fileScope.size > 0) {
+            const scopeBindings = [];
+            for (const [varName, typeName] of fileScope) {
+                scopeBindings.push([varName, typeName]);
+            }
+            result.fileScopeBindings.push({ filePath: file.path, bindings: scopeBindings });
+        }
+        // Per-file map: decorator end-line → decorator info, for associating with definitions
+        const fileDecorators = new Map();
+        // Track start indices of definition nodes already processed by higher-priority captures
+        // (e.g. @definition.function) to avoid duplicate nodes when @definition.const/@definition.variable
+        // patterns overlap with the same source range.
+        const processedDefinitionNodes = new Set();
+        const variableInfoCache = new Map();
+        // Pre-pass: tree-sitter .matches() yields captures in document byte order,
+        // so @definition.const (anchored on lexical_declaration/export_statement,
+        // byte 0) arrives BEFORE @definition.function (anchored on the inner
+        // arrow_function at byte ~30) for the same code like `const fn = () => {}`.
+        // Pre-populate the set with all higher-priority definition startIndexes so
+        // Const/Static/Variable captures are correctly skipped in the main loop.
+        for (const m of matches) {
+            const cm = {};
+            for (const c of m.captures)
+                cm[c.name] = c.node;
+            const dn = getDefinitionNodeFromCaptures(cm);
+            if (dn && !cm['definition.const'] && !cm['definition.static'] && !cm['definition.variable']) {
+                processedDefinitionNodes.add(`${dn.startIndex}`);
+            }
+        }
+        for (const match of matches) {
+            const captureMap = {};
+            for (const c of match.captures) {
+                captureMap[c.name] = c.node;
+            }
+            if (isSuppressedConcreteTypedefDuplicate(captureMap, concreteTypedefRanges))
+                continue;
+            // Import matches: IMPORTS edges are emitted by the scope-resolution
+            // phase from finalized ImportEdges (RING4-1 #942 / RING4-2 #943 removed
+            // the legacy per-file import-map extraction that ran here). Skip.
+            if (captureMap['import'] && captureMap['import.source']) {
+                continue;
+            }
+            // Extract assignment sites (field write access)
+            if (captureMap['assignment'] &&
+                captureMap['assignment.receiver'] &&
+                captureMap['assignment.property']) {
+                const receiverText = captureMap['assignment.receiver'].text;
+                const propertyName = captureMap['assignment.property'].text;
+                if (receiverText && propertyName) {
+                    const srcId = findEnclosingFunctionId(captureMap['assignment'], file.path, provider) ||
+                        generateId('File', file.path);
+                    let receiverTypeName;
+                    if (typeEnv) {
+                        receiverTypeName = typeEnv.lookup(receiverText, captureMap['assignment']) ?? undefined;
+                    }
+                    result.assignments.push({
+                        filePath: file.path,
+                        sourceId: srcId,
+                        receiverText,
+                        propertyName,
+                        line: captureMap['assignment'].startPosition.row + 1,
+                        ...(receiverTypeName ? { receiverTypeName } : {}),
+                    });
+                }
+                if (!captureMap['call'])
+                    continue;
+            }
+            // Store decorator metadata for later association with definitions
+            if (captureMap['decorator'] && captureMap['decorator.name']) {
+                const decoratorName = captureMap['decorator.name'].text;
+                const decoratorArg = captureMap['decorator.arg']?.text;
+                // #2391: the first positional arg captured as either a string node
+                // (`arg_str`, present even for the empty-string literal `""` which has no
+                // `string_content`) or a non-literal expression (`arg_expr`: an
+                // identifier or a `+`-concatenation).
+                const decoratorArgStr = captureMap['decorator.arg_str'];
+                const decoratorArgExpr = captureMap['decorator.arg_expr'];
+                const decoratorReceiver = captureMap['decorator.receiver']?.text;
+                const decoratorNode = captureMap['decorator'];
+                // Store by the decorator's end line — the definition follows immediately after
+                fileDecorators.set(decoratorNode.endPosition.row, {
+                    name: decoratorName,
+                    arg: decoratorArg,
+                });
+                if (ROUTE_DECORATOR_NAMES.has(decoratorName)) {
+                    const method = decoratorName.replace('Mapping', '').toUpperCase();
+                    const httpMethod = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'].includes(method)
+                        ? method
+                        : 'GET';
+                    const base = {
+                        filePath: file.path,
+                        httpMethod,
+                        decoratorName,
+                        lineNumber: decoratorNode.startPosition.row + lineOffset,
+                        ...(decoratorReceiver ? { decoratorReceiver } : {}),
+                    };
+                    if (decoratorArgStr) {
+                        // String-literal path (the fast path, unchanged). Empty-string
+                        // literal `""` has no `string_content` → `decoratorArg` undefined →
+                        // routePath '' (a valid path under an APIRouter prefix).
+                        result.decoratorRoutes.push({ ...base, routePath: decoratorArg ?? '' });
+                    }
+                    else if (decoratorArgExpr) {
+                        // #2391 non-literal path (imported/composed constant). Emit the raw
+                        // expression + its operands for cross-file resolution in parse-impl;
+                        // `routePath` stays empty until resolved (or the route is dropped).
+                        const operands = decoratorArgExpr.type === 'identifier'
+                            ? [{ kind: 'ref', name: decoratorArgExpr.text }]
+                            : parseConstOperands(decoratorArgExpr);
+                        result.decoratorRoutes.push({
+                            ...base,
+                            routePath: '',
+                            routePathExpr: decoratorArgExpr.text,
+                            ...(operands ? { routePathOperands: operands } : {}),
+                        });
+                    }
+                    // Otherwise the first arg is absent or an unsupported shape
+                    // (attribute access, call, …) → skip; never a phantom `POST /`.
+                }
+                // MCP/RPC tool detection: @mcp.tool(), @app.tool(), @server.tool()
+                if (decoratorName === 'tool') {
+                    // Re-store with isTool flag for the definition handler
+                    fileDecorators.set(decoratorNode.endPosition.row, {
+                        name: decoratorName,
+                        arg: decoratorArg,
+                        isTool: true,
+                    });
+                }
+                continue;
+            }
+            // Extract HTTP consumer URLs: fetch(), axios.get(), $.get(), requests.get(), etc.
+            if (captureMap['route.fetch']) {
+                const urlNode = captureMap['route.url'] ?? captureMap['route.template_url'];
+                // A fetch whose URL is not a literal is still an OUTWARD CALL, and that
+                // is the whole of what the R3-6 sink set needs — where the program
+                // reaches out, not where to. Recorded with an empty `fetchURL` (#2897):
+                // route linking normalizes the URL first and skips anything that yields
+                // nothing, so these add sink sites without inventing a FETCHES edge.
+                //
+                // Measured before this: 44 of 47 fetch calls in this repo pass a
+                // variable, so the sink signal was absent from 94% of them and
+                // sink-terminated flows could effectively never fire.
+                result.fetchCalls.push({
+                    filePath: file.path,
+                    fetchURL: urlNode ? urlNode.text : '',
+                    lineNumber: captureMap['route.fetch'].startPosition.row + lineOffset,
+                });
+                continue;
+            }
+            // HTTP client calls: axios.get('/path'), $.post('/path'), requests.get('/path')
+            // Skip methods also in EXPRESS_ROUTE_METHODS to avoid double-registering Express
+            // routes as both route definitions AND consumers (both queries match same AST node)
+            if (captureMap['http_client'] && captureMap['http_client.url']) {
+                const method = captureMap['http_client.method']?.text;
+                const url = captureMap['http_client.url'].text;
+                if (method && HTTP_CLIENT_ONLY_METHODS.has(method) && url.startsWith('/')) {
+                    result.fetchCalls.push({
+                        filePath: file.path,
+                        fetchURL: url,
+                        lineNumber: captureMap['http_client'].startPosition.row + lineOffset,
+                    });
+                }
+                continue;
+            }
+            // Express/Hono route registration: app.get('/path', handler)
+            if (captureMap['express_route'] &&
+                captureMap['express_route.method'] &&
+                captureMap['express_route.path']) {
+                const method = captureMap['express_route.method'].text;
+                const routePath = captureMap['express_route.path'].text;
+                if (EXPRESS_ROUTE_METHODS.has(method) && routePath.startsWith('/')) {
+                    // Extract the receiver (the object the method is called on) to filter out
+                    // HTTP client calls like axios.get('/api/users') that match the same pattern
+                    // as Express route registrations.
+                    const callNode = captureMap['express_route'];
+                    const funcNode = callNode.childForFieldName?.('function') ?? callNode.children?.[0];
+                    // Walk through nested member_expressions and call_expressions to
+                    // reach the innermost receiver identifier.  Handles chains like:
+                    //   this.httpService.get('/path')   -> member chain    -> 'httpservice'
+                    //   getClient().get('/path')         -> call_expression -> 'getclient'
+                    //   axios.get('/path')               -> bare identifier -> 'axios'
+                    let receiverNode = funcNode?.childForFieldName?.('object') ?? funcNode?.children?.[0];
+                    while (receiverNode?.type === 'member_expression' ||
+                        receiverNode?.type === 'call_expression') {
+                        if (receiverNode.type === 'member_expression') {
+                            // Drill into the property (rightmost part) of the member expression
+                            const propNode = receiverNode.childForFieldName?.('property');
+                            if (propNode) {
+                                receiverNode = propNode;
+                            }
+                            else {
+                                break;
+                            }
+                        }
+                        else {
+                            // call_expression: unwrap to the function being called
+                            const innerFunc = receiverNode.childForFieldName?.('function') ?? receiverNode.children?.[0];
+                            if (innerFunc && innerFunc !== receiverNode) {
+                                receiverNode = innerFunc;
+                            }
+                            else {
+                                break;
+                            }
+                        }
+                    }
+                    const receiverText = receiverNode?.text?.toLowerCase() ?? '';
+                    if (HTTP_CLIENT_RECEIVERS.has(receiverText)) {
+                        // This is an HTTP client call, not a route definition u2014 skip it
+                        continue;
+                    }
+                    const httpMethod = method === 'all' || method === 'use' || method === 'route'
+                        ? 'GET'
+                        : method.toUpperCase();
+                    result.decoratorRoutes.push({
+                        filePath: file.path,
+                        routePath,
+                        httpMethod,
+                        decoratorName: `express.${method}`,
+                        lineNumber: captureMap['express_route'].startPosition.row + lineOffset,
+                    });
+                }
+                continue;
+            }
+            // Extract call sites
+            if (captureMap['call']) {
+                const callNode = captureMap['call'];
+                const callNameNode = captureMap['call.name'];
+                const callExtractor = provider.callExtractor;
+                if (callExtractor) {
+                    // ── Path 1: Language-specific call site (bypasses routing) ────
+                    // Try language-specific extraction (e.g. Java `::` method references)
+                    // without callNameNode.  If successful, skip routing and the generic
+                    // path entirely.
+                    const langCallSite = callExtractor.extract(callNode, undefined);
+                    if (langCallSite) {
+                        if (!provider.isBuiltInName(langCallSite.calledName)) {
+                            const sourceId = findEnclosingFunctionId(callNode, file.path, provider) ||
+                                generateId('File', file.path);
+                            const receiverName = langCallSite.callForm === 'member' ? langCallSite.receiverName : undefined;
+                            let receiverTypeName = receiverName
+                                ? typeEnv.lookup(receiverName, callNode)
+                                : undefined;
+                            // Type-as-receiver heuristic (e.g. Java `User::getName`)
+                            if (langCallSite.typeAsReceiverHeuristic &&
+                                receiverName !== undefined &&
+                                receiverTypeName === undefined &&
+                                langCallSite.callForm === 'member') {
+                                const c0 = receiverName.charCodeAt(0);
+                                if (c0 >= 65 && c0 <= 90)
+                                    receiverTypeName = receiverName;
+                            }
+                            result.calls.push({
+                                filePath: file.path,
+                                calledName: langCallSite.calledName,
+                                sourceId,
+                                callForm: langCallSite.callForm,
+                                ...(receiverName !== undefined ? { receiverName } : {}),
+                                ...(receiverTypeName !== undefined ? { receiverTypeName } : {}),
+                            });
+                        }
+                        continue;
+                    }
+                    // ── Path 2: Generic extraction via @call.name ────────────────
+                    if (callNameNode) {
+                        const calledName = callNameNode.text;
+                        // Dispatch: route language-specific calls (properties, imports).
+                        // Call-based heritage (Ruby include/extend/prepend) is no longer
+                        // routed here — those calls return 'skip' from the router and the
+                        // mixin edges are emitted by scope-resolution (emitHeritageEdges).
+                        const routed = callRouter?.(calledName, captureMap['call']);
+                        if (routed) {
+                            if (routed.kind === 'skip')
+                                continue;
+                            if (routed.kind === 'import') {
+                                // Call-routed imports (e.g. Ruby `require`) are emitted as
+                                // IMPORTS edges by the scope-resolution phase; the legacy
+                                // per-file extraction that consumed these was removed in
+                                // RING4-2 (#943). Skip.
+                                continue;
+                            }
+                            if (routed.kind === 'properties') {
+                                // #1978: thread the qualifier so a routed property's owner edge
+                                // points at the *qualified* nested-class node (Outer.Inner) rather
+                                // than a now-nonexistent simple `Class:file:Inner` id. Gated on the
+                                // flag → byte-identical when off. Mirrors the main owner path.
+                                const propGetQualifiedOwnerName = provider.classExtractor?.qualifiedNodeId === true
+                                    ? (node, simpleName) => provider.classExtractor.extractQualifiedName(node, simpleName)
+                                    : undefined;
+                                const propEnclosingInfo = cachedFindEnclosingClassInfo(captureMap['call'], file.path, provider.resolveEnclosingOwner, propGetQualifiedOwnerName);
+                                const propEnclosingClassId = propEnclosingInfo?.qualifiedClassId ?? propEnclosingInfo?.classId ?? null;
+                                // Enrich routed properties with FieldExtractor metadata
+                                let routedFieldMap;
+                                if (provider.fieldExtractor && typeEnv) {
+                                    const classNode = findEnclosingClassNode(captureMap['call']);
+                                    if (classNode) {
+                                        routedFieldMap = getFieldInfo(classNode, provider, {
+                                            typeEnv,
+                                            symbolTable: NOOP_SYMBOL_TABLE,
+                                            filePath: file.path,
+                                            language,
+                                        });
+                                    }
+                                }
+                                for (const item of routed.items) {
+                                    const routedFieldInfo = routedFieldMap?.get(item.propName);
+                                    const propQualifiedName = propEnclosingInfo
+                                        ? `${propEnclosingInfo.className}.${item.propName}`
+                                        : item.propName;
+                                    const nodeId = generateId('Property', `${file.path}:${propQualifiedName}`);
+                                    result.nodes.push({
+                                        id: nodeId,
+                                        label: 'Property',
+                                        properties: {
+                                            name: item.propName,
+                                            filePath: file.path,
+                                            startLine: item.startLine,
+                                            endLine: item.endLine,
+                                            language,
+                                            isExported: true,
+                                            description: item.accessorType,
+                                            ...(item.declaredType
+                                                ? { declaredType: item.declaredType }
+                                                : routedFieldInfo?.type
+                                                    ? { declaredType: routedFieldInfo.type }
+                                                    : {}),
+                                            ...(routedFieldInfo?.rawDeclaredType !== undefined
+                                                ? { rawDeclaredType: routedFieldInfo.rawDeclaredType }
+                                                : {}),
+                                            ...(routedFieldInfo?.annotations !== undefined &&
+                                                routedFieldInfo.annotations.length > 0
+                                                ? { annotations: routedFieldInfo.annotations }
+                                                : {}),
+                                            ...(routedFieldInfo?.visibility !== undefined
+                                                ? { visibility: routedFieldInfo.visibility }
+                                                : {}),
+                                            ...(routedFieldInfo?.isStatic !== undefined
+                                                ? { isStatic: routedFieldInfo.isStatic }
+                                                : {}),
+                                            ...(routedFieldInfo?.isReadonly !== undefined
+                                                ? { isReadonly: routedFieldInfo.isReadonly }
+                                                : {}),
+                                        },
+                                    });
+                                    result.symbols.push({
+                                        filePath: file.path,
+                                        name: item.propName,
+                                        nodeId,
+                                        type: 'Property',
+                                        ...(propEnclosingClassId ? { ownerId: propEnclosingClassId } : {}),
+                                        ...(item.declaredType
+                                            ? { declaredType: item.declaredType }
+                                            : routedFieldInfo?.type
+                                                ? { declaredType: routedFieldInfo.type }
+                                                : {}),
+                                        ...(routedFieldInfo?.visibility !== undefined
+                                            ? { visibility: routedFieldInfo.visibility }
+                                            : {}),
+                                        ...(routedFieldInfo?.isStatic !== undefined
+                                            ? { isStatic: routedFieldInfo.isStatic }
+                                            : {}),
+                                        ...(routedFieldInfo?.isReadonly !== undefined
+                                            ? { isReadonly: routedFieldInfo.isReadonly }
+                                            : {}),
+                                    });
+                                    // Only emit File -> Property DEFINES for top-level properties
+                                    // (issue #1944); class members are reached via HAS_PROPERTY.
+                                    if (!propEnclosingClassId) {
+                                        const fileId = generateId('File', file.path);
+                                        const relId = generateId('DEFINES', `${fileId}->${nodeId}`);
+                                        result.relationships.push({
+                                            id: relId,
+                                            sourceId: fileId,
+                                            targetId: nodeId,
+                                            type: 'DEFINES',
+                                            confidence: 1.0,
+                                            reason: '',
+                                        });
+                                    }
+                                    if (propEnclosingClassId) {
+                                        result.relationships.push({
+                                            id: generateId('HAS_PROPERTY', `${propEnclosingClassId}->${nodeId}`),
+                                            sourceId: propEnclosingClassId,
+                                            targetId: nodeId,
+                                            type: 'HAS_PROPERTY',
+                                            confidence: 1.0,
+                                            reason: '',
+                                        });
+                                    }
+                                }
+                                continue;
+                            }
+                            // kind === 'call' — fall through to normal call processing below
+                        }
+                        if (!provider.isBuiltInName(calledName)) {
+                            const callSite = callExtractor.extract(callNode, callNameNode);
+                            if (callSite) {
+                                const sourceId = findEnclosingFunctionId(callNode, file.path, provider) ||
+                                    generateId('File', file.path);
+                                let receiverTypeName = callSite.receiverName
+                                    ? typeEnv.lookup(callSite.receiverName, callNode)
+                                    : undefined;
+                                // Type-as-receiver heuristic
+                                if (callSite.typeAsReceiverHeuristic &&
+                                    callSite.receiverName !== undefined &&
+                                    receiverTypeName === undefined &&
+                                    callSite.callForm === 'member') {
+                                    const c0 = callSite.receiverName.charCodeAt(0);
+                                    if (c0 >= 65 && c0 <= 90)
+                                        receiverTypeName = callSite.receiverName;
+                                }
+                                const inferLiteralType = provider.typeConfig?.inferLiteralType;
+                                // Skip when no arg list / zero args: nothing to infer for overload typing
+                                const argTypes = inferLiteralType && callSite.argCount !== undefined && callSite.argCount > 0
+                                    ? extractCallArgTypes(callNode, inferLiteralType, (varName, cn) => typeEnv.lookup(varName, cn))
+                                    : undefined;
+                                result.calls.push({
+                                    filePath: file.path,
+                                    calledName: callSite.calledName,
+                                    sourceId,
+                                    ...(callSite.argCount !== undefined ? { argCount: callSite.argCount } : {}),
+                                    ...(callSite.callForm !== undefined ? { callForm: callSite.callForm } : {}),
+                                    ...(callSite.receiverName !== undefined
+                                        ? { receiverName: callSite.receiverName }
+                                        : {}),
+                                    ...(receiverTypeName !== undefined ? { receiverTypeName } : {}),
+                                    ...(callSite.receiverMixedChain !== undefined
+                                        ? { receiverMixedChain: callSite.receiverMixedChain }
+                                        : {}),
+                                    ...(argTypes !== undefined ? { argTypes } : {}),
+                                });
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+            const definitionNode = getDefinitionNodeFromCaptures(captureMap);
+            const defaultNodeLabel = getLabelFromCaptures(captureMap, provider);
+            if (!defaultNodeLabel)
+                continue;
+            if (provider.shouldSkipDefinitionCapture?.(captureMap, defaultNodeLabel) === true)
+                continue;
+            const nameNode = captureMap['name'];
+            const extractedClassSymbol = definitionNode && provider.classExtractor?.isTypeDeclaration(definitionNode)
+                ? provider.classExtractor.extract(definitionNode, {
+                    name: nameNode?.text,
+                    type: defaultNodeLabel,
+                })
+                : null;
+            const nodeLabel = extractedClassSymbol?.type ?? defaultNodeLabel;
+            const isClassLikeLabel = nodeLabel === 'Class' ||
+                nodeLabel === 'Struct' ||
+                nodeLabel === 'Interface' ||
+                nodeLabel === 'Enum' ||
+                nodeLabel === 'Record';
+            if (isClassLikeLabel &&
+                provider.classExtractor?.shouldSkipClassCapture?.({
+                    captureMap,
+                    definitionNode,
+                    nameNode,
+                    nodeLabel,
+                }) === true) {
+                continue;
+            }
+            const exportDefaultCall = nodeLabel === 'Function' && definitionNode?.type === 'export_statement'
+                ? definitionNode.namedChildren.find((child) => child.type === 'call_expression')
+                : undefined;
+            const defaultExportHocName = (() => {
+                if (exportDefaultCall === undefined)
+                    return null;
+                const argList = exportDefaultCall.childForFieldName?.('arguments');
+                const callback = argList?.namedChildren.find((child) => child.type === 'arrow_function' || child.type === 'function_expression');
+                if (callback === undefined)
+                    return null;
+                const callee = exportDefaultCall.childForFieldName?.('function');
+                if (callee?.type === 'identifier' &&
+                    DEFAULT_EXPORT_IDENTIFIER_BLOCKLIST_SET.has(callee.text))
+                    return null;
+                if (callee?.type === 'member_expression') {
+                    const property = callee.childForFieldName?.('property');
+                    if (property?.type === 'property_identifier' &&
+                        ARRAY_METHOD_HOC_BLOCKLIST_SET.has(property.text))
+                        return null;
+                }
+                return deriveDefaultExportHocName(file.path);
+            })();
+            // `module.exports = function () {}` (#2723): the whole module is the
+            // callable. The member-assignment rule captures the LEFT property as the
+            // name, which here is the literal `exports` — meaningless. Override it:
+            // a named function expression supplies its own name, and the anonymous
+            // forms are named after the file by the same convention anonymous
+            // default exports already use. Takes precedence over `nameNode` for
+            // exactly that reason.
+            //
+            // The derived name is dropped when it COLLIDES with a callable the module
+            // already declares. `format.js` holding `function format() {}` plus an
+            // anonymous `module.exports = function () { return format(v); }` merged
+            // both onto one node, and the inner call to `format` then resolved to
+            // that merged node — fabricating a self-recursion edge present in no
+            // source (#2729 review F4). A fabricated edge is worse than a missing
+            // one: it hands `impact` a caller that does not exist.
+            const isCjsDefaultExport = definitionNode !== undefined && isCjsDefaultExportAssignment(definitionNode);
+            const cjsDefaultExportOwnName = isCjsDefaultExport
+                ? definitionNode?.childForFieldName('right')?.childForFieldName('name')?.text
+                : undefined;
+            // A collision must SUPPRESS the definition outright, not merely decline to
+            // name it — falling through would let the captured left property name the
+            // node the literal `exports`, which is both meaningless and the very node
+            // this feature's own test forbids.
+            const suppressCjsDefaultExport = (() => {
+                if (!isCjsDefaultExport || cjsDefaultExportOwnName !== undefined)
+                    return false;
+                const root = definitionNode.tree?.rootNode;
+                if (root === undefined)
+                    return false;
+                return defaultExportNameCollides(definitionNode, root, deriveDefaultExportHocName(file.path));
+            })();
+            if (suppressCjsDefaultExport)
+                continue;
+            const cjsDefaultExportName = isCjsDefaultExport
+                ? (cjsDefaultExportOwnName ?? deriveDefaultExportHocName(file.path))
+                : null;
+            // Synthesize name for constructors without explicit @name capture (e.g. Swift init)
+            if (!nameNode &&
+                nodeLabel !== 'Constructor' &&
+                !extractedClassSymbol &&
+                !defaultExportHocName &&
+                !cjsDefaultExportName)
+                continue;
+            const nodeName = extractedClassSymbol?.name ??
+                defaultExportHocName ??
+                cjsDefaultExportName ??
+                (nameNode ? nameNode.text : 'init');
+            // Dedup: variable captures (Const/Static/Variable) may overlap with higher-priority
+            // captures (e.g. `const fn = () => {}` matches both @definition.function and @definition.const).
+            // Multi-name declarations share the same definition node, so include the emitted name.
+            //
+            // `processedDefinitionNodes` alone only suppressed the value twin when the
+            // function-like match happened to be processed FIRST — and it is not.
+            // tree-sitter completes `@definition.const` at `@name`, while
+            // `@definition.function` must also match the trailing arrow / function
+            // expression, so the const match is yielded first and its edgeless twin
+            // escaped (#2687). `definitionPreScan` is the order-independent view of
+            // the same claim, pre-scanned over `matches` before this loop and ranked so
+            // a capture is dropped only by a STRICTLY higher-ranked claimant.
+            //
+            // It also replaces the old bare-`startIndex` claim, which was too coarse:
+            // a callable declared FIRST in a multi-name declaration
+            // (`const cb = () => 1, SIBLING = 2`) registered the shared definition
+            // node and silently dropped every later sibling on it. Both keys are now
+            // name-scoped, so siblings survive in either declarator order.
+            //
+            // The long-term collapse seam for this duplicate class is
+            // `selectNodeBearingDef` (#1876, still unwired); this pre-scan is the local
+            // form that keeps the hot loop single-pass. Keep them in sync if #1876 lands.
+            if (definitionNode) {
+                const definitionNameKey = `${definitionNode.startIndex}:${nodeName}`;
+                if (isValueDefinitionLabel(nodeLabel)) {
+                    if (processedDefinitionNodes.has(definitionNameKey) ||
+                        definitionPreScan.nonValue.has(definitionNameKey)) {
+                        continue;
+                    }
+                    processedDefinitionNodes.add(definitionNameKey);
+                }
+                else if (nodeLabel === 'Property' && definitionPreScan.callable.has(definitionNameKey)) {
+                    // Only a CALLABLE collapses a property. Consulting the wider
+                    // `nonValue` set here would let a property suppress itself, and would
+                    // let an annotated Python attribute lose to its own bare-assignment
+                    // twin — the property must outrank `Variable`, not tie with it.
+                    continue;
+                }
+            }
+            // #2735: for a bound callable the graph-node capture sits on the OUTER
+            // wrapper while scope-resolution anchors on the INNER expression. The
+            // position join is line-only, so `startLine` must follow the initializer
+            // (ids still use `definitionNode` via `localIdentity`).
+            const startRow = definitionNode &&
+                (nodeLabel === 'Function' || nodeLabel === 'Method' || nodeLabel === 'Constructor')
+                ? boundCallableStartRow(definitionNode, nodeName, nodeLabel, parsedFile?.localDefs, nameNode)
+                : definitionNode?.startPosition.row;
+            const startLine = startRow !== undefined
+                ? startRow + lineOffset
+                : nameNode
+                    ? nameNode.startPosition.row + lineOffset
+                    : lineOffset;
+            // Compute enclosing class BEFORE node ID — needed to qualify method IDs
+            const needsOwner = nodeLabel === 'Method' ||
+                nodeLabel === 'Constructor' ||
+                nodeLabel === 'Property' ||
+                nodeLabel === 'Function';
+            // #1978: thread the class-extractor's qualifier into the owner walk when the
+            // language opts into qualified node ids, so a nested member's owner resolves
+            // to the *qualified* class id (Outer.Inner). Gated on the flag → byte-identical
+            // when off. Mirrors parsing-processor.ts.
+            const getQualifiedOwnerName = provider.classExtractor?.qualifiedNodeId === true
+                ? (node, simpleName) => 
+                // #1991: LOCKSTEP — a Ruby `module` owner is not a typeDeclaration, so
+                // extractQualifiedName returns null; fall back to the scope walk so a
+                // method inside a nested module owns through the SAME qualified Trait
+                // id its node uses on the worker path too.
+                provider.classExtractor.extractQualifiedName(node, simpleName) ??
+                    provider.classExtractor.qualifyScopeName?.(node, simpleName) ??
+                    null
+                : undefined;
+            // A Property declared inside a function/lambda BODY is a function-LOCAL
+            // binding (e.g. Kotlin `val (a,b) = pair` or a `for ((k,v) in m)` loop
+            // destructuring emitted as `@definition.property` to dodge the local-symbol
+            // pruner), NOT a class member. Such locals must not get a HAS_PROPERTY owner
+            // edge from the enclosing class. Detect them by walking from the def node:
+            // if a function-like ancestor is reached BEFORE any class container, the
+            // property is enclosed by a function. Language-agnostic — genuine class
+            // fields sit directly in the class body with no intervening function, so
+            // they are unaffected (#1919 review CF3).
+            //
+            // EXCEPTION: a constructor PARAMETER property (TypeScript
+            // `constructor(public name: string)`) is also enclosed by a function, but
+            // it IS a class member — it is reached through the parameter list, not the
+            // executable body. So only strip the owner when the property is NOT inside
+            // a parameter list of that function (i.e. it's a body local).
+            const propOwnerNode = nameNode || definitionNode;
+            // A Property is function-local (and must NOT get a class HAS_PROPERTY owner)
+            // when its nearest enclosing executable body — reached before any class
+            // container — is a function/accessor/initializer body, AND it is not a
+            // constructor parameter-property (rescued by the param-list carve-out).
+            // Uses LOCAL_SCOPE_BODY_NODE_TYPES (not FUNCTION_NODE_TYPES): the latter
+            // mis-includes Dart bare signatures (over-stripping accessors) and omits
+            // Kotlin/Swift init+accessor bodies (under-stripping their locals) — see
+            // the #1919 review of this guard.
+            const isFunctionLocalProperty = nodeLabel === 'Property' &&
+                propOwnerNode !== undefined &&
+                findAncestorBeforeBoundary(propOwnerNode, LOCAL_SCOPE_BODY_NODE_TYPES, CLASS_CONTAINER_TYPES) !== null &&
+                findAncestorBeforeBoundary(propOwnerNode, PARAMETER_LIST_NODE_TYPES, LOCAL_SCOPE_BODY_NODE_TYPES) === null;
+            const enclosingClassInfo = needsOwner && !isFunctionLocalProperty
+                ? cachedFindEnclosingClassInfo(nameNode || definitionNode, file.path, provider.resolveEnclosingOwner, getQualifiedOwnerName)
+                : null;
+            const enclosingClassId = enclosingClassInfo?.qualifiedClassId ?? enclosingClassInfo?.classId ?? null;
+            // A Method with no enclosing class container is owned by a NAMED binding
+            // instead: an object literal (`const service = { load() {} }`) or, since
+            // the #2723 follow-up, a prototype assignment
+            // (`Foo.prototype.bar = function () {}`). Both resolve the owner from the
+            // syntax rather than from an ancestor walk, and both are language-shaped
+            // helpers behind the provider's own label decision — shared code here
+            // only asks "does this Method name an owner".
+            // `Property` joins `Method` here because object-literal KEYS are now
+            // indexed (A1/A5), and a key is owned by the object that holds it exactly
+            // as a literal's function-valued member is. Without it, two config
+            // objects in one file sharing a key name (`httpConfig.timeoutMs` and
+            // `dbConfig.timeoutMs`) generate the same `Property:<file>:timeoutMs` id
+            // and COLLAPSE INTO ONE node — two distinct settings become one symbol,
+            // and the merged name then looks workspace-unique to name inference,
+            // which resolves reads of it to a node representing both.
+            const objectLiteralOwnerInfo = !enclosingClassId && (nodeLabel === 'Method' || nodeLabel === 'Property') && definitionNode
+                ? (findMemberAssignmentOwnerInfo(definitionNode, file.path) ??
+                    findObjectLiteralBindingInfo(definitionNode, file.path, {
+                        // Only `Property` opts into the qualifier; `Method` ids must stay
+                        // byte-identical or every object-literal method in every indexed
+                        // repo changes id.
+                        includeOwnerName: nodeLabel === 'Property',
+                    }) ??
+                    // R3-4: an anonymous literal in return position is owned by the
+                    // function whose shape it is. Last in the chain so a variable-bound
+                    // literal keeps its existing owner and its existing id.
+                    (nodeLabel === 'Property' ? findReturnShapeOwnerInfo(definitionNode, file.path) : null))
+                : null;
+            // Provenance for narrowing (R3-4). A return shape is a real definition but
+            // the weaker one, and the unique-name pass ranks declared anchors above it
+            // so indexing these cannot change an answer that already resolved.
+            const returnShapeProperty = nodeLabel === 'Property' && definitionNode !== undefined && definitionNode !== null
+                ? isReturnShapeProperty(definitionNode)
+                : false;
+            // #1978: hoisted ABOVE qualifiedName/node-id (load-bearing order) so a
+            // class-like node can key its id by its fully-qualified path. Derived from
+            // the SAME extractQualifiedName the owner edge uses → owner id == node id.
+            const classNodeForSymbol = definitionNode || nameNode;
+            const qualifiedTypeName = extractedClassSymbol?.qualifiedName ??
+                (classNodeForSymbol && provider.classExtractor?.isTypeDeclaration(classNodeForSymbol)
+                    ? (provider.classExtractor.extractQualifiedName(classNodeForSymbol, nodeName) ?? nodeName)
+                    : // #1991: LOCKSTEP with parsing-processor.ts — qualify a Ruby `module`
+                        // (Trait) via the scope walk so same-tail nested mixin modules get
+                        // distinct ids on the worker path too. Gated on qualifiedNodeId.
+                        isQualifiableScopeLabel(nodeLabel) &&
+                            provider.classExtractor?.qualifiedNodeId === true &&
+                            classNodeForSymbol
+                            ? (provider.classExtractor.qualifyScopeName?.(classNodeForSymbol, nodeName) ??
+                                undefined)
+                            : undefined);
+            // Qualify method/property IDs with enclosing class name to avoid collisions.
+            // Class-like nodes use their own fully-qualified path as the id key when the
+            // language enables qualifiedNodeId (#1978); everything else is unchanged.
+            // #1982: LOCKSTEP with parsing-processor.ts — a Rust inherent-impl with an
+            // UNSCOPED bare target is keyed by the enclosing `mod_item` scope so the
+            // worker-path Impl node id matches the sequential path and the owner walk.
+            // #2699: a callable nested inside another callable is qualified by the
+            // enclosing callable, so a function-local closure stops colliding with a
+            // same-named file-level function.
+            // Applies to VALUES as well as callables since #2699 closed A1: a
+            // top-level `const handler` and a function-local `const handler`
+            // otherwise collapse onto one `Const:v.ts:handler`, which was the
+            // issue's original complaint and is unreachable from a callable-only
+            // gate. `isPositionQualifiedLocalLabel` is the single definition of that
+            // set, shared with resolution in `ids.ts` — the two phases disagreeing
+            // silently drops edges rather than failing (#2714).
+            // Same helper as the caller-attribution phase — see `enclosingCallablePrefix`.
+            //
+            // A CLASS MEMBER must never gain a local prefix, and the plain walk is not
+            // enough to guarantee that once `Property`/`Static` are in the set. A
+            // TypeScript constructor PARAMETER PROPERTY —
+            // `constructor(private readonly port: Port)` — reaches the constructor's
+            // `method_definition` THROUGH the parameter list, and `method_definition`
+            // is in LOCAL_SCOPE_BODY_NODE_TYPES, so the walk hits it BEFORE any class
+            // boundary and re-keys a genuine field as `C.constructor.port@r:c`. That
+            // silently empties the `C.port` slot every `impact` / `rename` / FTS
+            // consumer addresses, and the class still asserts HAS_PROPERTY against it.
+            //
+            // `isFunctionLocalProperty` above already encodes the correct test (a
+            // parameter-list ancestor reached before any local-scope body means NOT
+            // function-local); reuse that exclusion here rather than spelling a second
+            // rule, so the owner-edge decision and the id decision cannot disagree.
+            const isParameterScopedMember = (nodeLabel === 'Property' || nodeLabel === 'Static') &&
+                definitionNode !== undefined &&
+                findAncestorBeforeBoundary(definitionNode, PARAMETER_LIST_NODE_TYPES, LOCAL_SCOPE_BODY_NODE_TYPES) !== null;
+            const nestedCallablePrefix = isPositionQualifiedLocalLabel(nodeLabel) && definitionNode && !isParameterScopedMember
+                ? enclosingCallablePrefix(definitionNode, file.path, provider)
+                : undefined;
+            const rustImplQualifiedName = nodeLabel === 'Impl' &&
+                definitionNode?.type === 'impl_item' &&
+                nameNode?.type === 'type_identifier'
+                ? qualifyRustImplTargetByModScope(definitionNode, nodeName)
+                : undefined;
+            const qualifiedNameBeforeModScope = rustImplQualifiedName !== undefined
+                ? rustImplQualifiedName
+                : // #1991: LOCKSTEP — include Trait so a Ruby mixin module's qualified
+                    // scope id keys the worker-path node, matching the sequential path.
+                    (isClassLikeLabel || isQualifiableScopeLabel(nodeLabel)) &&
+                        provider.classExtractor?.qualifiedNodeId === true &&
+                        qualifiedTypeName !== undefined
+                        ? qualifiedTypeName
+                        : nestedCallablePrefix !== undefined && definitionNode
+                            ? nestedCallableQualifiedName(nestedCallablePrefix, definitionNode, nodeName)
+                            : enclosingClassInfo
+                                ? `${enclosingClassInfo.className}.${nodeName}`
+                                : // A member whose owner is named by the assignment rather than
+                                    // by an enclosing container (`Foo.prototype.bar = …`) qualifies
+                                    // by that owner, so two constructors in one file that both
+                                    // define `bar` stay distinct nodes.
+                                    objectLiteralOwnerInfo?.ownerName !== undefined
+                                        ? `${objectLiteralOwnerInfo.ownerName}.${nodeName}`
+                                        : nodeName;
+            // #2742: qualify by the enclosing `mod` chain, so two same-named items at
+            // different module depths in one file are DISTINCT nodes. Without this,
+            // `mod inner { fn dispatch }` and a crate-root `fn dispatch` both keyed
+            // `Function:<file>:dispatch`, first-wins — so a correctly resolved call
+            // into the inline module still rendered as a self-loop, and `impact`
+            // reported the real callee as unreached.
+            //
+            // Keyed purely on the `mod_item` node type, exactly as the impl-target
+            // qualifier above (#1982) already is, so it is a no-op for every language
+            // whose grammar has no such node. The impl branch already applied it and
+            // is left alone rather than qualified twice.
+            //
+            // Scoped to items that sit on NEITHER side of an owner edge, because only
+            // the id is re-keyed here — the anchor is minted independently by
+            // `findEnclosingClassInfo` and does not move with it:
+            //
+            //   - `!enclosingClassInfo` excludes the MEMBER side. A method already
+            //     carries its owner's name (`Inner.method`), and for an unscoped
+            //     inherent impl that owner is mod-scoped by the impl qualifier above,
+            //     so qualifying the member again would break the byte-for-byte
+            //     agreement #1975/#1982 established.
+            //   - `!MEMBER_OWNER_NODE_TYPES.has(...)` excludes the OWNER side. A
+            //     `struct` / `trait` / `enum` / `impl` declared directly in a `mod` has
+            //     no enclosing class, so the member-side guard alone let it through
+            //     while its own anchor stayed bare — `mod engine { struct Config { … } }`
+            //     minted `Struct:<file>:engine.Config` against a `HAS_PROPERTY` edge
+            //     anchored on `Struct:<file>:Config`, dangling every field. The same
+            //     gap put `impl a::Inner` inside a `mod` back on the #1975 rake this
+            //     helper's own docblock warns about: the impl branch above deliberately
+            //     fires only for an UNSCOPED `type_identifier`, and this gate was
+            //     picking up the scoped targets it had just excluded.
+            //   - `nestedCallablePrefix === undefined` excludes an item inside a
+            //     CALLABLE. `fn wrapper() { mod helper { fn dispatch } }` composed the
+            //     mod segment outermost — `helper.wrapper.dispatch@2:8` — inverting the
+            //     real nesting, because the mod prefix is prepended to a name the
+            //     enclosing-callable pass has already qualified. Nothing dangled (the
+            //     `@line:col` suffix keeps such ids unique on its own, which is also why
+            //     the mod segment adds no identity here), but the path read as a lie
+            //     about the source. Skipping is the honest answer; reordering would mean
+            //     interleaving two qualifier passes for a shape that only ever produces
+            //     already-unique ids.
+            //
+            // Same-named members on same-named types in sibling modules therefore
+            // still collapse, as do the containers themselves — unchanged from before
+            // this fix, and owned by the owner edge rather than worked around here.
+            const qualifiesByEnclosingModScope = rustImplQualifiedName === undefined &&
+                definitionNode !== undefined &&
+                !MEMBER_OWNER_NODE_TYPES.has(definitionNode.type) &&
+                nestedCallablePrefix === undefined &&
+                !enclosingClassInfo &&
+                objectLiteralOwnerInfo?.ownerName === undefined;
+            const qualifiedName = qualifiesByEnclosingModScope && definitionNode !== undefined
+                ? qualifyByEnclosingModScope(definitionNode, qualifiedNameBeforeModScope)
+                : qualifiedNameBeforeModScope;
+            // Extract method metadata BEFORE generating node ID — parameterCount is needed
+            // to disambiguate overloaded methods via #<arity> suffix in the ID.
+            let declaredType;
+            let methodProps = {};
+            let arityForId; // raw param count for ID, even for variadic
+            let defMethodMap;
+            let defMethodInfo;
+            if (nodeLabel === 'Function' || nodeLabel === 'Method' || nodeLabel === 'Constructor') {
+                // Use MethodExtractor for method metadata — provides parameterCount, parameterTypes,
+                // returnType, isAbstract/isFinal/annotations, visibility, and more.
+                let enrichedByMethodExtractor = false;
+                if (provider.methodExtractor && definitionNode) {
+                    const classNode = findEnclosingClassNode(definitionNode) ?? findClassNodeByQualifiedName(definitionNode);
+                    if (classNode) {
+                        const methodMap = getMethodInfo(classNode, provider, {
+                            filePath: file.path,
+                            language,
+                        });
+                        const defLine = definitionNode.startPosition.row + 1;
+                        const info = methodMap?.get(methodInfoKey(nodeName, defLine, definitionNode.startPosition.column));
+                        if (info) {
+                            enrichedByMethodExtractor = true;
+                            arityForId = arityForIdFromInfo(info);
+                            methodProps = buildMethodProps(info);
+                            defMethodMap = methodMap;
+                            defMethodInfo = info;
+                        }
+                    }
+                }
+                // For top-level methods (e.g. Go method_declaration), try extractFromNode
+                if (!enrichedByMethodExtractor &&
+                    provider.methodExtractor?.extractFromNode &&
+                    definitionNode) {
+                    const info = provider.methodExtractor.extractFromNode(definitionNode, {
+                        filePath: file.path,
+                        language,
+                    });
+                    if (info) {
+                        enrichedByMethodExtractor = true;
+                        arityForId = arityForIdFromInfo(info);
+                        methodProps = buildMethodProps(info);
+                    }
+                }
+            }
+            // Append #<paramCount> to owned callable IDs to disambiguate overloads.
+            // Top-level Function IDs stay stable; functions inside an owner may overload.
+            // When same-arity collisions exist, append ~type1,type2 for further disambiguation.
+            const needsAritySuffix = nodeLabel === 'Method' ||
+                nodeLabel === 'Constructor' ||
+                (nodeLabel === 'Function' && enclosingClassId !== null);
+            let arityTag = needsAritySuffix && arityForId !== undefined ? `#${arityForId}` : '';
+            if (arityTag && defMethodMap && defMethodInfo) {
+                const groups = buildCollisionGroups(defMethodMap);
+                arityTag += typeTagForId(defMethodMap, nodeName, arityForId, defMethodInfo, language, groups);
+                arityTag += constTagForId(defMethodMap, nodeName, arityForId, defMethodInfo, groups);
+            }
+            const parameterShapeTag = nodeLabel === 'Function' || nodeLabel === 'Method'
+                ? parameterShapeIdTag(methodProps.parameterTypes, methodProps.parameterTypeClasses)
+                : '';
+            const classTemplateArguments = extractedClassSymbol?.templateArguments ??
+                provider.classExtractor?.extractTemplateArgumentsFromCapture?.({
+                    captureMap,
+                    definitionNode,
+                    nameNode,
+                }) ??
+                (captureMap['template-arguments']
+                    ? extractTemplateArguments(captureMap['template-arguments'].text)
+                    : undefined) ??
+                (nameNode && nameNode.text ? extractTemplateArguments(nameNode.text) : undefined);
+            const classTemplateTag = (nodeLabel === 'Class' ||
+                nodeLabel === 'Struct' ||
+                nodeLabel === 'Interface' ||
+                nodeLabel === 'Enum' ||
+                nodeLabel === 'Record') &&
+                classTemplateArguments !== undefined &&
+                classTemplateArguments.length > 0
+                ? templateArgumentsIdTag(classTemplateArguments)
+                : '';
+            // SFINAE / `requires`-clause aware ID disambiguation (issue #1579).
+            // Function-template overloads with identical parameterTypes but
+            // mutually-exclusive constraints (e.g. `enable_if_t<is_integral_v<T>>`
+            // vs `enable_if_t<is_floating_point_v<T>>`) need distinct graph nodes
+            // so the constraint-filter step in `narrowOverloadCandidates` has two
+            // candidates to narrow between. Without this tag they collapse to a
+            // single Function node and the SFINAE call resolves to only one edge
+            // regardless of which overload's constraint holds. This mirrors the
+            // sequential `parsing-processor` path removed in #1983 — the worker is
+            // now the sole parse path, so it must stamp the constraint tag and the
+            // `templateConstraints` node property the resolver looks up by re-
+            // hashing the def's constraints (see graph-bridge ids.ts / node-lookup.ts).
+            let parsedTemplateConstraints = undefined;
+            let constraintsTag = '';
+            if ((nodeLabel === 'Function' || nodeLabel === 'Method') &&
+                provider.extractTemplateConstraints !== undefined &&
+                definitionNode) {
+                try {
+                    parsedTemplateConstraints = provider.extractTemplateConstraints(definitionNode);
+                    if (parsedTemplateConstraints !== undefined) {
+                        constraintsTag = templateConstraintsIdTag(parsedTemplateConstraints);
+                    }
+                }
+                catch (err) {
+                    // Optional C++ template-constraint enrichment: fall back to no tag, but
+                    // surface the failure (#2264) — matches the CFG-build warning above.
+                    reportWarning(`Template-constraint extraction failed for ${file.path}: ${err instanceof Error ? err.message : String(err)}`);
+                    parsedTemplateConstraints = undefined;
+                    constraintsTag = '';
+                }
+            }
+            const nodeId = generateId(nodeLabel, `${file.path}:${qualifiedName}${classTemplateTag}${arityTag}${parameterShapeTag}${constraintsTag}`);
+            let description;
+            try {
+                description = provider.descriptionExtractor?.(nodeLabel, nodeName, captureMap);
+            }
+            catch (err) {
+                // A throw here (an unexpected tree-sitter node shape, a provider bug) must
+                // NOT propagate — it would escape processFileGroup to the language-group
+                // catch, which treats any throw as "parser unavailable" and silently drops
+                // every remaining file in the group. Mirrors the extractTemplateConstraints
+                // guard above (#2286 review).
+                reportWarning(`Description extraction failed for ${file.path}: ${err instanceof Error ? err.message : String(err)}`);
+                description = undefined;
+            }
+            let frameworkHint = definitionNode
+                ? detectFrameworkFromAST(language, (definitionNode.text || '').slice(0, 300))
+                : null;
+            // Suppress Spring framework hint for methods inside interfaces
+            // (Feign clients, JAX-RS proxies are consumers, not providers)
+            if (frameworkHint && definitionNode) {
+                let classCheck = definitionNode.parent;
+                while (classCheck) {
+                    if (classCheck.type === 'interface_declaration') {
+                        frameworkHint = null;
+                        break;
+                    }
+                    if (classCheck.type === 'class_declaration' || classCheck.type === 'program') {
+                        break;
+                    }
+                    classCheck = classCheck.parent;
+                }
+            }
+            // Decorators appear on lines immediately before their definition; allow up to
+            // MAX_DECORATOR_SCAN_LINES gap for blank lines / multi-line decorator stacks.
+            const MAX_DECORATOR_SCAN_LINES = 5;
+            if (definitionNode) {
+                const defStartLine = definitionNode.startPosition.row;
+                for (let checkLine = defStartLine - 1; checkLine >= Math.max(0, defStartLine - MAX_DECORATOR_SCAN_LINES); checkLine--) {
+                    const dec = fileDecorators.get(checkLine);
+                    if (dec) {
+                        // Use first (closest) decorator found for framework hint
+                        if (!frameworkHint) {
+                            frameworkHint = {
+                                framework: 'decorator',
+                                entryPointMultiplier: 1.2,
+                                reason: `@${dec.name}${dec.arg ? `("${dec.arg}")` : ''}`,
+                            };
+                        }
+                        // Emit tool definition if this is a @tool decorator
+                        if (dec.isTool) {
+                            result.toolDefs.push({
+                                filePath: file.path,
+                                toolName: nodeName,
+                                description: (dec.arg || description || '').slice(0, 200),
+                                lineNumber: definitionNode.startPosition.row + lineOffset,
+                                handlerNodeId: nodeId,
+                            });
+                        }
+                        fileDecorators.delete(checkLine);
+                    }
+                }
+            }
+            // Property metadata extraction (not needed before nodeId — Properties don't overload)
+            if (nodeLabel === 'Property' && definitionNode) {
+                // FieldExtractor is the single source of truth when available
+                if (provider.fieldExtractor && typeEnv) {
+                    const classNode = findEnclosingClassNode(definitionNode);
+                    if (classNode) {
+                        const fieldMap = getFieldInfo(classNode, provider, {
+                            typeEnv,
+                            symbolTable: NOOP_SYMBOL_TABLE,
+                            filePath: file.path,
+                            language,
+                        });
+                        const info = fieldMap?.get(nodeName);
+                        if (info) {
+                            declaredType = info.type ?? undefined;
+                            // Mutate methodProps BEFORE the `{...methodProps}` spread below —
+                            // rawDeclaredType is the verbatim generic type text (U1, PR #2200).
+                            if (info.rawDeclaredType !== undefined) {
+                                methodProps.rawDeclaredType = info.rawDeclaredType;
+                            }
+                            // Field annotations ('@Name' strings, U2 PR #2200) — omit when empty.
+                            if (info.annotations !== undefined && info.annotations.length > 0) {
+                                methodProps.annotations = info.annotations;
+                            }
+                            methodProps.visibility = info.visibility;
+                            methodProps.isStatic = info.isStatic;
+                            methodProps.isReadonly = info.isReadonly;
+                        }
+                    }
+                }
+            }
+            // Variable/Const/Static metadata extraction via VariableExtractor
+            if ((nodeLabel === 'Const' || nodeLabel === 'Static' || nodeLabel === 'Variable') &&
+                definitionNode &&
+                provider.variableExtractor) {
+                let variableInfoByName = variableInfoCache.get(definitionNode.startIndex);
+                if (!variableInfoByName) {
+                    const varCtx = {
+                        filePath: file.path,
+                        language,
+                    };
+                    variableInfoByName = new Map(provider.variableExtractor
+                        .extractAll(definitionNode, varCtx)
+                        .map((info) => [info.name, info]));
+                    variableInfoCache.set(definitionNode.startIndex, variableInfoByName);
+                }
+                const varInfo = variableInfoByName.get(nodeName);
+                if (varInfo) {
+                    if (varInfo.type)
+                        declaredType = varInfo.type;
+                    methodProps.visibility = varInfo.visibility;
+                    methodProps.isStatic = varInfo.isStatic;
+                    methodProps.isConst = varInfo.isConst;
+                    methodProps.isMutable = varInfo.isMutable;
+                    methodProps.scope = varInfo.scope;
+                }
+            }
+            result.nodes.push({
+                id: nodeId,
+                label: nodeLabel,
+                properties: {
+                    name: nodeName,
+                    filePath: file.path,
+                    startLine,
+                    endLine: definitionNode ? definitionNode.endPosition.row + lineOffset : startLine,
+                    language: language,
+                    isExported: language === SupportedLanguages.Vue && isVueSetup
+                        ? isVueSetupTopLevel(nameNode || definitionNode)
+                        : cachedExportCheck(provider.exportChecker, nameNode || definitionNode, nodeName),
+                    ...(qualifiedTypeName !== undefined ? { qualifiedName: qualifiedTypeName } : {}),
+                    ...(classTemplateArguments !== undefined && classTemplateArguments.length > 0
+                        ? { templateArguments: classTemplateArguments }
+                        : {}),
+                    ...(parsedTemplateConstraints !== undefined
+                        ? { templateConstraints: parsedTemplateConstraints }
+                        : {}),
+                    ...(frameworkHint
+                        ? {
+                            astFrameworkMultiplier: frameworkHint.entryPointMultiplier,
+                            astFrameworkReason: frameworkHint.reason,
+                        }
+                        : {}),
+                    ...(description !== undefined ? { description } : {}),
+                    ...methodProps,
+                    ...(declaredType !== undefined ? { declaredType } : {}),
+                    ...(returnShapeProperty ? { fromReturnShape: true, isDetail: true } : {}),
+                },
+            });
+            // enclosingClassId already computed above (before nodeId generation)
+            const ownerId = enclosingClassId ?? objectLiteralOwnerInfo?.ownerId;
+            result.symbols.push({
+                filePath: file.path,
+                name: nodeName,
+                nodeId,
+                type: nodeLabel,
+                ...(qualifiedTypeName !== undefined ? { qualifiedName: qualifiedTypeName } : {}),
+                parameterCount: methodProps.parameterCount,
+                requiredParameterCount: methodProps.requiredParameterCount,
+                parameterTypes: methodProps.parameterTypes,
+                parameterTypeClasses: methodProps.parameterTypeClasses,
+                returnType: methodProps.returnType,
+                ...(declaredType !== undefined ? { declaredType } : {}),
+                ...(classTemplateArguments !== undefined && classTemplateArguments.length > 0
+                    ? { templateArguments: classTemplateArguments }
+                    : {}),
+                ...(ownerId !== undefined ? { ownerId } : {}),
+                visibility: methodProps.visibility,
+                isStatic: methodProps.isStatic,
+                isReadonly: methodProps.isReadonly,
+                isAbstract: methodProps.isAbstract,
+                isFinal: methodProps.isFinal,
+                ...(methodProps.isDeleted !== undefined
+                    ? { isDeleted: methodProps.isDeleted }
+                    : {}),
+                ...(methodProps.isVirtual !== undefined
+                    ? { isVirtual: methodProps.isVirtual }
+                    : {}),
+                ...(methodProps.isOverride !== undefined
+                    ? { isOverride: methodProps.isOverride }
+                    : {}),
+                ...(methodProps.isAsync !== undefined ? { isAsync: methodProps.isAsync } : {}),
+                ...(methodProps.isPartial !== undefined
+                    ? { isPartial: methodProps.isPartial }
+                    : {}),
+                ...(methodProps.annotations !== undefined
+                    ? { annotations: methodProps.annotations }
+                    : {}),
+            });
+            // Only emit File -> Symbol DEFINES for top-level symbols (issue #1944).
+            if (ownerId === undefined) {
+                const fileId = generateId('File', file.path);
+                const relId = generateId('DEFINES', `${fileId}->${nodeId}`);
+                result.relationships.push({
+                    id: relId,
+                    sourceId: fileId,
+                    targetId: nodeId,
+                    type: 'DEFINES',
+                    confidence: 1.0,
+                    reason: '',
+                });
+            }
+            // ── HAS_METHOD / HAS_PROPERTY: link member to enclosing class ──
+            if (ownerId !== undefined) {
+                const memberEdgeType = nodeLabel === 'Property' ? 'HAS_PROPERTY' : 'HAS_METHOD';
+                result.relationships.push({
+                    id: generateId(memberEdgeType, `${ownerId}->${nodeId}`),
+                    sourceId: ownerId,
+                    targetId: nodeId,
+                    type: memberEdgeType,
+                    confidence: 1.0,
+                    reason: objectLiteralOwnerInfo
+                        ? 'object literal method belongs to exported object binding'
+                        : '',
+                });
+            }
+            // ── Fetch wrapper detection: record functions that call fetch() internally ──
+            if (nodeLabel === 'Function' &&
+                definitionNode &&
+                nameNode &&
+                (language === SupportedLanguages.TypeScript || language === SupportedLanguages.JavaScript)) {
+                if (checkForFetchCall(definitionNode)) {
+                    result.fetchWrapperDefs.push({
+                        filePath: file.path,
+                        functionName: nameNode.text,
+                    });
+                }
+            }
+        }
+        // Extract framework routes via provider detection (e.g., Laravel routes.php)
+        if (provider.isRouteFile?.(file.path)) {
+            const extractedRoutes = extractLaravelRoutes(tree, file.path);
+            for (const r of extractedRoutes)
+                result.routes.push(r);
+        }
+        // Extract tRPC procedure routes from TS/JS router files
+        if ((language === SupportedLanguages.TypeScript || language === SupportedLanguages.JavaScript) &&
+            (file.path.includes('/routers/') ||
+                file.path.includes('/trpc/') ||
+                file.path.includes('/server/'))) {
+            const trpcRoutes = extractTrpcRoutes(file.path, file.content);
+            for (const r of trpcRoutes)
+                result.routes.push(r);
+        }
+        // Extract ORM queries (Prisma, Supabase)
+        extractORMQueries(file.path, parseContent, result.ormQueries);
+        // Extract FastAPI include_router(prefix=...) and `from <mod> import router`
+        // sites. parse-impl aggregates these into a per-module prefix map and
+        // injects the resolved prefix onto each ExtractedDecoratorRoute that
+        // came from a `@router.<verb>` decorator. Python-only.
+        if (language === SupportedLanguages.Python) {
+            extractFastAPIRouterBindings(file.path, parseContent, result.routerIncludes, result.routerImports, (result.routerModuleAliases ??= []), (result.routerConstructorPrefixes ??= []));
+            // #2391: harvest module-level string constants + from-imports so parse-impl
+            // can resolve non-literal decorator route paths cross-file. Only emit for
+            // files that carry something resolvable (a constant definition or an import
+            // binding) to keep the aggregate bounded on large repos.
+            const constants = extractPythonModuleConstants(tree);
+            if (constants.literals.size > 0 || constants.exprs.size > 0 || constants.imports.size > 0) {
+                (result.moduleConstants ??= []).push({ filePath: file.path, constants });
+            }
+        }
+        // Language-specific decorator route extraction via provider hook.
+        // The provider's extractDecoratorRoutes walks the AST for framework-specific
+        // route patterns (e.g., Java Spring class-level prefix joining). Routes are
+        // appended to decoratorRoutes for the routes phase to emit as Route nodes.
+        if (provider.extractDecoratorRoutes) {
+            const frameworkRoutes = provider.extractDecoratorRoutes(tree, file.path, lineOffset);
+            for (const r of frameworkRoutes)
+                result.decoratorRoutes.push(r);
+        }
+        // Project-wide route-inheritance type collection via provider hook (#2288).
+        // The per-file SharedSpringType views are aggregated by the parse phase,
+        // which then resolves interface-inherited routes cross-file.
+        if (provider.extractRouteInheritanceTypes) {
+            const springTypes = provider.extractRouteInheritanceTypes(tree, file.path);
+            if (springTypes.length > 0)
+                (result.springTypes ??= []).push(...springTypes);
+        }
+        // Vue: emit CALLS edges for components used in <template>
+        if (language === SupportedLanguages.Vue) {
+            const templateComponents = extractTemplateComponents(file.content);
+            for (const componentName of templateComponents) {
+                result.calls.push({
+                    filePath: file.path,
+                    calledName: componentName,
+                    sourceId: generateId('File', file.path),
+                    callForm: 'free',
+                });
+            }
+        }
+    }
+};
+// ============================================================================
+// Worker message handler — supports sub-batch streaming
+// ============================================================================
+/** Accumulated result across sub-batches */
+let accumulated = {
+    nodes: [],
+    relationships: [],
+    symbols: [],
+    calls: [],
+    assignments: [],
+    routes: [],
+    fetchCalls: [],
+    fetchWrapperDefs: [],
+    decoratorRoutes: [],
+    routerIncludes: [],
+    routerImports: [],
+    routerConstructorPrefixes: [],
+    routerModuleAliases: [],
+    toolDefs: [],
+    ormQueries: [],
+    constructorBindings: [],
+    fileScopeBindings: [],
+    parsedFiles: [],
+    skippedLanguages: {},
+    cfgSkipped: {},
+    fileCount: 0,
+};
+let cumulativeProcessed = 0;
+// `mergeResult` (+ its `appendAll`) lives in ./result-merge.ts (extracted so it
+// can be unit-tested without importing this entry module).
+// Signal the pool that worker-side initialization (parser imports, language
+// grammars, type-env setup, all helper modules) is complete and the message
+// handler below is about to be attached. The pool's `waitForWorkerReady`
+// resolves on this handshake — without it, a worker that crashes during
+// top-of-script init slips past pool startup (Node's `online` event fires
+// before the script body runs) and the pool only notices via the first
+// dispatch's idle timeout (~30s). Emit once; the dispatch handler treats
+// any subsequent `ready` message as a benign no-op.
+//
+// Native postMessage carries the ready handshake — Node's structured
+// clone delivers `{type:'ready'}` to the pool's waitForWorkerReady
+// listener directly. The pool drops the slot if this isn't seen within
+// `WORKER_READY_TIMEOUT_MS` (5s), so emitting it AFTER all top-of-script
+// init (imports, native binding loads, type-env setup) completes is the
+// load-bearing signal that this worker is ready for dispatch.
+bootstrapLog('ready sent');
+parentPort.postMessage({ type: 'ready' });
+// Module-scope `TextDecoder` for sub-batch content. The pool sends each
+// file's content as a `Uint8Array` (zero-copy ArrayBuffer transfer); we
+// decode to string lazily here, once per file, before handing to
+// tree-sitter. Hoisted to module scope so we don't allocate a new
+// ICU-backed decoder per sub-batch — `TextDecoder.decode()` is
+// stateless across calls and safe to share.
+const sharedContentDecoder = new TextDecoder('utf-8');
+/**
+ * Convert the pool's sub-batch `files` array (content as `Uint8Array`,
+ * transferred zero-copy) into the `ParseWorkerInput[]` shape
+ * `processBatch` expects (content as `string`). This is the one place
+ * the UTF-8 decode happens — runs on the worker thread in parallel with
+ * continued main-thread work.
+ */
+function decodeSubBatchFiles(files) {
+    return files.map((f) => ({
+        path: f.path,
+        // Test scaffolding (the writeReadyWorker preamble that wraps
+        // parentPort.on) may already convert content to string before
+        // calling here; tolerate both shapes so the same worker code
+        // exercises real and synthetic dispatches.
+        content: typeof f.content === 'string' ? f.content : sharedContentDecoder.decode(f.content),
+    }));
+}
+let firstTaskLogged = false;
+parentPort.on('message', (msg) => {
+    if (!firstTaskLogged) {
+        firstTaskLogged = true;
+        bootstrapLog('first task received');
+    }
+    try {
+        // Sub-batch mode: { type: 'sub-batch', files: [...] }
+        if (msg.type === 'sub-batch') {
+            const files = decodeSubBatchFiles(msg.files);
+            const result = processBatch(files, (filesProcessed) => {
+                parentPort.postMessage({
+                    type: 'progress',
+                    filesProcessed: cumulativeProcessed + filesProcessed,
+                });
+            });
+            cumulativeProcessed += result.fileCount;
+            mergeResult(accumulated, result);
+            // Signal ready for next sub-batch
+            parentPort.postMessage({ type: 'sub-batch-done' });
+            return;
+        }
+        // Flush: send accumulated results
+        if (msg.type === 'flush') {
+            // #1983 parallel serialization: when a store path is configured, write
+            // this job's ParsedFiles to our own disk shard HERE (at the flush
+            // boundary, where `accumulated.parsedFiles` is complete) and drop them
+            // from the result so the main thread never deserializes/re-serializes
+            // them. Writing at flush — not per sub-batch — encodes the invariant
+            // "a shard is written iff its result is delivered": a worker that dies
+            // before flush wrote no shard, so the pool's job retry yields exactly
+            // one. `undefined` store path keeps ParsedFiles in the result (no-store
+            // fallback). The write is synchronous: blocking this dedicated worker
+            // thread protects the main thread and avoids threading async through the
+            // accumulate path; per-job write time is small vs the parse it follows.
+            if ((PARSED_FILE_STORE_STORAGE_PATH || DURABLE_PARSED_FILE_STORAGE_PATH) &&
+                accumulated.parsedFiles.length > 0) {
+                const seq = shardSeq++;
+                // #2038 warm-cache coverage: ALSO write a durable, content-addressed
+                // shard keyed by chunk hash so a future warm parse-cache hit (no worker
+                // runs) can restore these ParsedFiles without re-parsing. Same bytes,
+                // same `seq`, so durable and run-scoped shards correlate. Only when the
+                // flush carried a chunk hash (content-addressed dispatch).
+                if (DURABLE_PARSED_FILE_STORAGE_PATH && typeof msg.chunkHash === 'string') {
+                    persistDurableParsedFileShardSync(DURABLE_PARSED_FILE_STORAGE_PATH, msg.chunkHash, threadId, seq, accumulated.parsedFiles);
+                }
+                if (PARSED_FILE_STORE_STORAGE_PATH) {
+                    persistParsedFileShardSync(PARSED_FILE_STORE_STORAGE_PATH, `w${threadId}-${seq}`, accumulated.parsedFiles);
+                    accumulated.parsedFiles = [];
+                }
+            }
+            postResultCloneSafe(accumulated);
+            // Reset for potential reuse
+            accumulated = {
+                nodes: [],
+                relationships: [],
+                symbols: [],
+                calls: [],
+                assignments: [],
+                routes: [],
+                fetchCalls: [],
+                fetchWrapperDefs: [],
+                decoratorRoutes: [],
+                routerIncludes: [],
+                routerImports: [],
+                routerConstructorPrefixes: [],
+                routerModuleAliases: [],
+                toolDefs: [],
+                ormQueries: [],
+                constructorBindings: [],
+                fileScopeBindings: [],
+                parsedFiles: [],
+                skippedLanguages: {},
+                cfgSkipped: {},
+                fileCount: 0,
+            };
+            cumulativeProcessed = 0;
+            return;
+        }
+    }
+    catch (err) {
+        // Carry the worker-side stack across the MessageChannel, not just the
+        // message. Without this, an unexpected worker throw (e.g. the minified
+        // `this.#<x> is not a function` family) reaches the operator as a bare
+        // one-liner with no file:line — exactly what made #2068 undebuggable. The
+        // pool embeds `errorStack` into its death/circuit-breaker reason so the
+        // surfaced "Phase 'parse' failed" message points at the real frame (the
+        // stack's first line already carries the error's type + message). We send
+        // primitive fields (not the raw Error) so a non-cloneable `cause` payload
+        // can never turn the report itself into a `messageerror`. `errorStack` is
+        // optional on the wire, so an older pool ignores it.
+        const e = err instanceof Error ? err : new Error(String(err));
+        parentPort.postMessage({
+            type: 'error',
+            error: e.message,
+            errorStack: e.stack,
+        });
+    }
+});

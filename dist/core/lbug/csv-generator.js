@@ -1,0 +1,744 @@
+/**
+ * CSV Generator for LadybugDB Hybrid Schema
+ *
+ * Streams CSV rows directly to disk files in a single pass over graph nodes.
+ * File contents are lazy-read from disk per-node to avoid holding the entire
+ * repo in RAM. Rows are buffered (FLUSH_BYTES) before writing to minimize
+ * per-row Promise overhead.
+ *
+ * RFC 4180 Compliant:
+ * - Fields containing commas, double quotes, or newlines are enclosed in double quotes
+ * - Double quotes within fields are escaped by doubling them ("")
+ * - All fields are consistently quoted for safety with code content
+ */
+import fs from 'fs/promises';
+import { createWriteStream } from 'fs';
+import path from 'path';
+import { RELATION_SCHEMA } from './schema.js';
+import { VALID_NODE_TABLES, parseRelationSchemaPairs, RelPairRouter } from './rel-pair-routing.js';
+import { parseTruthyEnv } from '../ingestion/utils/env.js';
+import { SYMBOL_NODE_LABELS } from '../ingestion/utils/symbol-labels.js';
+import { applyCjkSegmentationIfEnabled } from '../search/cjk-segmentation.js';
+/** Computed once — `RELATION_SCHEMA` is a static template literal. Exported so
+ *  the streamed sinks (`GraphEmitSink`, `PdgEmitSink`) share this parse
+ *  instead of each re-deriving it from the same DDL string. */
+export const DECLARED_RELATION_PAIRS = parseRelationSchemaPairs(RELATION_SCHEMA);
+/**
+ * Deterministic output ordering — optional (out-of-core / windowed-resolve
+ * enabler). When `GITNEXUS_SORT_GRAPH_OUTPUT` is set, nodes and relationships
+ * are emitted sorted by their (unique, dedup-key) graph `id` rather than in
+ * graph-insertion order, making the CSV a pure function of the graph's node/edge
+ * SET instead of of emit order. Default off returns the iterator untouched, so
+ * the bytes are identical to today. With it on, a windowed/out-of-core emit
+ * (the later windowed-resolve work) need only reproduce the same edge SET, not the global insertion order —
+ * which removes "CSV row order == Map insertion order" as a byte-identical
+ * hazard for every later windowing step.
+ */
+const byGraphId = (a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+const orderedNodes = (graph, sorted) => sorted ? [...graph.iterNodes()].sort(byGraphId) : graph.iterNodes();
+const orderedRelationships = (graph, sorted) => sorted ? [...graph.iterRelationships()].sort(byGraphId) : graph.iterRelationships();
+/**
+ * Flush buffered rows to disk once the buffered chunk reaches this many bytes.
+ * Byte-bounded rather than row-count-bounded: row size ranges from a few dozen
+ * bytes (typical symbol/relationship rows) up to a full File's content
+ * (#2317/#2323), so a row-count-only cap lets a handful of huge rows build an
+ * unbounded `buffer.join('\n')` string before ever tripping it.
+ *
+ * Not an env knob — fixed by a safety margin, not a preference. The one worst
+ * case that matters: one more oversized row lands right after the buffer was
+ * just under this threshold, before the flush fires. That row is capped at
+ * TREE_SITTER_MAX_BUFFER (32MB, hard-clamped — GITNEXUS_MAX_FILE_SIZE cannot
+ * raise it). Two transforms can each grow it before it reaches the buffer:
+ * `applyCjkSegmentationIfEnabled` (#2331, `CJK_BIGRAM_WORST_CASE_GROWTH_FACTOR`
+ * on an all-CJK row when `GITNEXUS_FTS_CJK_SEGMENTATION=bigram` — the single
+ * source of truth for that ratio, imported by the paired test) and
+ * `escapeCSVField`'s worst-case quote-doubling (2x). So the peak joined-string
+ * size is bounded by
+ *   FLUSH_BYTES + 2 * CJK_BIGRAM_WORST_CASE_GROWTH_FACTOR * TREE_SITTER_MAX_BUFFER
+ *     ≈ 8MB + 149MB ≈ 157MB,
+ * versus Node's `buffer.constants.MAX_STRING_LENGTH` (~512MB) — the test
+ * actually enforces half of that (~256MB), for a ~1.63x margin (see the
+ * `shouldFlushCSVBuffer stays within the V8 string-length ceiling` test,
+ * which fails loudly if any of these constants ever moves this margin the
+ * wrong way). With segmentation disabled (default), the old ~3.56x margin
+ * still applies. Raising FLUSH_BYTES trades fewer/larger flushes for less
+ * margin; lowering it trades the reverse for lower peak transient memory.
+ * Change the constant directly if a real workload needs a different point on
+ * that curve — a per-host env var would let the margin get silently
+ * reintroduced by an operator with no way to know why 512MB is dangerous.
+ */
+export const FLUSH_BYTES = 8 * 1024 * 1024;
+export const shouldFlushCSVBuffer = (byteCount) => byteCount >= FLUSH_BYTES;
+/**
+ * Yield the event loop every N relationship rows during the emit pass (#2226 F4)
+ * so a concurrent node COPY (the overlap in loadGraphToLbug) and write-stream
+ * drain callbacks get scheduling time during long synchronous emit stretches.
+ * Scheduling-only — never changes row content or order (byte-identical). Tuning
+ * constant, not load-bearing.
+ */
+const REL_YIELD_EVERY = 5000;
+// ============================================================================
+// CSV ESCAPE UTILITIES
+// ============================================================================
+export const sanitizeUTF8 = (str) => {
+    return str
+        .replace(/\r\n/g, '\n')
+        .replace(/\r/g, '\n')
+        .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '')
+        .replace(/[\uD800-\uDFFF]/g, '')
+        .replace(/[\uFFFE\uFFFF]/g, '');
+};
+export const escapeCSVField = (value) => {
+    if (value === undefined || value === null)
+        return '""';
+    let str = String(value);
+    str = sanitizeUTF8(str);
+    return `"${str.replace(/"/g, '""')}"`;
+};
+export const escapeCSVNumber = (value, defaultValue = -1) => {
+    if (value === undefined || value === null)
+        return String(defaultValue);
+    return String(value);
+};
+const formatCSVStringArray = (value) => {
+    const items = Array.isArray(value)
+        ? value.filter((item) => typeof item === 'string')
+        : [];
+    const unsafe = items.find((item) => /[,\[\]'"\n\r]/.test(item));
+    if (unsafe !== undefined) {
+        throw new Error(`Cannot safely encode CSV string-list item: ${JSON.stringify(unsafe)}`);
+    }
+    return `[${items.join(',')}]`;
+};
+// ============================================================================
+// CONTENT EXTRACTION (lazy — reads from disk on demand)
+// ============================================================================
+const BINARY_SAMPLE_CHARS = 1000;
+const UNICODE_REPLACEMENT_CHAR = 0xfffd;
+/**
+ * Did this text come from a binary payload? Density of non-printables over the
+ * first {@link BINARY_SAMPLE_CHARS} characters, above 10%.
+ *
+ * U+FFFD counts, and it is the character that matters most here (#2889). Every
+ * source file enters the pipeline through a `utf-8` decode — the content cache
+ * below reads with `fs.readFile(path, 'utf-8')`, and the parse worker decodes
+ * the same way. That decode is lossy and total: an invalid byte sequence never
+ * survives as invalid bytes, it is REPLACED with U+FFFD. So the embedded-binary
+ * payloads #2889 describes (webpack bundles, class-file constant pools,
+ * serialized objects inside .js/.vue sources) arrive here as long runs of
+ * U+FFFD, not as the control bytes this scan was originally written to count —
+ * charCode 0xFFFD is neither `< 9`, nor between 13 and 32, nor 127, so the
+ * detector scored a wholly corrupt payload as clean text and every caller waved
+ * it through.
+ *
+ * The threshold stays at 10%: a legitimate source file carries no replacement
+ * characters at all unless it was mis-decoded, and a handful (a stray latin-1
+ * comment, one bad byte in a license header) still scores far under the bar.
+ * Density rather than "contains any binary run" is deliberate — a description
+ * that is mostly real prose with one stray replacement character is worth more
+ * indexed than dropped.
+ */
+export const isBinaryContent = (content) => {
+    // `content &&` keeps the original tolerance for a null/undefined caller —
+    // `strict` is off in this package, so the type alone does not rule it out.
+    const end = content ? Math.min(content.length, BINARY_SAMPLE_CHARS) : 0;
+    if (end === 0)
+        return false;
+    let nonPrintable = 0;
+    for (let i = 0; i < end; i++) {
+        const code = content.charCodeAt(i);
+        if (code < 9 || (code > 13 && code < 32) || code === 127 || code === UNICODE_REPLACEMENT_CHAR)
+            nonPrintable++;
+    }
+    return nonPrintable / end > 0.1;
+};
+/**
+ * LRU content cache — avoids re-reading the same source file for every
+ * symbol defined in it. Sized generously so most files stay cached during
+ * the single-pass node iteration.
+ */
+class FileContentCache {
+    cache = new Map();
+    accessOrder = [];
+    maxSize;
+    repoPath;
+    constructor(repoPath, maxSize = 3000) {
+        this.repoPath = repoPath;
+        this.maxSize = maxSize;
+    }
+    async get(relativePath) {
+        if (!relativePath)
+            return '';
+        const cached = this.cache.get(relativePath);
+        if (cached !== undefined) {
+            // Move to end of accessOrder (LRU promotion)
+            const idx = this.accessOrder.indexOf(relativePath);
+            if (idx !== -1) {
+                this.accessOrder.splice(idx, 1);
+                this.accessOrder.push(relativePath);
+            }
+            return cached;
+        }
+        try {
+            const fullPath = path.join(this.repoPath, relativePath);
+            const content = await fs.readFile(fullPath, 'utf-8');
+            this.set(relativePath, content);
+            return content;
+        }
+        catch {
+            this.set(relativePath, '');
+            return '';
+        }
+    }
+    set(key, value) {
+        if (this.cache.size >= this.maxSize) {
+            const oldest = this.accessOrder.shift();
+            if (oldest)
+                this.cache.delete(oldest);
+        }
+        this.cache.set(key, value);
+        this.accessOrder.push(key);
+    }
+}
+/**
+ * Flatten newlines and tabs to single spaces for FTS-indexed text columns
+ * (`content`, `description`) — the real fix for #2317.
+ *
+ * Ladybug's full-text-search tokenizer splits ONLY on the space character —
+ * `\n`, `\r`, and `\t` are NOT token delimiters. So multiline text indexes as
+ * a handful of giant tokens (each whole line, joined across lines), and a
+ * word query matches none of them: `searchFTSFromLbug('foo')` misses a file
+ * whose content is `... \nfoo\n ...`. Removing the 10KB cap (#2333/#2317)
+ * stores the full body but leaves it unsearchable; collapsing intra-text
+ * whitespace to spaces is what actually makes every word searchable.
+ *
+ * This rewrites the STORED column too (the same value is COPYed in), so File
+ * content returned via the graph API is space-flattened — an accepted trade
+ * for making file/symbol text searchable. Leading/trailing/empty are no-ops.
+ *
+ * Callers apply `applyCjkSegmentationIfEnabled` (#2331) to the text *before*
+ * this flatten, so a CJK phrase split across a line-wrap loses its boundary
+ * bigram (run detection resets at whitespace) — an accepted limitation, see
+ * the plan's Scope Boundaries.
+ *
+ * Exported (#2339) so `bm25-index.ts`'s query path can compose it in the
+ * same order on incoming search queries, keeping index-time and query-time
+ * text transforms symmetric — a literal tab/newline in a query would
+ * otherwise fail to match whitespace-normalized indexed content.
+ */
+export const normalizeFtsText = (text) => text.replace(/[\r\n\t]+/g, ' ');
+/**
+ * Composes both FTS-text transforms for the `description` column — one place for
+ * the six emission sites below to call, instead of repeating the composition.
+ *
+ * Binary-looking descriptions are dropped rather than transformed (#2889). The
+ * `content` column has always been gated on {@link isBinaryContent} inside
+ * {@link extractContent}; `description` never was, so a symbol whose "doc
+ * comment" is really a slice of an embedded binary payload had that payload
+ * copied verbatim into an FTS-indexed column. Dropping it here rather than at
+ * each of the six call sites keeps the gate in the same place as the transforms
+ * it guards. Empty string, not a sentinel: unlike `content`, a description has
+ * no reader that needs to be told why it is missing.
+ */
+const formatFtsDescription = (description) => isBinaryContent(description) ? '' : normalizeFtsText(applyCjkSegmentationIfEnabled(description));
+// Labels that get exact source-span content (no ±2 window). Single source of
+// truth in `symbol-labels.ts` — see there for why the exactness depends on the
+// 0-based line invariant. Kept as a named alias to read intent at the use site.
+const EXACT_SYMBOL_CONTENT_LABELS = SYMBOL_NODE_LABELS;
+const extractContent = async (node, contentCache) => {
+    const filePath = node.properties.filePath;
+    const content = await contentCache.get(filePath);
+    if (!content)
+        return '';
+    if (node.label === 'Folder')
+        return '';
+    if (isBinaryContent(content))
+        return '[Binary file - content not stored]';
+    // File content is stored in full — intentionally NOT length-capped here, so
+    // text past the old 10KB cutoff stays FTS-searchable (#2317). It is already
+    // bounded upstream by the walker's max-file-size cap (512KB default / 32MB),
+    // and only whitespace-normalized for the tokenizer. The symbol snippet path
+    // below, by contrast, deliberately stays capped at MAX_SNIPPET.
+    if (node.label === 'File') {
+        return normalizeFtsText(applyCjkSegmentationIfEnabled(content));
+    }
+    const startLine = node.properties.startLine;
+    const endLine = node.properties.endLine;
+    if (startLine === undefined || endLine === undefined)
+        return '';
+    const lines = content.split('\n');
+    const exactSymbolContent = EXACT_SYMBOL_CONTENT_LABELS.has(node.label);
+    const start = Math.max(0, exactSymbolContent ? startLine : startLine - 2);
+    const end = Math.min(lines.length - 1, exactSymbolContent ? endLine : endLine + 2);
+    const snippet = lines.slice(start, end + 1).join('\n');
+    const MAX_SNIPPET = 5000;
+    const capped = snippet.length > MAX_SNIPPET ? snippet.slice(0, MAX_SNIPPET) + '\n... [truncated]' : snippet;
+    return normalizeFtsText(applyCjkSegmentationIfEnabled(capped));
+};
+// ============================================================================
+// BUFFERED CSV WRITER
+// ============================================================================
+class BufferedCSVWriter {
+    ws;
+    buffer = [];
+    bufferedBytes = 0;
+    rows = 0;
+    constructor(filePath, header) {
+        this.ws = createWriteStream(filePath, 'utf-8');
+        // Large repos flush many times — raise listener cap to avoid MaxListenersExceededWarning
+        this.ws.setMaxListeners(50);
+        this.buffer.push(header);
+        this.bufferedBytes = Buffer.byteLength(header) + 1;
+    }
+    /**
+     * Buffer a row. Returns a promise ONLY when the buffer crossed FLUSH_BYTES
+     * and a disk write was issued; otherwise returns `undefined` so the caller
+     * can skip awaiting (#2203 U3) — avoiding a microtask tick on every buffered
+     * row (millions at scale). The flush promise still resolves on drain, so
+     * backpressure is preserved on the rows that actually write.
+     */
+    addRow(row) {
+        this.buffer.push(row);
+        this.bufferedBytes += Buffer.byteLength(row) + 1;
+        this.rows++;
+        if (shouldFlushCSVBuffer(this.bufferedBytes)) {
+            return this.flush();
+        }
+        return undefined;
+    }
+    flush() {
+        if (this.buffer.length === 0)
+            return Promise.resolve();
+        const chunk = this.buffer.join('\n') + '\n';
+        this.buffer.length = 0;
+        this.bufferedBytes = 0;
+        return new Promise((resolve, reject) => {
+            this.ws.once('error', reject);
+            const ok = this.ws.write(chunk);
+            if (ok) {
+                this.ws.removeListener('error', reject);
+                resolve();
+            }
+            else {
+                this.ws.once('drain', () => {
+                    this.ws.removeListener('error', reject);
+                    resolve();
+                });
+            }
+        });
+    }
+    async finish() {
+        await this.flush();
+        return new Promise((resolve, reject) => {
+            this.ws.end(() => resolve());
+            this.ws.on('error', reject);
+        });
+    }
+}
+// ============================================================================
+// STREAMING CSV GENERATION — SINGLE PASS
+// ============================================================================
+/** Canonical relationship CSV header — shared by the emit pass and the
+ * `splitRelCsvByLabelPair` differential oracle. */
+export const REL_CSV_HEADER = 'from,to,type,confidence,reason,step';
+/** Build the escaped CSV row (no trailing newline) for one relationship.
+ * Single source of the relationship row bytes — used by the emit pass and by
+ * the byte-identity differential test that feeds the legacy split oracle. */
+export const buildRelRow = (rel) => [
+    escapeCSVField(rel.sourceId),
+    escapeCSVField(rel.targetId),
+    escapeCSVField(rel.type),
+    escapeCSVNumber(rel.confidence, 1.0),
+    escapeCSVField(rel.reason),
+    escapeCSVNumber(rel.step, 0),
+].join(',');
+/** Canonical BasicBlock node CSV header — taint/PDG substrate (issue #2080).
+ * No `name` column; blocks are identified by id + source span. Shared by the
+ * whole-graph emit pass and the streaming PDG emit sink (issue #2202) so the
+ * two paths produce byte-identical BasicBlock rows by construction. */
+export const BASICBLOCK_CSV_HEADER = 'id,filePath,startLine,endLine,text,callees,calleeIds';
+/** Build the escaped CSV row (no trailing newline) for one BasicBlock node.
+ * Single source of the BasicBlock row bytes — used by `streamAllCSVsToDisk`
+ * and by the streaming `PdgEmitSink` (issue #2202). `callees` is a comma-free
+ * (space-joined) list of the leaf callee names invoked in the block — the
+ * statement-precise inter-procedural reach substrate (the field is itself a CSV
+ * cell, so the inner separator must NOT be a comma). `calleeIds` is the SOUND
+ * parallel to `callees`: the space-joined RESOLVED callee symbol ids for the
+ * block (#2227 follow-up), likewise a comma-free cell. */
+export const buildBasicBlockRow = (node) => [
+    escapeCSVField(node.id),
+    escapeCSVField(node.properties.filePath || ''),
+    escapeCSVNumber(node.properties.startLine, -1),
+    escapeCSVNumber(node.properties.endLine, -1),
+    escapeCSVField(node.properties.text || ''),
+    escapeCSVField(String(node.properties.callees ?? '')),
+    escapeCSVField(String(node.properties.calleeIds ?? '')),
+].join(',');
+/**
+ * Stream all CSV data directly to disk files.
+ * Iterates graph nodes exactly ONCE — routes each node to the right writer.
+ * File contents are lazy-read from disk with a generous LRU cache.
+ *
+ * `onNodePhaseComplete` (optional, #2203 parallelism leg): fired exactly once,
+ * right after every node CSV is fully flushed to disk and BEFORE the
+ * relationship pass starts writing any `rel_*.csv`. It receives the finished
+ * node-file manifest so the caller can begin `COPY`-ing nodes while this
+ * function keeps generating relationship CSVs (the only single-writer-safe
+ * overlap — node `COPY` ‖ relationship emit). It is intentionally NOT awaited:
+ * the relationship pass proceeds concurrently with whatever the caller
+ * schedules. A synchronous throw from the callback is allowed and propagates out
+ * of this function (rejecting the returned promise) — it is raised before the
+ * relationship pass begins, so no `rel_*.csv` is written; `loadGraphToLbug` uses
+ * this to surface its PDG-manifest collision guard. The callback must NOT, however,
+ * schedule un-awaited async work that can reject unobserved. Absent ⇒ today's
+ * behavior, byte-for-byte.
+ */
+export const streamAllCSVsToDisk = async (graph, repoPath, csvDir, onNodePhaseComplete) => {
+    // Deterministic (id-sorted) node/relationship row order when enabled;
+    // default off = today's graph-insertion order (byte-identical).
+    const sortOutput = parseTruthyEnv(process.env.GITNEXUS_SORT_GRAPH_OUTPUT);
+    // Remove stale CSVs from previous crashed runs, then recreate
+    try {
+        await fs.rm(csvDir, { recursive: true, force: true });
+    }
+    catch { }
+    await fs.mkdir(csvDir, { recursive: true });
+    // We open ~30 concurrent write-streams; raise process limit to suppress
+    // MaxListenersExceededWarning (restored after all streams finish).
+    const prevMax = process.getMaxListeners();
+    process.setMaxListeners(prevMax + 40);
+    // try/finally so the listener bump is ALWAYS restored — including the
+    // rel-routing throw path (#2203 U2) and any node-writer finish() rejection,
+    // not just the success path (avoids leaking +40 listeners across failed runs
+    // in long-lived hosts / the test suite).
+    try {
+        const contentCache = new FileContentCache(repoPath);
+        // Create writers for every node type up-front
+        const fileWriter = new BufferedCSVWriter(path.join(csvDir, 'file.csv'), 'id,name,filePath,content');
+        const folderWriter = new BufferedCSVWriter(path.join(csvDir, 'folder.csv'), 'id,name,filePath');
+        const codeElementHeader = 'id,name,filePath,startLine,endLine,isExported,content,description';
+        const functionWriter = new BufferedCSVWriter(path.join(csvDir, 'function.csv'), codeElementHeader);
+        const classWriter = new BufferedCSVWriter(path.join(csvDir, 'class.csv'), `${codeElementHeader},frameworkAnnotations`);
+        const interfaceWriter = new BufferedCSVWriter(path.join(csvDir, 'interface.csv'), codeElementHeader);
+        const methodHeader = 'id,name,filePath,startLine,endLine,isExported,content,description,parameterCount,returnType';
+        const methodWriter = new BufferedCSVWriter(path.join(csvDir, 'method.csv'), methodHeader);
+        const codeElemWriter = new BufferedCSVWriter(path.join(csvDir, 'codeelement.csv'), codeElementHeader);
+        const communityWriter = new BufferedCSVWriter(path.join(csvDir, 'community.csv'), 'id,label,heuristicLabel,keywords,description,enrichedBy,cohesion,symbolCount');
+        const processWriter = new BufferedCSVWriter(path.join(csvDir, 'process.csv'), 'id,label,heuristicLabel,processType,stepCount,communities,entryPointId,terminalId');
+        // Section nodes have an extra 'level' column
+        const sectionWriter = new BufferedCSVWriter(path.join(csvDir, 'section.csv'), 'id,name,filePath,startLine,endLine,level,content,description');
+        // Route nodes for API endpoint mapping
+        const routeWriter = new BufferedCSVWriter(path.join(csvDir, 'route.csv'), 'id,name,filePath,responseKeys,errorKeys,middleware,method,handlerSymbolId');
+        // Tool nodes for MCP tool definitions
+        const toolWriter = new BufferedCSVWriter(path.join(csvDir, 'tool.csv'), 'id,name,filePath,description');
+        // BasicBlock nodes — taint/PDG substrate (issue #2080). No `name` column;
+        // blocks are identified by id + source span. Emitted by no phase yet.
+        const basicBlockWriter = new BufferedCSVWriter(path.join(csvDir, 'basicblock.csv'), BASICBLOCK_CSV_HEADER);
+        // Multi-language node types share the same CSV shape (no isExported column)
+        const multiLangHeader = 'id,name,filePath,startLine,endLine,content,description';
+        const MULTI_LANG_TYPES = [
+            'Struct',
+            'Enum',
+            'Macro',
+            'Typedef',
+            'Union',
+            'Namespace',
+            'Trait',
+            'Impl',
+            'TypeAlias',
+            'Const',
+            'Static',
+            'Variable',
+            'Property',
+            'Record',
+            'Delegate',
+            'Annotation',
+            'Constructor',
+            'Template',
+            'Module',
+        ];
+        const propertyHeader = 'id,name,filePath,startLine,endLine,content,description,declaredType,isDetail';
+        const multiLangWriters = new Map();
+        for (const t of MULTI_LANG_TYPES) {
+            multiLangWriters.set(t, new BufferedCSVWriter(path.join(csvDir, `${t.toLowerCase()}.csv`), t === 'Property' ? propertyHeader : multiLangHeader));
+        }
+        const codeWriterMap = {
+            Function: functionWriter,
+            Class: classWriter,
+            Interface: interfaceWriter,
+            CodeElement: codeElemWriter,
+        };
+        // Deduplicate all node types — the pipeline can produce duplicate IDs across
+        // all symbol types (Class, Method, Function, etc.), not just File nodes.
+        // A single Set covering every label prevents PK violations on COPY.
+        const seenNodeIds = new Set();
+        // --- SINGLE PASS over all nodes ---
+        for (const node of orderedNodes(graph, sortOutput)) {
+            if (seenNodeIds.has(node.id))
+                continue;
+            seenNodeIds.add(node.id);
+            // addRow returns a promise only when it flushes; awaiting it once after the
+            // switch (instead of `await`-ing every addRow) skips a per-row microtask
+            // tick on the rows buffered between byte-bounded flushes (#2203 U3).
+            let pending;
+            switch (node.label) {
+                case 'File': {
+                    const content = await extractContent(node, contentCache);
+                    pending = fileWriter.addRow([
+                        escapeCSVField(node.id),
+                        escapeCSVField(node.properties.name || ''),
+                        escapeCSVField(node.properties.filePath || ''),
+                        escapeCSVField(content),
+                    ].join(','));
+                    break;
+                }
+                case 'Folder':
+                    pending = folderWriter.addRow([
+                        escapeCSVField(node.id),
+                        escapeCSVField(node.properties.name || ''),
+                        escapeCSVField(node.properties.filePath || ''),
+                    ].join(','));
+                    break;
+                case 'Community': {
+                    const keywords = node.properties.keywords || [];
+                    const keywordsStr = `[${keywords.map((k) => `'${k.replace(/\\/g, '\\\\').replace(/'/g, "''").replace(/,/g, '\\,')}'`).join(',')}]`;
+                    pending = communityWriter.addRow([
+                        escapeCSVField(node.id),
+                        escapeCSVField(node.properties.name || ''),
+                        escapeCSVField(node.properties.heuristicLabel || ''),
+                        keywordsStr,
+                        escapeCSVField(formatFtsDescription(node.properties.description || '')),
+                        escapeCSVField(node.properties.enrichedBy || 'heuristic'),
+                        escapeCSVNumber(node.properties.cohesion, 0),
+                        escapeCSVNumber(node.properties.symbolCount, 0),
+                    ].join(','));
+                    break;
+                }
+                case 'Process': {
+                    const communities = node.properties.communities || [];
+                    const communitiesStr = `[${communities.map((c) => `'${c.replace(/'/g, "''")}'`).join(',')}]`;
+                    pending = processWriter.addRow([
+                        escapeCSVField(node.id),
+                        escapeCSVField(node.properties.name || ''),
+                        escapeCSVField(node.properties.heuristicLabel || ''),
+                        escapeCSVField(node.properties.processType || ''),
+                        escapeCSVNumber(node.properties.stepCount, 0),
+                        escapeCSVField(communitiesStr),
+                        escapeCSVField(node.properties.entryPointId || ''),
+                        escapeCSVField(node.properties.terminalId || ''),
+                    ].join(','));
+                    break;
+                }
+                case 'Method': {
+                    const content = await extractContent(node, contentCache);
+                    pending = methodWriter.addRow([
+                        escapeCSVField(node.id),
+                        escapeCSVField(node.properties.name || ''),
+                        escapeCSVField(node.properties.filePath || ''),
+                        escapeCSVNumber(node.properties.startLine, -1),
+                        escapeCSVNumber(node.properties.endLine, -1),
+                        node.properties.isExported ? 'true' : 'false',
+                        escapeCSVField(content),
+                        escapeCSVField(formatFtsDescription(node.properties.description || '')),
+                        escapeCSVNumber(node.properties.parameterCount, 0),
+                        escapeCSVField(node.properties.returnType || ''),
+                    ].join(','));
+                    break;
+                }
+                case 'Section': {
+                    const content = await extractContent(node, contentCache);
+                    pending = sectionWriter.addRow([
+                        escapeCSVField(node.id),
+                        escapeCSVField(node.properties.name || ''),
+                        escapeCSVField(node.properties.filePath || ''),
+                        escapeCSVNumber(node.properties.startLine, -1),
+                        escapeCSVNumber(node.properties.endLine, -1),
+                        escapeCSVNumber(node.properties.level, 1),
+                        escapeCSVField(content),
+                        escapeCSVField(formatFtsDescription(node.properties.description || '')),
+                    ].join(','));
+                    break;
+                }
+                case 'Route': {
+                    const responseKeys = node.properties.responseKeys || [];
+                    // LadybugDB array literal inside a quoted CSV field: escapeCSVField wraps in "..."
+                    // and the array uses single-quoted elements
+                    const keysStr = `[${responseKeys.map((k) => `'${k.replace(/'/g, "''")}'`).join(',')}]`;
+                    const errorKeys = node.properties.errorKeys || [];
+                    const errorKeysStr = `[${errorKeys.map((k) => `'${k.replace(/'/g, "''")}'`).join(',')}]`;
+                    const middleware = node.properties.middleware || [];
+                    const middlewareStr = `[${middleware.map((m) => `'${m.replace(/'/g, "''")}'`).join(',')}]`;
+                    pending = routeWriter.addRow([
+                        escapeCSVField(node.id),
+                        escapeCSVField(node.properties.name || ''),
+                        escapeCSVField(node.properties.filePath || ''),
+                        escapeCSVField(keysStr),
+                        escapeCSVField(errorKeysStr),
+                        escapeCSVField(middlewareStr),
+                        escapeCSVField(String(node.properties.method ?? '')),
+                        escapeCSVField(String(node.properties.handlerSymbolId ?? '')),
+                    ].join(','));
+                    break;
+                }
+                case 'Tool':
+                    pending = toolWriter.addRow([
+                        escapeCSVField(node.id),
+                        escapeCSVField(node.properties.name || ''),
+                        escapeCSVField(node.properties.filePath || ''),
+                        escapeCSVField(formatFtsDescription(node.properties.description || '')),
+                    ].join(','));
+                    break;
+                case 'BasicBlock':
+                    pending = basicBlockWriter.addRow(buildBasicBlockRow(node));
+                    break;
+                default: {
+                    // Code element nodes (Function, Class, Interface, CodeElement)
+                    const writer = codeWriterMap[node.label];
+                    if (writer) {
+                        const content = await extractContent(node, contentCache);
+                        const row = [
+                            escapeCSVField(node.id),
+                            escapeCSVField(node.properties.name || ''),
+                            escapeCSVField(node.properties.filePath || ''),
+                            escapeCSVNumber(node.properties.startLine, -1),
+                            escapeCSVNumber(node.properties.endLine, -1),
+                            node.properties.isExported ? 'true' : 'false',
+                            escapeCSVField(content),
+                            escapeCSVField(formatFtsDescription(node.properties.description || '')),
+                        ];
+                        if (node.label === 'Class') {
+                            row.push(escapeCSVField(formatCSVStringArray(node.properties.frameworkAnnotations)));
+                        }
+                        pending = writer.addRow(row.join(','));
+                    }
+                    else {
+                        // Multi-language node types (Struct, Impl, Trait, Macro, etc.)
+                        const mlWriter = multiLangWriters.get(node.label);
+                        if (mlWriter) {
+                            const content = await extractContent(node, contentCache);
+                            pending = mlWriter.addRow([
+                                escapeCSVField(node.id),
+                                escapeCSVField(node.properties.name || ''),
+                                escapeCSVField(node.properties.filePath || ''),
+                                escapeCSVNumber(node.properties.startLine, -1),
+                                escapeCSVNumber(node.properties.endLine, -1),
+                                escapeCSVField(content),
+                                escapeCSVField(formatFtsDescription(node.properties.description || '')),
+                                ...(node.label === 'Property'
+                                    ? [
+                                        escapeCSVField(node.properties.declaredType || ''),
+                                        // R3-4 detail symbols — see PROPERTY_SCHEMA. Written as
+                                        // an explicit boolean so the column is never empty; an
+                                        // empty BOOLEAN cell fails the COPY.
+                                        node.properties.isDetail === true ? 'true' : 'false',
+                                    ]
+                                    : []),
+                            ].join(','));
+                        }
+                        else {
+                            // Unknown label: not in codeWriterMap or multiLangWriters, so there
+                            // is no CSV table for it and it is intentionally NOT persisted —
+                            // `pending` stays undefined, so the loop awaits nothing. Made
+                            // explicit so a future node type isn't silently dropped here: wire
+                            // it into one of the writer maps above (or this branch).
+                        }
+                    }
+                    break;
+                }
+            }
+            if (pending)
+                await pending;
+        }
+        // Finish all node writers
+        const allWriters = [
+            fileWriter,
+            folderWriter,
+            functionWriter,
+            classWriter,
+            interfaceWriter,
+            methodWriter,
+            codeElemWriter,
+            communityWriter,
+            processWriter,
+            sectionWriter,
+            routeWriter,
+            toolWriter,
+            basicBlockWriter,
+            ...multiLangWriters.values(),
+        ];
+        await Promise.all(allWriters.map((w) => w.finish()));
+        // Build the node-file manifest now (all writers are flushed; `.rows` is
+        // final). Hoisted above the relationship pass so `onNodePhaseComplete` can
+        // hand the caller a complete node manifest to start COPY-ing while we keep
+        // generating relationship CSVs below (#2203 overlap). The same map is
+        // returned, so the result is unchanged when no callback is supplied.
+        const nodeFiles = new Map();
+        const tableMap = [
+            ['File', fileWriter],
+            ['Folder', folderWriter],
+            ['Function', functionWriter],
+            ['Class', classWriter],
+            ['Interface', interfaceWriter],
+            ['Method', methodWriter],
+            ['CodeElement', codeElemWriter],
+            ['Community', communityWriter],
+            ['Process', processWriter],
+            ['Section', sectionWriter],
+            ['Route', routeWriter],
+            ['Tool', toolWriter],
+            ['BasicBlock', basicBlockWriter],
+            ...Array.from(multiLangWriters.entries()).map(([name, w]) => [name, w]),
+        ];
+        for (const [name, writer] of tableMap) {
+            if (writer.rows > 0) {
+                nodeFiles.set(name, {
+                    csvPath: path.join(csvDir, `${name.toLowerCase()}.csv`),
+                    rows: writer.rows,
+                });
+            }
+        }
+        // Node CSVs are on disk; relationship CSVs have not been touched yet. Hand
+        // the manifest to the caller (not awaited — the rel pass runs concurrently).
+        onNodePhaseComplete?.(nodeFiles);
+        // --- Stream relationships directly to per-FROM→TO-label-pair files ---
+        // (#2203 U2) Route every edge to its pair file in this single pass. The old
+        // monolithic relations.csv — and its line-by-line re-read + per-edge regex
+        // re-split in loadGraphToLbug — are gone, so the ~1M-edge set is written and
+        // read once instead of twice. The router applies the SAME label-derivation +
+        // validTables filter as the legacy splitRelCsvByLabelPair, so the per-pair
+        // files are byte-identical (asserted by the differential test).
+        const relRouter = new RelPairRouter(csvDir, REL_CSV_HEADER, VALID_NODE_TABLES, DECLARED_RELATION_PAIRS);
+        try {
+            let emitted = 0;
+            for (const rel of orderedRelationships(graph, sortOutput)) {
+                const pending = relRouter.route(rel.sourceId, rel.targetId, buildRelRow(rel), rel.type);
+                if (pending)
+                    await pending;
+                // Periodically hand the event loop back so the overlapped node COPY and
+                // write-stream drains run instead of starving behind this synchronous
+                // loop (#2226 F4). No effect on emitted bytes — pure scheduling.
+                if (++emitted % REL_YIELD_EVERY === 0)
+                    await new Promise((r) => setImmediate(r));
+            }
+            await relRouter.close();
+        }
+        catch (err) {
+            relRouter.destroy();
+            // Rethrow the real stream error (EMFILE / disk-full) rather than the generic
+            // AbortError a pending drain-await rejects with — mirrors the retained
+            // splitRelCsvByLabelPair's `throw streamError ?? err`.
+            throw relRouter.lastError ?? err;
+        }
+        return {
+            nodeFiles,
+            relsByPair: relRouter.byPair,
+            relHeader: REL_CSV_HEADER,
+            skippedRels: relRouter.skipped,
+            totalValidRels: relRouter.total,
+        };
+    }
+    finally {
+        // Restore original process listener limit on every path (success or throw).
+        process.setMaxListeners(prevMax);
+    }
+};
