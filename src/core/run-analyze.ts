@@ -21,6 +21,7 @@ import {
   logUnresolvedReceiverFiles,
   summarizeUnresolvedReceivers,
 } from './ingestion/scope-resolution/unresolved-receivers.js';
+import { summarizeUndecidedSatisfaction } from './ingestion/scope-resolution/undecided-satisfaction.js';
 import type { KnowledgeGraph } from './graph/types.js';
 import { resetDegradedParseCounter } from './tree-sitter/safe-parse.js';
 import {
@@ -57,6 +58,7 @@ import {
   resolveNativeSafeStorageDir,
 } from './lbug/lbug-config.js';
 import { escapeCypherString } from './lbug/cypher-escape.js';
+import { chunk } from '../lib/utils.js';
 import {
   buildSearchIndexesOrDegrade,
   ftsFailureIsFatal,
@@ -170,7 +172,11 @@ import {
   SPRING_BEAN_INVENTORY_FEATURE,
   SPRING_CONDITIONALS_FEATURE,
 } from './ingestion/frameworks/spring/analysis-features.js';
-import { SPRING_CONFIG_BINDINGS_FEATURE } from './ingestion/languages/java/analysis-features.js';
+import {
+  JAVA_ENUM_INTERFACE_HERITAGE_FEATURE,
+  JAVA_RECORD_COMPONENT_ACCESSORS_FEATURE,
+  SPRING_CONFIG_BINDINGS_FEATURE,
+} from './ingestion/languages/java/analysis-features.js';
 import {
   CLASS_FRAMEWORK_ANNOTATIONS_FEATURE,
   findAnalysisFeatureMismatches,
@@ -223,6 +229,8 @@ const ANALYSIS_FEATURES = [
   SPRING_BEAN_INVENTORY_FEATURE,
   SPRING_CONDITIONALS_FEATURE,
   SPRING_CONFIG_BINDINGS_FEATURE,
+  JAVA_ENUM_INTERFACE_HERITAGE_FEATURE,
+  JAVA_RECORD_COMPONENT_ACCESSORS_FEATURE,
 ] as const;
 
 interface PersistedFrameworkAnnotationRow {
@@ -2843,9 +2851,7 @@ async function runFullAnalysisInner(
               });
         progress('embeddings', 88, `Restoring ${rowsToRestore.length} cached embeddings...`);
         const EMBED_BATCH = 200;
-        for (let i = 0; i < rowsToRestore.length; i += EMBED_BATCH) {
-          const batch = rowsToRestore.slice(i, i + EMBED_BATCH);
-
+        for (const batch of chunk(rowsToRestore, EMBED_BATCH)) {
           try {
             await batchInsert(executeWithReusedStatement, batch);
             restoredEmbeddingCount += batch.length;
@@ -2873,9 +2879,8 @@ async function runFullAnalysisInner(
             .map((e) => `${e.nodeId}:${e.chunkIndex}`);
           if (orphanRowIds.length > 0) {
             try {
-              for (let i = 0; i < orphanRowIds.length; i += DELETE_FILES_CHUNK_SIZE) {
-                const chunk = orphanRowIds.slice(i, i + DELETE_FILES_CHUNK_SIZE);
-                const listLiteral = `[${chunk
+              for (const batch of chunk(orphanRowIds, DELETE_FILES_CHUNK_SIZE)) {
+                const listLiteral = `[${batch
                   .map((id) => `'${escapeCypherString(id)}'`)
                   .join(', ')}]`;
                 await executeQuery(
@@ -3541,6 +3546,16 @@ async function runFullAnalysisInner(
       // Git-only: non-git repos never take the incremental path.
       schemaFingerprint: hasGitDir(repoPath) ? SCHEMA_FINGERPRINT : undefined,
       unresolvedReceiverMembers: summarizeUnresolvedReceivers(resolutionOutcomes),
+      // Carried forward ONLY when this run could not measure — `saveMeta` writes
+      // a fresh object, so omitting the key deletes a prior record and turns a
+      // hedged answer back into a confident one. A run that DID measure always
+      // wins, including when it measured nothing: vendoring the missing
+      // dependency and re-analyzing has to be able to clear the hedge, or the
+      // field becomes permanent noise and readers learn to ignore it.
+      undecidedInterfaceSatisfaction:
+        pipelineResult.undecidedSatisfaction === undefined
+          ? existingMeta?.undecidedInterfaceSatisfaction
+          : summarizeUndecidedSatisfaction(pipelineResult.undecidedSatisfaction),
       analysisFeatures: currentAnalysisFeatures,
       // Always stamped with the live resolved mode (#2331/#2339) — unlike
       // `pdg` below, 'none' is a meaningful value to compare, not an
