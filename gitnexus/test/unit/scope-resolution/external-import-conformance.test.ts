@@ -36,15 +36,35 @@
  * paired positive case is a regression wearing the fix's clothes.
  */
 import { describe, expect, it } from 'vitest';
-import type { ParsedImport } from 'gitnexus-shared';
+import type { ParsedFile, ParsedImport, ScopeId, SymbolDefinition } from 'gitnexus-shared';
 import { SupportedLanguages } from 'gitnexus-shared';
 import { SCOPE_RESOLVERS } from '../../../src/core/ingestion/scope-resolution/pipeline/registry.js';
 import type { ComposerConfig } from '../../../src/core/ingestion/language-config.js';
+import {
+  clearJavaPackageFacts,
+  setJavaPackageFact,
+} from '../../../src/core/ingestion/languages/java/package-facts.js';
+import {
+  clearKotlinPackageFacts,
+  setKotlinPackageFact,
+} from '../../../src/core/ingestion/languages/kotlin/package-facts.js';
 
 /** The `composer.json` PSR-4 map `loadPhpComposerConfig` would have produced. */
 const PHP_COMPOSER: ComposerConfig = { psr4: new Map([['App', 'app']]) };
 /** The value `loadGoModulePath` produces for a repo with a `go.mod`. */
 const GO_MODULE = { modulePath: 'example.com/mod' };
+/** The root dependency scope `loadRubyResolutionConfig` would have produced. */
+const RUBY_GEMS = {
+  scopesByDirectory: new Map([
+    [
+      '',
+      {
+        externalRequirePrefixes: new Set(['rails']),
+        localLoadRootsByPrefix: new Map(),
+      },
+    ],
+  ]),
+};
 /** What `scanCSharpProject` would report for the C# workspace below — the
  *  in-repo namespace evidence the #1881 suffix-fallback gate reads. */
 const CSHARP_NAMESPACES = {
@@ -81,6 +101,46 @@ interface ConformanceCase {
    */
   readonly reachesDecoy?: string;
   readonly parsedImport?: (targetRaw: string) => ParsedImport | undefined;
+  /**
+   * Declarations the resolver reads from the parsed workspace rather than from
+   * path shape. Java resolves entirely this way since #2953 — a specifier names
+   * a type in a DECLARED package — so a case that supplied only paths would
+   * measure a resolver with no workspace at all, and every arm would pass for
+   * the wrong reason.
+   */
+  readonly declare?: () => void;
+  readonly parsedFile?: (filePath: string) => ParsedFile;
+}
+
+function kotlinParsedFile(filePath: string): ParsedFile {
+  const name = filePath.slice(filePath.lastIndexOf('/') + 1, filePath.lastIndexOf('.'));
+  const moduleScope = `module:${filePath}` as ScopeId;
+  const def: SymbolDefinition = {
+    nodeId: `Class:${filePath}:${name}`,
+    filePath,
+    type: 'Class',
+    qualifiedName: name,
+  };
+  return {
+    filePath,
+    moduleScope,
+    scopes: [
+      {
+        id: moduleScope,
+        parent: null,
+        kind: 'Module',
+        range: { startLine: 1, startCol: 0, endLine: 1, endCol: 1 },
+        filePath,
+        bindings: new Map([[name, [{ def, origin: 'local' }]]]),
+        ownedDefs: [def],
+        imports: [],
+        typeBindings: new Map(),
+      },
+    ],
+    parsedImports: [],
+    localDefs: [def],
+    referenceSites: [],
+  };
 }
 
 const PHP_FUNCTION_IMPORT = (targetRaw: string): ParsedImport => ({
@@ -161,6 +221,25 @@ const CASES: ReadonlyMap<SupportedLanguages, ConformanceCase> = new Map([
       ],
       fromFile: 'src/main/java/com/example/App.java',
       resolutionConfig: undefined,
+      // `vendor/util/List.java` declares package `vendor.util`, so
+      // `vendor.util.List` is a real import of it and `java.util.List` is not.
+      // The two differ ONLY by what the workspace declares — both specifiers
+      // end in `util.List`, and both would match the same path suffix.
+      declare: () => {
+        clearJavaPackageFacts();
+        setJavaPackageFact('vendor/util/List.java', {
+          status: 'known',
+          packageName: 'vendor.util',
+        });
+        setJavaPackageFact('com/example/model/User.java', {
+          status: 'known',
+          packageName: 'com.example.model',
+        });
+        setJavaPackageFact('src/main/java/com/example/App.java', {
+          status: 'known',
+          packageName: 'com.example',
+        });
+      },
       external: 'java.util.List',
       decoy: 'vendor/util/List.java',
       reachesDecoy: 'vendor.util.List',
@@ -172,6 +251,18 @@ const CASES: ReadonlyMap<SupportedLanguages, ConformanceCase> = new Map([
       files: ['src/main/kotlin/vendor/Assert.kt', 'src/main/kotlin/com/example/App.kt'],
       fromFile: 'src/main/kotlin/com/example/App.kt',
       resolutionConfig: undefined,
+      declare: () => {
+        clearKotlinPackageFacts();
+        setKotlinPackageFact('src/main/kotlin/vendor/Assert.kt', {
+          status: 'known',
+          packageName: 'vendor',
+        });
+        setKotlinPackageFact('src/main/kotlin/com/example/App.kt', {
+          status: 'known',
+          packageName: 'com.example',
+        });
+      },
+      parsedFile: kotlinParsedFile,
       external: 'org.junit.Assert',
       decoy: 'src/main/kotlin/vendor/Assert.kt',
       reachesDecoy: 'vendor.Assert',
@@ -193,7 +284,7 @@ const CASES: ReadonlyMap<SupportedLanguages, ConformanceCase> = new Map([
     {
       files: ['lib/app/models/user.rb', 'lib/generators.rb', 'lib/main.rb'],
       fromFile: 'lib/main.rb',
-      resolutionConfig: undefined,
+      resolutionConfig: RUBY_GEMS,
       external: 'rails/generators',
       decoy: 'lib/generators.rb',
       reachesDecoy: 'generators',
@@ -213,12 +304,12 @@ const CASES: ReadonlyMap<SupportedLanguages, ConformanceCase> = new Map([
   [
     SupportedLanguages.PHP,
     {
-      files: ['app/Models/User.php', 'lib/Legacy/Missing.php', 'app/Main.php'],
+      files: ['app/Ghost/Missing.php', 'app/Models/User.php', 'app/Main.php'],
       fromFile: 'app/Main.php',
       resolutionConfig: PHP_COMPOSER,
       external: 'Vendor\\Ghost\\Missing',
-      decoy: 'lib/Legacy/Missing.php',
-      reachesDecoy: 'App\\Models\\User',
+      decoy: 'app/Ghost/Missing.php',
+      reachesDecoy: 'App\\Ghost\\Missing',
       parsedImport: PHP_FUNCTION_IMPORT,
     },
   ],
@@ -245,7 +336,7 @@ const CASES: ReadonlyMap<SupportedLanguages, ConformanceCase> = new Map([
       resolutionConfig: undefined,
       external: 'Foundation',
       decoy: 'Sources/Foundation/Thing.swift',
-      reachesDecoy: 'Models',
+      reachesDecoy: 'Sources',
     },
   ],
   [
@@ -279,8 +370,39 @@ const CASES: ReadonlyMap<SupportedLanguages, ConformanceCase> = new Map([
       fromFile: 'src/PROG.cbl',
       resolutionConfig: undefined,
       external: 'EXTERNAL',
-      decoy: 'vendor/EXTERNAL.cpy',
+      // After the copybook-dir preference, vendor/EXTERNAL.cpy is intentionally
+      // unreachable (that is the #2967 fix). The reachable decoy is the in-repo
+      // copybook; vendor/EXTERNAL.cpy stays in `files` so EXTERNAL→[] is not a
+      // vacuous miss of an empty workspace.
+      decoy: 'copybooks/CUSTREC.cpy',
       reachesDecoy: 'CUSTREC',
+    },
+  ],
+  [
+    SupportedLanguages.Zig,
+    {
+      // `@import("std")` is the standard library, and Zig's resolver answers
+      // null for the stdlib names outright — it never suffix-matches a bare
+      // name against the file set, so a repo file that happens to be called
+      // `std.zig` is not a candidate. The same file IS reachable through the
+      // filesystem-relative spelling, which is what the decoy arm proves.
+      files: ['src/std.zig', 'src/util.zig', 'src/main.zig'],
+      fromFile: 'src/main.zig',
+      resolutionConfig: undefined,
+      external: 'std',
+      decoy: 'src/std.zig',
+      reachesDecoy: 'std.zig',
+    },
+  ],
+  [
+    SupportedLanguages.ObjectiveC,
+    {
+      files: ['Headers/Foundation.h', 'Headers/Widget.h', 'Sources/main.m'],
+      fromFile: 'Sources/main.m',
+      resolutionConfig: undefined,
+      external: 'Foundation',
+      decoy: 'Headers/Foundation.h',
+      reachesDecoy: 'Foundation.h',
     },
   ],
 ]);
@@ -294,16 +416,9 @@ const CASES: ReadonlyMap<SupportedLanguages, ConformanceCase> = new Map([
  * TypeScript one, then deleting its line here.
  */
 const KNOWN_GAPS: ReadonlyMap<SupportedLanguages, string> = new Map<SupportedLanguages, string>([
-  [SupportedLanguages.Java, '`java.util.List` -> `vendor/util/List.java`'],
-  [SupportedLanguages.Kotlin, '`org.junit.Assert` -> `src/main/kotlin/vendor/Assert.kt`'],
-  [SupportedLanguages.Go, '`github.com/vendor/dep/internal/models` -> `internal/models/user.go`'],
-  [SupportedLanguages.Ruby, '`rails/generators` -> `lib/generators.rb`'],
-  [SupportedLanguages.PHP, '`Vendor\\Ghost\\Missing` -> `lib/Legacy/Missing.php`'],
   [SupportedLanguages.Dart, '`package:http/http.dart` -> `lib/http.dart`'],
-  [SupportedLanguages.Swift, '`Foundation` -> `Sources/Foundation/Thing.swift`'],
   [SupportedLanguages.C, '`stdio.h` -> `src/stdio.h`'],
   [SupportedLanguages.CPlusPlus, '`cstdio.h` -> `src/cstdio.h`'],
-  [SupportedLanguages.Cobol, '`EXTERNAL` -> `vendor/EXTERNAL.cpy`'],
 ]);
 
 /**
@@ -335,13 +450,25 @@ function resolveWith(
 ): string | readonly string[] | null {
   const resolver = SCOPE_RESOLVERS.get(language)!;
   const files = new Set(testCase.files);
+  testCase.declare?.();
+  // The parsed workspace, supplied only to a case that declares one. A minimal
+  // `{ filePath }` stand-in is exactly right for a resolver that reads the file
+  // list plus its own fact store (Java), and WRONG for one that reads other
+  // ParsedFile fields (PHP's `filesByDirectory`), which would silently resolve
+  // differently against stubs than against real parsed files.
+  const parsedFiles =
+    testCase.declare === undefined
+      ? []
+      : testCase.files.map(
+          testCase.parsedFile ?? ((filePath) => ({ filePath }) as unknown as ParsedFile),
+        );
   return resolver.resolveImportTarget(
     targetRaw,
     testCase.fromFile,
     files,
     testCase.resolutionConfig,
     {
-      parsedFiles: [],
+      parsedFiles,
       parsedImport: testCase.parsedImport?.(targetRaw),
     },
   );

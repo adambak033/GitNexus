@@ -46,6 +46,17 @@ npx gitnexus status
 npx gitnexus list
 ```
 
+**Scope extraction incomplete:** `npx gitnexus status` reports
+`incompleteReasons: ["scope-extraction-failed"]` when one or more files still
+lack scope captures after the worker and fallback passes. `impact` and `context`
+then report a lower bound with `causes.scopeExtractionFiles` set to the affected
+file count. Re-run `npx gitnexus analyze --force`; if the reason remains, inspect
+the scope-extraction warnings for the unsupported or malformed source file.
+Every pre-existing index remains unverified until it is analyzed once by a
+version that writes the completeness receipt. An older index or unreadable completeness record reports
+`incompleteReasons: ["scope-extraction-unverified"]`; re-analyze it before treating
+empty impact results as exact.
+
 ---
 
 ## Embeddings
@@ -173,6 +184,58 @@ Analyze re-execs Node with a **large old-space heap** when needed (`analyze.ts`)
 Only one process should open a repo's `.gitnexus/lbug` store at a time. If MCP and a second `analyze` run conflict, stop one process, then retry `analyze` or restart MCP.
 
 If the error text is `"Only one write transaction at a time is allowed in the system."` instead of a lock/busy message, it's the same underlying conflict — our retry matcher (`isDbBusyError` in `src/core/lbug/lbug-config.ts`) recognizes this exact string and auto-retries it. The fix if it still surfaces after retries is the same: stop the overlapping process.
+
+---
+
+## File acquisition/reclaim guard recovery
+
+The portable file-lock backend uses `analyze.lock.guard` beside `analyze.lock`.
+Every acquisition, including an empty slot, exclusively creates the guard before
+inspecting, reclaiming, creating, and verifying the main lock. It removes the
+guard before returning a workload handle or waiting on a live workload holder.
+Linux abstract-socket and Windows named-pipe locking are unchanged.
+
+A stalled or crashed guard owner blocks file acquisition even when its PID is
+dead, its metadata is incomplete, or no main lock exists. **The guard is never
+automatically stolen.** Guard contention times out after at most 30 seconds,
+capped by the remaining acquisition timeout. This separate ceiling applies even
+when `GITNEXUS_INDEX_LOCK_TIMEOUT_MS` is zero or negative (unbounded workload wait).
+A guard-cleanup failure rejects acquisition; it must not start unprotected work.
+
+Manual recovery is an outage procedure, not an age/PID-based cleanup:
+
+1. Identify the exact lock directory named in the error. This shared primitive
+   also protects group sync and registry operations, not just repo analysis.
+2. Stop **all relevant writers** and prevent restart: editor/agent hooks, watch
+   processes, scheduled jobs, services, and any containers sharing the directory.
+   Account for paused processes and every host with access. If quiescence cannot
+   be established, do not remove the guard. PID metadata is diagnostic only.
+3. While restart remains disabled, inspect and preserve the guard/main records
+   for diagnosis, then remove only that directory's orphan `analyze.lock.guard`
+   and, if present, its orphan `analyze.lock`. Do not remove databases or sidecars
+   as part of lock recovery. Do not use a recursive or wildcard cleanup.
+4. Ensure all participating writers use the guarded version and the same locking
+   backend/domain, then restart in a controlled fashion.
+
+**Upgrade requires a coordinated stop/upgrade/restart.** Concurrent older
+versions ignore the guard and can still displace live locks; mixed-version
+mutual exclusion is not guaranteed. The file protocol assumes reliable atomic
+local-filesystem `O_EXCL` creation and cooperating processes. Network/distributed
+filesystems, external file replacement, and uncoordinated manual deletion are not
+covered. A process crash while holding the short-lived guard trades automatic
+recovery for fail-closed safety. Denied file creation returns a non-owning
+`lockFree` handle only when neither workload lock nor acquisition guard exists;
+unreadable paths fail closed. No staging sweep runs without ownership. Analysis,
+registry transactions, group synchronization, and embeddings sync refuse
+`lockFree` handles, including an otherwise up-to-date analysis on a file-backend
+read-only mount.
+The socket backend can still acquire ownership on a read-only index mount.
+Heterogeneous permissions are not proof that another process cannot write.
+
+If guard cleanup fails after this attempt created its workload record, acquisition
+is refused and token-exact workload cleanup is attempted before returning the
+error. Failed or unverifiable cleanup must be diagnosed under the same quiesced
+recovery procedure above; never delete a possibly active successor's record.
 
 ---
 

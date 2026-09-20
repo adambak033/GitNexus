@@ -10,6 +10,13 @@ import os from 'os';
 import path from 'path';
 import fs from 'fs/promises';
 
+const mockWikiStorage = () => {
+  vi.doMock('../../src/storage/storage-resolver.js', async (importActual) => ({
+    ...(await importActual<typeof import('../../src/storage/storage-resolver.js')>()),
+    requireStoragePath: vi.fn().mockResolvedValue('/tmp/wiki-storage'),
+  }));
+};
+
 // ─── detectCursorCLI caching ─────────────────────────────────────────
 
 describe('detectCursorCLI', () => {
@@ -223,6 +230,42 @@ describe('resolveLLMConfig', () => {
     expect(config.model).toBe('');
   });
 
+  it('uses grokModel when provider is grok', async () => {
+    vi.doMock('../../src/core/logger.js', () => ({
+      logger: { info: vi.fn(), warn: vi.fn() },
+    }));
+    vi.doMock('../../src/storage/repo-manager.js', () => ({
+      loadCLIConfig: vi.fn().mockResolvedValue({
+        provider: 'grok',
+        grokModel: 'grok-build',
+      }),
+    }));
+
+    const { resolveLLMConfig } = await import('../../src/core/wiki/llm-client.js');
+    const config = await resolveLLMConfig({ provider: 'grok' });
+
+    expect(config.provider).toBe('grok');
+    expect(config.model).toBe('grok-build');
+  });
+
+  it('does not inherit HTTP model defaults for grok local provider', async () => {
+    vi.doMock('../../src/core/logger.js', () => ({
+      logger: { info: vi.fn(), warn: vi.fn() },
+    }));
+    vi.doMock('../../src/storage/repo-manager.js', () => ({
+      loadCLIConfig: vi.fn().mockResolvedValue({
+        provider: 'openai',
+        model: 'legacy-http-model',
+      }),
+    }));
+
+    const { resolveLLMConfig } = await import('../../src/core/wiki/llm-client.js');
+    const config = await resolveLLMConfig({ provider: 'grok' });
+
+    expect(config.provider).toBe('grok');
+    expect(config.model).toBe('');
+  });
+
   it('does not inherit HTTP model defaults for local CLI providers', async () => {
     vi.doMock('../../src/storage/repo-manager.js', () => ({
       loadCLIConfig: vi.fn().mockResolvedValue({
@@ -332,6 +375,7 @@ describe('wikiCommand provider switch persistence', () => {
     vi.restoreAllMocks();
     vi.doUnmock('../../src/storage/git.js');
     vi.doUnmock('../../src/storage/repo-manager.js');
+    vi.doUnmock('../../src/storage/storage-resolver.js');
     vi.doUnmock('../../src/core/wiki/llm-client.js');
     vi.doUnmock('../../src/core/wiki/generator.js');
     vi.doUnmock('cli-progress');
@@ -344,6 +388,9 @@ describe('wikiCommand provider switch persistence', () => {
   ) {
     const saveCLIConfig = vi.fn();
 
+    vi.doMock('../../src/core/logger.js', () => ({
+      logger: { info: vi.fn(), warn: vi.fn() },
+    }));
     vi.doMock('../../src/storage/git.js', () => ({
       getGitRoot: vi.fn(),
       isGitRepo: vi.fn().mockReturnValue(true),
@@ -391,6 +438,7 @@ describe('wikiCommand provider switch persistence', () => {
         Presets: { shades_grey: {} },
       },
     }));
+    mockWikiStorage();
 
     vi.spyOn(console, 'log').mockImplementation(() => {});
     const { wikiCommand } = await import('../../src/cli/wiki.js');
@@ -457,6 +505,26 @@ describe('wikiCommand provider switch persistence', () => {
       apiVersion: 'v2',
       isReasoningModel: false,
     });
+  });
+
+  it('saves grok model to grokModel instead of the HTTP model field', async () => {
+    const saveCLIConfig = await saveProviderSwitch(
+      {
+        provider: 'minimax',
+        apiKey: 'old-minimax-key',
+        baseUrl: 'https://api.minimax.io/v1',
+        model: 'MiniMax-M3',
+      },
+      {
+        provider: 'grok',
+        model: 'grok-build',
+      },
+    );
+
+    const saved = saveCLIConfig.mock.calls[0][0] as Record<string, unknown>;
+    expect(saved.provider).toBe('grok');
+    expect(saved.grokModel).toBe('grok-build');
+    expect(saved.model).toBeUndefined();
   });
 });
 
@@ -589,6 +657,7 @@ describe('wikiCommand --timeout validation', () => {
     vi.restoreAllMocks();
     vi.doUnmock('../../src/storage/git.js');
     vi.doUnmock('../../src/storage/repo-manager.js');
+    vi.doUnmock('../../src/storage/storage-resolver.js');
     vi.doUnmock('../../src/core/wiki/llm-client.js');
     vi.doUnmock('../../src/core/wiki/generator.js');
     vi.doUnmock('cli-progress');
@@ -648,6 +717,7 @@ describe('wikiCommand --timeout validation', () => {
           Presets: { shades_grey: {} },
         },
       }));
+      mockWikiStorage();
 
       const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
       const { wikiCommand } = await import('../../src/cli/wiki.js');
@@ -677,6 +747,7 @@ describe('wikiCommand --retries validation', () => {
     vi.restoreAllMocks();
     vi.doUnmock('../../src/storage/git.js');
     vi.doUnmock('../../src/storage/repo-manager.js');
+    vi.doUnmock('../../src/storage/storage-resolver.js');
     vi.doUnmock('../../src/core/wiki/llm-client.js');
     vi.doUnmock('../../src/core/wiki/generator.js');
     vi.doUnmock('cli-progress');
@@ -736,6 +807,7 @@ describe('wikiCommand --retries validation', () => {
           Presets: { shades_grey: {} },
         },
       }));
+      mockWikiStorage();
 
       const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
       const { wikiCommand } = await import('../../src/cli/wiki.js');
@@ -761,6 +833,7 @@ describe('wikiCommand --timeout mapping', () => {
     vi.restoreAllMocks();
     vi.doUnmock('../../src/storage/git.js');
     vi.doUnmock('../../src/storage/repo-manager.js');
+    vi.doUnmock('../../src/storage/storage-resolver.js');
     vi.doUnmock('../../src/core/wiki/llm-client.js');
     vi.doUnmock('../../src/core/wiki/generator.js');
     vi.doUnmock('cli-progress');
@@ -828,6 +901,7 @@ describe('wikiCommand --timeout mapping', () => {
         Presets: { shades_grey: {} },
       },
     }));
+    mockWikiStorage();
 
     const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     const { wikiCommand } = await import('../../src/cli/wiki.js');
@@ -899,6 +973,7 @@ describe('wikiCommand timeout messaging', () => {
     vi.restoreAllMocks();
     vi.doUnmock('../../src/storage/git.js');
     vi.doUnmock('../../src/storage/repo-manager.js');
+    vi.doUnmock('../../src/storage/storage-resolver.js');
     vi.doUnmock('../../src/core/wiki/llm-client.js');
     vi.doUnmock('../../src/core/wiki/generator.js');
     vi.doUnmock('cli-progress');
@@ -964,6 +1039,7 @@ describe('wikiCommand timeout messaging', () => {
         Presets: { shades_grey: {} },
       },
     }));
+    mockWikiStorage();
 
     const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     const { wikiCommand } = await import('../../src/cli/wiki.js');
@@ -1012,6 +1088,16 @@ describe('CLI config round-trip with cursor provider', () => {
     const loaded = JSON.parse(await fs.readFile(configPath, 'utf-8'));
     expect(loaded.provider).toBe('opencode');
     expect(loaded.opencodeModel).toBe('openai/gpt-5.4-mini');
+    expect(loaded.apiKey).toBeUndefined();
+  });
+
+  it('saves and loads grok provider config correctly', async () => {
+    const config = { provider: 'grok', grokModel: 'grok-build' };
+    await fs.writeFile(configPath, JSON.stringify(config, null, 2));
+
+    const loaded = JSON.parse(await fs.readFile(configPath, 'utf-8'));
+    expect(loaded.provider).toBe('grok');
+    expect(loaded.grokModel).toBe('grok-build');
     expect(loaded.apiKey).toBeUndefined();
   });
 
@@ -1243,6 +1329,55 @@ describe('WikiGenerator invokeLLM routing', () => {
     expect(cursorSpy).not.toHaveBeenCalled();
     expect(openaiSpy).not.toHaveBeenCalled();
     expect(result.content).toBe('opencode response');
+  });
+
+  it('routes to callGrokLLM when provider is grok', async () => {
+    vi.doMock('../../src/core/logger.js', () => ({
+      logger: { info: vi.fn(), warn: vi.fn() },
+    }));
+    const cursorClient = await import('../../src/core/wiki/cursor-client.js');
+    const localClient = await import('../../src/core/wiki/local-cli-client.js');
+    const grokClient = await import('../../src/core/wiki/grok-client.js');
+    const llmClient = await import('../../src/core/wiki/llm-client.js');
+
+    const cursorSpy = vi
+      .spyOn(cursorClient, 'callCursorLLM')
+      .mockResolvedValue({ content: 'cursor response' });
+    const claudeSpy = vi
+      .spyOn(localClient, 'callClaudeLLM')
+      .mockResolvedValue({ content: 'claude response' });
+    const grokSpy = vi
+      .spyOn(grokClient, 'callGrokLLM')
+      .mockResolvedValue({ content: 'grok response' });
+    const openaiSpy = vi
+      .spyOn(llmClient, 'callLLM')
+      .mockResolvedValue({ content: 'openai response' });
+
+    const { WikiGenerator } = await import('../../src/core/wiki/generator.js');
+
+    const storagePath = path.join(tmpDir, 'storage');
+    const wikiDir = path.join(storagePath, 'wiki');
+    await fs.mkdir(wikiDir, { recursive: true });
+
+    const repoPath = path.join(tmpDir, 'repo');
+    await fs.mkdir(repoPath, { recursive: true });
+
+    const generator = new WikiGenerator(repoPath, storagePath, path.join(storagePath, 'lbug'), {
+      apiKey: '',
+      baseUrl: '',
+      model: 'grok-build',
+      maxTokens: 1000,
+      temperature: 0,
+      provider: 'grok',
+    });
+
+    const result = await (generator as any).invokeLLM('test prompt', 'system prompt');
+
+    expect(grokSpy).toHaveBeenCalledTimes(1);
+    expect(claudeSpy).not.toHaveBeenCalled();
+    expect(cursorSpy).not.toHaveBeenCalled();
+    expect(openaiSpy).not.toHaveBeenCalled();
+    expect(result.content).toBe('grok response');
   });
 
   it('routes to callLLM when provider is openai', async () => {

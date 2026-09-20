@@ -9,10 +9,12 @@
 import fs from 'fs/promises';
 import path from 'path';
 import { createHash } from 'crypto';
+import { scoreImpactRisk, unusedAxesForImpactWalk, type ImpactRiskResult } from 'gitnexus-shared';
 import {
   initLbug,
   executeQuery,
   executeParameterized,
+  ensureVectorExtension,
   closeLbug,
   isLbugReady,
   statDbIdentity,
@@ -20,29 +22,30 @@ import {
 } from '../../core/lbug/pool-adapter.js';
 import { queryClassBeanMetadata } from './bean-metadata.js';
 import { querySpringAopMetadata } from './aop-metadata.js';
+import { queryConvexDispatchMetadata } from './convex-metadata.js';
 import { isValidQueryParams } from '../../core/lbug/query-params.js';
 import { toDisplayLine } from './line-display.js';
 import { LBUG_ID_PROBE_BATCH_SIZE, LBUG_QUERY_BATCH_SIZE } from '../../core/lbug/query-batch.js';
 import { chunk, mapConcurrent } from '../../lib/utils.js';
 import { pathSuffixOf } from './path-predicate.js';
 import { toOneBasedLine } from '../../core/ingestion/utils/line-base.js';
+import { isTestFilePath } from '../../core/ingestion/utils/test-file-path.js';
 import { isWalCorruptionError, WAL_RECOVERY_SUGGESTION } from '../../core/lbug/lbug-config.js';
 // Embedding imports are lazy (dynamic import) to avoid loading onnxruntime-node
 // at MCP server startup — crashes on unsupported Node ABI versions (#89)
 // git utilities available if needed
 // import { isGitRepo, getCurrentCommit, getGitRoot } from '../../storage/git.js';
 import {
-  parseDiffHunks,
+  parseDiffHunksResult,
   coalesceHunksByPath,
   hunksOverlapRange,
+  findGitRootByDotGit,
   getCanonicalRepoRoot,
   getGitRoot,
-  type FileDiff,
 } from '../../storage/git.js';
 import { realpathSync } from 'fs';
 import {
   listRegisteredRepos,
-  cleanupOldKuzuFiles,
   canonicalizePath,
   getStoragePaths,
   loadMeta,
@@ -59,6 +62,7 @@ import {
 } from '../../core/group/service.js';
 import { resolveAtGroupMemberRepoPath } from '../../core/group/resolve-at-member.js';
 import { collectBestChunks } from '../../core/embeddings/types.js';
+import { reapEmbeddingSidecarSafely } from '../../core/embeddings/embedding-sidecar-reap.js';
 import {
   DEFAULT_MCP_VECTOR_MAX_DISTANCE,
   getVectorMaxDistance,
@@ -86,6 +90,7 @@ import {
 import { getExactScanLimit } from '../../core/platform/capabilities.js';
 import { PhaseTimer } from '../../core/search/phase-timer.js';
 import { ftsDegradedWarning, ftsQueryFailedWarning } from '../../core/search/fts-indexes.js';
+import { getFtsDisabledReason, type FtsDisabledReason } from '../../core/search/fts-policy.js';
 import {
   cjkSegmentationModeMismatch,
   containsSegmentableCjkRun,
@@ -94,13 +99,21 @@ import {
   MAX_CJK_SEGMENTATION_QUERY_LENGTH,
 } from '../../core/search/cjk-segmentation.js';
 import {
-  checkStalenessAsync,
-  checkCwdMatch,
+  checkoutIsDirectory,
+  contentRetentionFromMeta,
+  isFullSourceAvailable,
+} from '../../core/content-retention.js';
+import { checkStalenessAsync, checkCwdMatch } from '../../core/git-staleness.js';
+import {
+  stalenessPayload,
+  type IndexedRef,
   type StalenessInfo,
-} from '../../core/git-staleness.js';
+  type StalenessPayload,
+} from '../../core/staleness-status.js';
 import { logger } from '../../core/logger.js';
 import {
   isLocalEmbeddingRuntimeBlockerMessage,
+  isLocalEmbeddingSidecarAbortMessage,
   isMissingLocalEmbeddingStackMessage,
 } from '../../core/embeddings/runtime-support.js';
 import {
@@ -111,6 +124,7 @@ import {
   PDG_QUERY_DEFAULT_LIMIT,
   PDG_QUERY_MAX_LIMIT,
 } from '../tools.js';
+import { foldNumericToolArgumentAliases } from '../tool-arguments.js';
 import { findImportCycles, IMPORT_CYCLE_LIMIT } from '../../core/graph/import-cycles.js';
 import { decodeTaintPath } from '../../core/ingestion/taint/path-codec.js';
 import { decodeReachingDefReason } from '../../core/ingestion/cfg/reaching-def-reason-codec.js';
@@ -122,7 +136,9 @@ import {
 } from '../../core/ingestion/scope-resolution/unresolved-receivers.js';
 import type { UnresolvedReceiverSummary } from '../../core/ingestion/scope-resolution/unresolved-receivers.js';
 import type { UndecidedSatisfactionSummary } from '../../core/ingestion/scope-resolution/undecided-satisfaction.js';
+import { scopeExtractionFailureTotal } from '../../core/ingestion/scope-resolution/scope-extraction-failures.js';
 import { lookupCount } from '../../core/ingestion/scope-resolution/summary-maps.js';
+import { VALUE_REF_EDGE_REASON } from '../../core/ingestion/scope-resolution/value-ref-edges.js';
 import {
   DEFERRED_IMPORT_REASON_SUFFIX,
   TYPE_ONLY_IMPORT_REASON_SUFFIX,
@@ -163,6 +179,29 @@ const VALUE_CANDIDATE_TYPES: ReadonlySet<string> = new Set(['Const', 'Variable',
  * only truncation signal available when the COUNT leg fails.
  */
 const CANDIDATE_WINDOW = 20;
+
+/**
+ * `content` is an index capability rather than a promise that every symbol has
+ * text. Retention `none` intentionally omits it, while `symbol` retains only
+ * symbol spans. Keep this response additive and emit it only when requested so
+ * callers relying on the legacy response shape remain compatible.
+ */
+const requestedContentAvailability = (
+  requested: boolean,
+  meta: Awaited<ReturnType<typeof loadMeta>>,
+) => {
+  if (!requested) return undefined;
+  const profile = contentRetentionFromMeta(meta);
+  return {
+    requested: true as const,
+    profile,
+    available: profile !== 'none',
+    scope: profile,
+    ...(profile === 'none'
+      ? { reason: 'Source-derived content is not retained by this index.' }
+      : {}),
+  };
+};
 
 /**
  * The pieces every ambiguous-resolution payload shares, derived once.
@@ -266,10 +305,8 @@ function normalizeToolParams(
 ): { params: Record<string, unknown> } | { error: string } {
   const input = params && typeof params === 'object' ? (params as Record<string, unknown>) : {};
   const definitions = TOOL_STRING_ALIASES[method];
-  if (!definitions) return { params: input };
-
   const normalized = { ...input };
-  for (const { canonical, aliases } of definitions) {
+  for (const { canonical, aliases } of definitions ?? []) {
     const keys = [canonical, ...aliases];
     const supplied: Array<{ key: string; value: string }> = [];
     for (const key of keys) {
@@ -277,7 +314,12 @@ function normalizeToolParams(
       const value = input[key];
       // Internal CLI callers materialize omitted optional flags as undefined.
       if (value === undefined) continue;
-      if (typeof value !== 'string' || !value.trim()) {
+      // Strict OpenAI/Anthropic adapters also materialize omitted optional
+      // string aliases as "". Treat those exactly like undefined. Required
+      // canonical values are still rejected by the method-specific check
+      // below, and non-string aliases remain invalid.
+      if (typeof value === 'string' && !value.trim()) continue;
+      if (typeof value !== 'string') {
         return { error: `MCP parameter ${method}.${key} must be a non-empty string.` };
       }
       supplied.push({ key, value: value.trim() });
@@ -291,48 +333,28 @@ function normalizeToolParams(
       };
     }
 
-    for (const alias of aliases) delete normalized[alias];
+    for (const key of keys) delete normalized[key];
     if (supplied.length > 0) normalized[canonical] = supplied[0].value;
   }
 
+  const folded = foldNumericToolArgumentAliases(method, normalized);
+  if ('error' in folded) return folded;
+
   if (
     method === 'impact' &&
-    typeof normalized.target !== 'string' &&
-    (typeof normalized.target_uid !== 'string' || !normalized.target_uid.trim())
+    typeof folded.params.target !== 'string' &&
+    (typeof folded.params.target_uid !== 'string' || !folded.params.target_uid.trim())
   ) {
     return { error: 'MCP impact requires target, name, symbol, or target_uid.' };
   }
-  return { params: normalized };
+  return { params: folded.params };
 }
 
 // AI context generation is CLI-only (gitnexus analyze)
 // import { generateAIContextFiles } from '../../cli/ai-context.js';
 
-/**
- * Quick test-file detection for filtering impact results.
- * Matches common test file patterns across all supported languages.
- */
-export function isTestFilePath(filePath: string | null | undefined): boolean {
-  if (!filePath) return false;
-  const p = filePath.toLowerCase().replace(/\\/g, '/');
-  return (
-    p.includes('.test.') ||
-    p.includes('.spec.') ||
-    p.includes('__tests__/') ||
-    p.includes('__mocks__/') ||
-    p.includes('/test/') ||
-    p.includes('/tests/') ||
-    p.includes('/testing/') ||
-    p.includes('/fixtures/') ||
-    p.endsWith('_test.go') ||
-    p.endsWith('_test.py') ||
-    p.endsWith('_spec.rb') ||
-    p.endsWith('_test.rb') ||
-    p.includes('/spec/') ||
-    p.includes('/test_') ||
-    p.includes('/conftest.')
-  );
-}
+/** Shared predicate; re-exported so MCP importers keep the old public name. */
+export { isTestFilePath };
 
 /** Valid LadybugDB node labels for safe Cypher query construction */
 export const VALID_NODE_LABELS = new Set([
@@ -340,6 +362,8 @@ export const VALID_NODE_LABELS = new Set([
   'Folder',
   'Function',
   'Class',
+  'Protocol',
+  'Category',
   'Interface',
   'Method',
   'CodeElement',
@@ -365,6 +389,7 @@ export const VALID_NODE_LABELS = new Set([
   'Module',
   'Route',
   'Tool',
+  'Destination',
 ]);
 
 /** Valid relation types for impact analysis filtering */
@@ -409,6 +434,15 @@ export const VALID_RELATION_TYPES = new Set([
   // impact defaults do not silently widen; target enrichment still surfaces
   // advised/proxied state on ordinary impact calls.
   'ADVISED_BY',
+  // Async messaging edges. Valid for an explicit `relationTypes` filter —
+  // "who else publishes to the topic this handler reads?" — but deliberately
+  // NOT in the default impact relTypes, on the HANDLES_ROUTE precedent: a
+  // shared broker destination is a high-degree hub, and admitting it by
+  // default would pull every unrelated producer of a busy topic into an
+  // ordinary blast radius. No IMPACT_RELATION_CONFIDENCE entry either, so the
+  // 0.5 unknown-type floor applies (WRAPS/FETCHES/INJECTS precedent).
+  'PUBLISHES_TO',
+  'CONSUMES_FROM',
 ]);
 
 /**
@@ -484,6 +518,8 @@ interface ImpactFrontierEdge {
   confidence: unknown;
   /** `n.id` — the frontier node this edge was reached FROM. */
   sourceId: string;
+  /** Edge sits in a branch proven dead at index time (`GraphRelationship.staticGated`). */
+  staticGated?: boolean;
 }
 
 /**
@@ -652,6 +688,8 @@ export interface CodebaseContext {
  * number of SENTENCES, which has no relation to how much is missing.
  */
 export interface EpistemicCauses {
+  /** Files whose scope-extraction output is absent from this index. */
+  readonly scopeExtractionFiles: number;
   /**
    * Call SITES dropped at index time because the receiver's type could not be
    * established. Unit: call sites, taken from the index's
@@ -659,9 +697,8 @@ export interface EpistemicCauses {
    */
   readonly receiverTyping: number;
   /**
-   * Symbols on the far side of a dispatch boundary that the traversal could not
-   * attribute to the queried symbol: implementations plus interface-level
-   * consumers, summed over the boundary nodes that were flagged.
+   * Symbols on or beyond a dispatch boundary that the traversal could not
+   * attribute statically: implementations plus interface-level consumers.
    *
    * Unit: SYMBOLS, not call sites — deliberately, because a call-site count is
    * not derivable on this side. The graph does not retain per-site multiplicity
@@ -670,6 +707,10 @@ export interface EpistemicCauses {
    * per (caller, target) pair no matter how many syntactic sites exist. A
    * symbol reachable through two flagged boundary nodes is counted once per
    * node, so this is itself a lower bound.
+   *
+   * Framework runtime-proxy metadata can prove that impact is incomplete but
+   * cannot provide this magnitude, so it contributes a boundary note while
+   * leaving this count unchanged.
    *
    * It is still directly comparable in magnitude with `receiverTyping` — both
    * answer "how much is missing" — which `boundaries.length` was not.
@@ -704,6 +745,39 @@ export interface EpistemicCauses {
    * "nothing was undecided", and a re-index is what tells the two apart.
    */
   readonly undecidedSatisfaction: number;
+  /**
+   * Symbols that name this callable in VALUE position rather than calling it
+   * (#3399) — a registration table (`bridge.accessor(Element.getNamespaceUri,
+   * …)`), a callback argument, a function pointer stored in a field.
+   *
+   * Unit: SYMBOLS — distinct referrers, the same unit and the same reason as
+   * `dispatchBoundary`: the reference edge is per-site but the walk's question
+   * is "who else might reach this", and a referrer that names the callable
+   * twice is still one place the value escapes from.
+   *
+   * Kept separate from `dispatchBoundary` even though both describe dispatch
+   * the walk cannot follow. That slot counts implementations and
+   * interface-level consumers found by the heritage probe; these are neither,
+   * and folding them in would tell a consumer branching on the numbers that an
+   * interface boundary exists where there is none. The distinction is also the
+   * actionable one: a dispatch boundary is irreducible, whereas a callable
+   * value CAN often be followed once the language models the store/load that
+   * carries it.
+   *
+   * The reference itself IS modelled — that is what makes it countable. What is
+   * missing is the invocation through the value: it happens later, through a
+   * struct field, a registry lookup, or comptime reflection, and no CALLS edge
+   * connects the eventual call site back to this symbol.
+   *
+   * Zero when the property-dispatch pass DID synthesize that invocation
+   * (`x.<key>()` through a registered object-literal key): the walk followed
+   * the registration, so nothing was missed and the result stays `exact`.
+   *
+   * Also zero — WITH a boundary note — when the probe itself could not run.
+   * The note is the signal there; the count is not, which is why a reader must
+   * branch on `epistemic` first and read the causes as explanation.
+   */
+  readonly callableValueReferences: number;
 }
 
 function epistemicFrom(dropped: {
@@ -711,6 +785,9 @@ function epistemicFrom(dropped: {
   sites: number;
   external: number;
   undecided: number;
+  dispatch: number;
+  scopeExtraction: number;
+  callableValueReferences: number;
 }): {
   epistemic: 'exact' | 'lower-bound';
   boundaries?: string[];
@@ -724,10 +801,12 @@ function epistemicFrom(dropped: {
       ? {
           epistemic: 'exact',
           causes: {
+            scopeExtractionFiles: dropped.scopeExtraction,
             receiverTyping: 0,
-            dispatchBoundary: 0,
+            dispatchBoundary: dropped.dispatch,
             externalBoundary: dropped.external,
             undecidedSatisfaction: 0,
+            callableValueReferences: dropped.callableValueReferences,
           },
         }
       : { epistemic: 'exact' }
@@ -739,12 +818,37 @@ function epistemicFrom(dropped: {
         // prose saying `2 call sites` — a consumer branching on the number
         // would read a different magnitude than the human reading the text.
         causes: {
+          scopeExtractionFiles: dropped.scopeExtraction,
           receiverTyping: dropped.sites,
-          dispatchBoundary: 0,
+          dispatchBoundary: dropped.dispatch,
           externalBoundary: dropped.external,
           undecidedSatisfaction: dropped.undecided,
+          callableValueReferences: dropped.callableValueReferences,
         },
       };
+}
+
+function scopeExtractionBoundaries(
+  summary: unknown,
+  receipt: unknown,
+): { notes: string[]; files: number } {
+  const unknown = {
+    notes: [
+      'Scope-extraction completeness was not recorded for this index, so actual impact may be higher.',
+    ],
+    files: 0,
+  };
+  if (receipt !== 1) return unknown;
+  const total = scopeExtractionFailureTotal(summary);
+  if (total === undefined) return unknown;
+  if (total === 0) return { notes: [], files: 0 };
+  return {
+    notes: [
+      `Scope extraction failed for ${total} ${total === 1 ? 'file' : 'files'} while this index was built. ` +
+        `Scope-resolution edges from ${total === 1 ? 'that file are' : 'those files are'} absent, so actual impact may be higher.`,
+    ],
+    files: total,
+  };
 }
 
 /**
@@ -819,6 +923,153 @@ function undecidedSatisfactionBoundaries(
   return { notes, undecided };
 }
 
+/**
+ * Boundary evidence for callables named in VALUE position (#3399).
+ *
+ * `bridge.accessor(Element.getNamespaceUri, null, .{})`, `{ onClick: handler }`,
+ * `qsort(xs, n, sz, compareItems)` — each REGISTERS a function somewhere
+ * instead of calling it. The registration is modelled (`value-ref` → a USES
+ * edge, Kythe `ref` / Joern `METHOD_REF`); the invocation through the stored
+ * value is not, because it happens later through a struct field, a registry
+ * lookup or comptime reflection.
+ *
+ * That gap is precisely the first half of `tools.ts`'s definition of
+ * `lower-bound` — the walk provably missed callers — and it was previously
+ * reported as `exact`. (The second half, a probe that could not run, is what
+ * the failure branch below publishes; the contract states both because this
+ * function can produce either.) A
+ * public DOM accessor bound into a JS bridge table came back LOW/exact with two
+ * internal callers, which is worse than no answer: `lower-bound` invites the
+ * reader to look further, `exact` tells them not to bother.
+ *
+ * Counted as DISTINCT REFERRERS rather than sites: the question the count
+ * serves is "how many places does this value escape from", and a table that
+ * registers the same callable twice is still one table.
+ *
+ * NOT every value reference is a gap. Where the property-dispatch pass
+ * synthesized the invocation side, the walk followed it and the answer stays
+ * `exact` — see the second probe below.
+ *
+ * Three failure modes, three different answers, none of them silence:
+ *   - the query cannot run       → hedge, count 0 (a probe that did not answer
+ *                                  is not evidence of completeness);
+ *   - the query returns nothing  → no hedge (a real, measured zero);
+ *   - the reference was followed → no hedge (nothing was missed).
+ *
+ * The probe reads the edge's `reason`, which is why writer and reader share
+ * {@link VALUE_REF_EDGE_REASON}. Language-neutral by construction — every
+ * provider that emits a `value-ref` capture participates, and one that emits
+ * none simply gets no rows.
+ */
+async function callableValueReferenceBoundaries(
+  lbugPath: string,
+  symId: string,
+): Promise<{ notes: string[]; referrers: number }> {
+  // `COUNT(DISTINCT …)`, not a capped row list. A `LIMIT n` here would make the
+  // published cause silently understate a target with more than n
+  // registrations — and this number is documented as "how many symbols", so a
+  // reader comparing its magnitude against `receiverTyping` would be comparing
+  // a truth to a ceiling. Aggregating in the database keeps the work bounded
+  // without capping the answer; scalar `sym.id` equality plus an implicit
+  // group-by is the shape `countByType` below already relies on.
+  //
+  // `null`, not `[]`, on failure: see below — an empty result set and an
+  // unanswerable query must not be the same value.
+  const rows = await executeParameterized(
+    lbugPath,
+    `MATCH (other)-[r:CodeRelation]->(sym)
+     WHERE sym.id = $symId AND r.type = 'USES' AND r.reason = $reason
+     RETURN COUNT(DISTINCT other.id) AS cnt`,
+    { symId, reason: VALUE_REF_EDGE_REASON },
+  ).catch(() => null);
+
+  // A probe that could not run must never read as certainty — the same rule the
+  // `loadMeta` read above states, and the whole reason this function exists.
+  // Returning zero here would publish `exact` on the strength of a query that
+  // never answered.
+  if (rows === null) {
+    return {
+      referrers: 0,
+      notes: [
+        'The callable-value-reference probe could not be run against this index, so whether ' +
+          'this symbol is registered somewhere as a value is unknown. Treat the caller list as ' +
+          'incomplete until it can be re-checked.',
+      ],
+    };
+  }
+  const referrers = rows.length > 0 ? Number((rows[0] as any).cnt ?? (rows[0] as any)[0] ?? 0) : 0;
+  if (!Number.isFinite(referrers) || referrers <= 0) return { notes: [], referrers: 0 };
+
+  // Registrations whose invocation side the analyzer ALREADY synthesized are
+  // not a gap. `emitPropertyDispatchCalls` sweep 2 connects `x.<key>()` member
+  // calls to every function registered under `<key>` and stamps those edges
+  // `property-dispatch`; where that happened, the walk did not "provably miss"
+  // the caller and `lower-bound` would be noise sprayed over an answer the
+  // analyzer actually computed. Zig — the case this was built for — never sets
+  // a property key (no object-literal key to dispatch through), so it is never
+  // excluded here; the exclusion exists to keep TypeScript/JavaScript hook
+  // tables that ARE followed from being downgraded.
+  //
+  // SYMBOL-LEVEL, NOT PER-EDGE, and that is only sound because of an invariant
+  // that lives nowhere near this line. The graph does not record which
+  // registration produced which synthesized call, so if one symbol could carry
+  // both a followed and an unfollowed registration, this would zero the note
+  // over a gap the analyzer provably did not close — #3399 returning through a
+  // side door. Today no symbol can:
+  //
+  //   - sweep 2 synthesizes CALLS only for a registration whose site carried a
+  //     `propertyKey` (sweep 1 skips the index when it is undefined);
+  //   - every JS/TS `@reference.value-ref` rule also captures
+  //     `@reference.property-key` — both are object-literal shapes;
+  //   - no Zig `@reference.value-ref` rule captures one.
+  //
+  // So a dispatchable registration is always a JS/TS one, an undispatchable
+  // registration is always a Zig one, and the two never meet on one symbol.
+  // `test/unit/scope-resolution/value-ref-dispatchability.test.ts` FAILS the day
+  // that stops holding — a JS/TS rule for a bare callback argument
+  // (`register(handler)`), a Zig rule that grows a key. When it does, the
+  // choice to make here is between (a) splitting the edge `reason` into
+  // dispatchable / undispatchable so this probe can count them apart, and
+  // (b) hedging any symbol with an undispatchable registration regardless of
+  // dispatch. (a) is precise and costs a graph-content change; (b) is cheap and
+  // over-hedges. What is NOT acceptable is leaving this as-is, because a signal
+  // that quietly stops firing is the defect this whole feature removes.
+  //
+  // Given the invariant, the residual today is only the coarseness of the
+  // exclusion within JS/TS, and hedging every property-value registration in
+  // every JS/TS codebase is worse: a signal that fires on everything stops
+  // carrying information, and the fan-out cap warning still sits behind it.
+  const dispatched = await executeParameterized(
+    lbugPath,
+    `MATCH (other)-[r:CodeRelation]->(sym)
+     WHERE sym.id = $symId AND r.type = 'CALLS' AND r.reason = 'property-dispatch'
+     RETURN COUNT(r) AS cnt`,
+    { symId },
+  ).catch(() => null);
+  // Failure here is NOT a reason to skip the hedge: we already know a value
+  // reference exists, and being unable to prove it was followed leaves the
+  // conservative answer standing.
+  const dispatchedCount =
+    dispatched === null || dispatched.length === 0
+      ? 0
+      : Number((dispatched[0] as any).cnt ?? (dispatched[0] as any)[0] ?? 0);
+  if (Number.isFinite(dispatchedCount) && dispatchedCount > 0) {
+    return { notes: [], referrers: 0 };
+  }
+
+  const one = referrers === 1;
+  return {
+    referrers,
+    notes: [
+      `${referrers} ${one ? 'symbol references' : 'symbols reference'} this callable as a VALUE ` +
+        `rather than calling it (a registration table, a callback argument, a stored function ` +
+        `pointer). The reference is recorded, but the call made THROUGH that value is not: it is ` +
+        `dispatched later from wherever the value is stored. Callers reached that way are absent ` +
+        `from this result — actual impact may be higher.`,
+    ],
+  };
+}
+
 interface RepoHandle {
   id: string; // unique key = repo name (basename)
   name: string;
@@ -829,7 +1080,11 @@ interface RepoHandle {
   lastCommit: string;
   remoteUrl?: string;
   stats?: RegistryEntry['stats'];
-  /** Primary/flat branch name, when known (#2106). */
+  /**
+   * Branch this handle's index describes (#2106/#3291). The flat/workspace
+   * slot keeps the primary checkout name; `applyBranchScope` overwrites it
+   * with the pin when serving a `branches[]` sub-index.
+   */
   branch?: string;
   /** Pinned `--branch` sub-indexes available for this repo, distinct from the flat workspace slot (#2106/#2354). */
   branches?: BranchSummary[];
@@ -960,9 +1215,18 @@ export function buildDetectChangesDiffArgs(scope: string, baseRef?: string): str
   // not `--default-prefix`, which needs git >= 2.42. `--no-ext-diff` stops a
   // configured external diff driver from replacing the unified output we parse.
   const args = [
+    // Before the subcommand: default core.quotePath C-quotes non-ASCII so
+    // `diff --git` / `+++` tokens no longer match the unquoted `a/` `b/` forms
+    // the parser also accepts. The parser still decodes quoted tokens; this
+    // pin keeps production git from emitting them.
+    '-c',
+    'core.quotePath=false',
     'diff',
     '--ignore-cr-at-eol',
     '--no-ext-diff',
+    // color.ui=always prefixes `+++ b/` with ANSI, so parseDiffHunks sees zero
+    // files and the CLI used to print a clean "No changes detected." (#3131).
+    '--color=never',
     '--src-prefix=a/',
     '--dst-prefix=b/',
   ];
@@ -1041,6 +1305,11 @@ interface ApiImpactRoute {
   route: string;
   method: string | null;
   handler: string;
+  runtimeEvidence: {
+    confirmed: boolean;
+    source?: string;
+    status?: string;
+  };
   responseShape: { success: string[]; error: string[] };
   middleware: string[];
   middlewareDetection?: 'partial';
@@ -1060,6 +1329,30 @@ interface ApiImpactRoute {
     warning?: string;
   };
 }
+
+interface RouteRuntimeEvidence {
+  runtimeConfirmed: boolean;
+  runtimeSource: string | null;
+  runtimeStatus: string | null;
+}
+
+const routeRuntimeEvidence = (route: RouteRuntimeEvidence) => ({
+  confirmed: route.runtimeConfirmed,
+  ...(route.runtimeSource === null ? {} : { source: route.runtimeSource }),
+  ...(route.runtimeStatus === null ? {} : { status: route.runtimeStatus }),
+});
+
+const isMissingRouteRuntimePropertyError = (error: unknown): boolean => {
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    ['runtimeConfirmed', 'runtimeSource', 'runtimeStatus'].some((property) =>
+      message.includes(property),
+    ) &&
+    (/cannot find property/i.test(message) ||
+      /property .* does not exist/i.test(message) ||
+      /property .* not found/i.test(message))
+  );
+};
 
 /**
  * `api_impact` is polymorphic by match count: a single matched route returns the
@@ -1083,12 +1376,15 @@ export interface RepoListing {
   lastCommit: string;
   remoteUrl?: string;
   stats?: any;
-  staleness?: { commitsBehind: number; hint?: string };
+  staleness?: StalenessPayload;
   siblings?: Array<{ name: string; path: string; lastCommit: string }>;
   /** Primary/flat branch name, when known (#2106). */
   branch?: string;
   /** Pinned `--branch` sub-indexes available for this repo, distinct from the flat workspace slot (#2106/#2354). */
   branches?: Array<Omit<BranchSummary, 'stats'>>;
+  storagePath?: string;
+  contentRetention?: 'full' | 'symbol' | 'none';
+  sourceAvailable?: boolean;
 }
 
 /** Continuation metadata for the paginated `list_repos` MCP tool (#2119). */
@@ -1172,22 +1468,33 @@ function canCarryStaleness(result: unknown): result is Record<string, unknown> {
 }
 
 /**
- * #2655: attach a non-blocking `staleness` signal to a tool result when the
- * index is behind HEAD, mirroring the `list_repos` `{commitsBehind, hint}`
- * shape. Only ever ADDS a field to a carryable object result (see
- * {@link canCarryStaleness}) — it never changes an existing result's shape.
+ * #2655: attach a non-blocking `staleness` signal to a tool result. Only ever
+ * ADDS a field to a carryable object result (see {@link canCarryStaleness}) —
+ * it never changes an existing result's shape.
+ *
+ * #3291: `ref` names the index the answer came from. Supplying it switches the
+ * payload to the ref-carrying form, which reports every status — including
+ * `current` and `unknown` — because that one added key is the only place a tool
+ * result can say WHICH index answered. Absence used to be the freshness signal
+ * here; it could not distinguish a current index of the default branch from a
+ * current index of some feature branch, since `current` is a statement about a
+ * ref rather than about the repository.
+ *
+ * With no `ref` the pre-#3291 behaviour is unchanged: absent for `current`,
+ * `diverged` attached as a positive finding that the index is not at HEAD, and
+ * `unknown` withheld as noise (#3256). A missing `info` still attaches nothing
+ * either way, which is what keeps a failed freshness probe non-fatal.
  */
 export function attachToolStaleness(
   result: unknown,
-  staleness: StalenessInfo | undefined,
+  info: StalenessInfo | undefined,
+  ref?: IndexedRef,
 ): unknown {
-  if (!staleness?.isStale || !canCarryStaleness(result)) {
+  const staleness = stalenessPayload(info, ref ? { ref } : {});
+  if (!staleness || !canCarryStaleness(result)) {
     return result;
   }
-  return {
-    ...result,
-    staleness: { commitsBehind: staleness.commitsBehind, hint: staleness.hint },
-  };
+  return { ...result, staleness };
 }
 
 /** tri-review Residual-2: see `LocalBackend.lastObservedPoolState`'s doc comment. */
@@ -1248,12 +1555,12 @@ export class LocalBackend {
   private warnedSiblingDrift: Set<string> = new Set();
 
   /**
-   * One-shot stderr warning for the VECTOR-extension fallback. Without this
-   * guard the diagnostic would fire on every `semanticSearch()` call on
-   * platforms where the extension is unsupported (e.g. Windows), making MCP
-   * stderr noisy per DoD §2.8.
+   * One-shot stderr guards for distinct VECTOR load and index-query failures.
+   * Keeping them separate preserves both diagnostics across semanticSearch calls
+   * without repeating either on hot paths.
    */
-  private warnedVectorUnsupported = false;
+  private warnedVectorLoadFailed = false;
+  private warnedVectorQueryFailed = false;
 
   /**
    * One-shot warning when a pruned or Node-unloadable optional embedding stack
@@ -1532,15 +1839,6 @@ export class LocalBackend {
       const storagePath = entry.storagePath;
       const lbugPath = path.join(storagePath, 'lbug');
 
-      // Clean up any leftover KuzuDB files from before the LadybugDB migration.
-      // If kuzu exists but lbug doesn't, warn so the user knows to re-analyze.
-      const kuzu = await cleanupOldKuzuFiles(storagePath);
-      if (kuzu.found && kuzu.needsReindex) {
-        logger.error(
-          `GitNexus: "${entry.name}" has a stale KuzuDB index. Run: gitnexus analyze ${entry.path}`,
-        );
-      }
-
       const handle: RepoHandle = {
         id,
         name: entry.name,
@@ -1584,7 +1882,7 @@ export class LocalBackend {
     // memory registry snapshot; no disk I/O on this hot path (#2106 R3).
     for (const entry of entries) {
       for (const b of entry.branches ?? []) {
-        liveLbugPaths.add(getStoragePaths(entry.path, b.branch).lbugPath);
+        liveLbugPaths.add(getStoragePaths(entry.path, b.branch, entry.storagePath).lbugPath);
       }
     }
     // initializedRepos is the authoritative set of OPENED pool keys (flat AND
@@ -1680,21 +1978,61 @@ export class LocalBackend {
    * - If only 1 repo, use it
    * - If 0 or multiple without param, throw with helpful message
    *
-   * On a miss, re-reads the registry once in case a new repo was indexed
-   * while the MCP server was running.
+   * Re-reads the registry before an omitted implicit target or after an
+   * explicit miss, so long-running servers see newly indexed repositories.
    */
   async resolveRepo(repoParam?: string, branch?: string): Promise<RepoHandle> {
-    let refreshedAfterAmbiguity = false;
+    return this.selectToolRepository(repoParam, branch);
+  }
+
+  /**
+   * Internal resolver variant for CLI/MCP tool routing and discovery.
+   * - If repoParam is given, match by name or path
+   * - If only 1 repo, use it
+   * - If multiple repos exist and repoParam is omitted, callers may opt in to
+   *   the registered repo containing process.cwd()
+   * - If 0 repos exist, or cwd cannot disambiguate multiple repos, throw
+   *
+   * Omitted-repo resolution re-reads the registry before accepting any
+   * implicit target, including a cached singleton. A caller that just obtained
+   * a fresh registry snapshot may disable that refresh explicitly.
+   */
+  async selectToolRepository(
+    repoParam?: string,
+    branch?: string,
+    options: { allowCwdDefault?: boolean; refreshRegistry?: boolean } = {},
+  ): Promise<RepoHandle> {
+    const allowCwdDefault = options.allowCwdDefault === true;
+    const mayRefresh = options.refreshRegistry !== false;
+    let refreshed = false;
+
+    // A cached singleton is also an implicit choice: another process may have
+    // registered a second repo since init, which must not let a repo-less
+    // mutating call bypass the multi-repo ambiguity guard.
+    if (!repoParam && mayRefresh) {
+      await this.refreshRepos();
+      refreshed = true;
+    }
+
     let result: RepoHandle | null;
     try {
-      result = this.resolveRepoFromCache(repoParam);
+      result = this.resolveRepoFromCache(repoParam, allowCwdDefault);
     } catch (err) {
       if (!(err instanceof RegistryAmbiguousTargetError)) throw err;
+      if (!mayRefresh || refreshed) throw err;
       // Stale in-memory duplicate siblings can linger after unregister; refresh
       // once before re-throwing so a resolved registry can disambiguate (#1658).
       await this.refreshRepos();
-      refreshedAfterAmbiguity = true;
-      result = this.resolveRepoFromCache(repoParam);
+      refreshed = true;
+      result = this.resolveRepoFromCache(repoParam, allowCwdDefault);
+    }
+
+    // Explicit misses retain the existing one-refresh retry. Omitted targets
+    // already refreshed above unless a same-snapshot caller opted out.
+    if (!result && mayRefresh && !refreshed) {
+      await this.refreshRepos();
+      refreshed = true;
+      result = this.resolveRepoFromCache(repoParam, allowCwdDefault);
     }
 
     if (result) {
@@ -1708,16 +2046,6 @@ export class LocalBackend {
         /* best-effort; never throw from resolveRepo */
       });
       return this.applyBranchScope(result, branch);
-    }
-
-    // Miss — refresh registry and try once more (skip if already refreshed above)
-    if (!refreshedAfterAmbiguity) {
-      await this.refreshRepos();
-    }
-    const retried = this.resolveRepoFromCache(repoParam);
-    if (retried) {
-      this.maybeWarnSiblingDrift(retried).catch(() => {});
-      return this.applyBranchScope(retried, branch);
     }
 
     // Still no match — throw with helpful message
@@ -1806,7 +2134,7 @@ export class LocalBackend {
     const summary =
       handle.branch !== branch ? handle.branches?.find((b) => b.branch === branch) : undefined;
     if (summary) {
-      const { lbugPath } = getStoragePaths(handle.repoPath, branch);
+      const { lbugPath } = getStoragePaths(handle.repoPath, branch, handle.storagePath);
       // The lbug is the artifact the pool opens, so its presence is the
       // serviceability truth — a half-deleted dir can outlive its meta.json
       // while the lbug is gone, and vice versa (#2364 review F1 arm ii).
@@ -1825,6 +2153,8 @@ export class LocalBackend {
           indexedAt: summary.indexedAt,
           lastCommit: summary.lastCommit,
           stats: summary.stats,
+          // The handle now represents the pin, not the flat slot (#3291).
+          branch: summary.branch,
         };
       }
       // Stale summary (sub-index adopted/deleted): refresh so later calls see
@@ -1869,7 +2199,7 @@ export class LocalBackend {
    * Throws {@link RegistryAmbiguousTargetError} when `repoParam` matches
    * multiple handles by name and cwd cannot disambiguate (#1658).
    */
-  private resolveRepoFromCache(repoParam?: string): RepoHandle | null {
+  private resolveRepoFromCache(repoParam?: string, allowCwdDefault = false): RepoHandle | null {
     if (this.repos.size === 0) return null;
 
     if (repoParam) {
@@ -1902,6 +2232,9 @@ export class LocalBackend {
       );
       if (nameMatches.length === 1) return nameMatches[0];
       if (nameMatches.length > 1) {
+        // Explicit duplicate aliases retain the legacy fail-closed contract:
+        // only an exact cwd Git-root match may disambiguate them. Deepest path
+        // containment is reserved for an omitted read-only repo (#3073).
         const cwdPick = this.pickRepoHandleForCwd(nameMatches);
         if (cwdPick) return cwdPick;
         throw new RegistryAmbiguousTargetError(
@@ -1933,31 +2266,50 @@ export class LocalBackend {
       return this.repos.values().next().value!;
     }
 
-    // No repo param and multiple repos — try cwd-based auto-detection
-    // across ALL repos so agents in a worktree don't need to pass repo.
-    const cwdPick = this.pickRepoHandleForCwd([...this.repos.values()]);
-    if (cwdPick) return cwdPick;
+    if (allowCwdDefault) {
+      const cwdPick = this.pickRepoHandleForCwd([...this.repos.values()], true);
+      if (cwdPick) return cwdPick;
+    }
 
-    return null; // Multiple repos, no param, no cwd match — ambiguous
+    return null; // Multiple repos, no param — ambiguous
   }
 
   /**
-   * Prefer the indexed repo whose path matches the git root of process.cwd().
+   * Match process.cwd() against indexed repositories.
    *
-   * In MCP stdio server mode, `process.cwd()` is the server's launch directory,
-   * not the agent client's cwd. If the server was started from an unrelated
-   * directory, `getGitRoot` returns null and duplicate-name resolution throws
-   * {@link RegistryAmbiguousTargetError} — callers should pass an absolute path.
+   * Explicit duplicate aliases use exact Git-root matching only. Omitted
+   * read-only calls opt into deepest containing-path selection. In that mode a
+   * candidate must not sit above cwd's Git root, so an unindexed nested checkout
+   * cannot fall through to an indexed ancestor. The `.git` ancestor fallback
+   * preserves that boundary when the git executable is unavailable.
    */
-  private pickRepoHandleForCwd(candidates: RepoHandle[]): RepoHandle | null {
-    const cwdRoot = getGitRoot(process.cwd());
-    if (!cwdRoot) return null;
-    const canonicalCwd = canonicalizePath(cwdRoot);
+  private pickRepoHandleForCwd(
+    candidates: RepoHandle[],
+    allowContaining = false,
+  ): RepoHandle | null {
+    const cwd = process.cwd();
+    const normalize = (value: string): string => {
+      const canonical = canonicalizePath(value);
+      return process.platform === 'win32' ? canonical.toLowerCase() : canonical;
+    };
+    const isSameOrDescendant = (parent: string, child: string): boolean =>
+      child === parent ||
+      child.startsWith(parent.endsWith(path.sep) ? parent : `${parent}${path.sep}`);
+    const canonicalCwd = normalize(cwd);
+    const cwdRoot = getGitRoot(cwd) ?? findGitRootByDotGit(cwd);
+    const canonicalRoot = cwdRoot ? normalize(cwdRoot) : null;
+    if (allowContaining) {
+      const containing = candidates
+        .map((handle) => ({ handle, repoPath: normalize(handle.repoPath) }))
+        .filter(({ repoPath }) => isSameOrDescendant(repoPath, canonicalCwd))
+        .filter(({ repoPath }) => !canonicalRoot || isSameOrDescendant(canonicalRoot, repoPath))
+        .sort((a, b) => b.repoPath.length - a.repoPath.length);
+      if (containing.length > 0) return containing[0].handle;
+    }
+
+    if (!canonicalRoot) return null;
     const cwdMatches = candidates.filter((handle) => {
-      const stored = canonicalizePath(handle.repoPath);
-      return process.platform === 'win32'
-        ? stored.toLowerCase() === canonicalCwd.toLowerCase()
-        : stored === canonicalCwd;
+      return normalize(handle.repoPath) === canonicalRoot;
     });
     return cwdMatches.length === 1 ? cwdMatches[0] : null;
   }
@@ -2144,12 +2496,22 @@ export class LocalBackend {
     // Check staleness for all repos in parallel instead of sequentially.
     // Each check spawns an async `git rev-list` — with 200 repos the sync
     // variant took ~50 s; parallel async brings it under a second (#1363).
-    const stalenessResults = await Promise.all(
-      handles.map((h) => checkStalenessAsync(h.repoPath, h.lastCommit)),
+    const listing = await Promise.all(
+      handles.map(async (h) => {
+        const [stale, meta] = await Promise.all([
+          checkStalenessAsync(h.repoPath, h.lastCommit),
+          loadMeta(h.storagePath).catch(() => null),
+        ]);
+        const contentRetention = contentRetentionFromMeta(meta);
+        const sourceAvailable = isFullSourceAvailable(
+          contentRetention,
+          contentRetention === 'full' ? await checkoutIsDirectory(h.repoPath) : false,
+        );
+        return { h, stale, source: { contentRetention, sourceAvailable } };
+      }),
     );
 
-    return handles.map((h, i) => {
-      const stale = stalenessResults[i];
+    return listing.map(({ h, stale, source }) => {
       const selfNorm = norm(h.repoPath);
       const siblings = h.remoteUrl
         ? (byRemote.get(h.remoteUrl) ?? []).filter((e) => norm(e.repoPath) !== selfNorm)
@@ -2161,9 +2523,7 @@ export class LocalBackend {
         lastCommit: h.lastCommit,
         remoteUrl: h.remoteUrl,
         stats: h.stats,
-        staleness: stale.isStale
-          ? { commitsBehind: stale.commitsBehind, hint: stale.hint }
-          : undefined,
+        staleness: stalenessPayload(stale, { includeUnknown: true }),
         siblings:
           siblings.length > 0
             ? siblings.map((s) => ({
@@ -2181,8 +2541,35 @@ export class LocalBackend {
                 lastCommit: b.lastCommit,
               }))
             : undefined,
+        storagePath: h.storagePath,
+        contentRetention: source.contentRetention,
+        sourceAvailable: source.sourceAvailable,
       };
     });
+  }
+
+  /**
+   * Lightweight registry count for schema-introspection callers that only
+   * need to know "one repo or many?" without paying the full staleness fan-out
+   * cost that listRepos() incurs. Uses the same validated registry
+   * `refreshRepos` / `selectToolRepository` see (`validate: true` prunes
+   * entries whose metadata is provably gone) so tools/list cannot advertise a
+   * multi-repo schema for ENOENT ghosts. No git processes are spawned.
+   */
+  async countRepos(): Promise<number> {
+    const entries = await listRegisteredRepos({ validate: true });
+    return entries.length;
+  }
+
+  /**
+   * In-memory validated registry size after the last `refreshRepos` / init /
+   * `selectToolRepository` refresh. `countRepos()` does not populate this map.
+   * Schema introspection uses this after a refreshed cwd probe so cardinality
+   * and the probe share one snapshot — without putting `refreshRepos()` (and
+   * its kuzu cleanup) on the 0–1 `countRepos` path.
+   */
+  cachedRepoCount(): number {
+    return this.repos.size;
   }
 
   /**
@@ -2300,15 +2687,27 @@ export class LocalBackend {
    * skipping the `git` spawn entirely for results that can't carry it (error
    * envelopes, arrays, non-objects — see {@link canCarryStaleness}) so an
    * error-returning call pays nothing.
+   *
+   * #3291: the ref comes straight off the already-resolved handle, so naming
+   * the index costs no extra I/O — no git spawn, no metadata read, and the
+   * `stalenessForTool` TTL cache is untouched. `branch` is passed through as-is
+   * and is legitimately absent for a detached HEAD or a legacy index; the
+   * always-present `lastCommit` is what identifies the index in that case.
    */
   private async withToolStaleness(repo: RepoHandle, result: unknown): Promise<unknown> {
     if (!canCarryStaleness(result)) return result;
     // Defensive: `checkStalenessAsync` self-catches today, but a rejection here
     // must never fail the tool — degrade to no-staleness. Paired with the
     // evict-on-reject in `stalenessForTool`, a transient failure also can't
-    // poison the TTL cache entry (#2655 review F1).
+    // poison the TTL cache entry (#2655 review F1). A rejection leaves `info`
+    // undefined, and the builder returns nothing for that even with a ref, so
+    // the degraded path still attaches no field.
     const staleness = await this.stalenessForTool(repo).catch(() => undefined);
-    return attachToolStaleness(result, staleness);
+    return attachToolStaleness(result, staleness, {
+      branch: repo.branch,
+      lastCommit: repo.lastCommit,
+      indexedAt: repo.indexedAt,
+    });
   }
 
   /**
@@ -2317,9 +2716,10 @@ export class LocalBackend {
    * one `git rev-list` per index per TTL window; the resolved value is cached
    * for TOOL_STALENESS_TTL_MS. Keyed by lbugPath so flat and branch handles
    * (same repoPath, different lastCommit) don't share an entry. Non-blocking by
-   * construction: `checkStalenessAsync` swallows git failures to
-   * `{ isStale: false }`, so a git error never fails the tool — it just omits
-   * the `staleness` field.
+   * construction: `checkStalenessAsync` keeps `isStale: false` on every git
+   * failure and reports what it could still establish in `status` (`diverged`,
+   * `unknown`, or `current` when HEAD alone matches the index), so a git error
+   * never fails the tool — at most it attaches a `diverged` staleness field.
    */
   private stalenessForTool(repo: RepoHandle): Promise<StalenessInfo> {
     const now = Date.now();
@@ -2384,9 +2784,10 @@ export class LocalBackend {
 
     // Resolve repo from optional param (re-reads registry on miss). An optional
     // `branch` param scopes the resolved handle to that branch's index (#2106).
-    const repo = await this.resolveRepo(
+    const repo = await this.selectToolRepository(
       p.repo as string | undefined,
       p.branch as string | undefined,
+      { allowCwdDefault: method !== 'rename' },
     );
 
     switch (method) {
@@ -2566,10 +2967,20 @@ export class LocalBackend {
     await this.ensureInitialized(repo);
 
     const processLimit = params.limit || 10;
-    // #trpc-fork: default raised 10 → 25 to fit a procedure→workflow→helper
-    // chain inside a single page. The tool schema mirrors this default.
+    // #trpc-fork: defaults raised (limit 5 → 10, max_symbols 10 → 25) to fit a
+    // procedure→workflow→helper chain inside a single page. The tool schema
+    // mirrors these defaults.
     const maxSymbolsPerProcess = params.max_symbols || 25;
-    const includeContent = params.include_content ?? false;
+    const requestedContent = params.include_content ?? false;
+    // Do not trust a lingering graph property when the metadata contract says
+    // source-derived text is unavailable. A full rebuild normally removes the
+    // column values; this guard keeps a partially migrated/corrupt index from
+    // disclosing text merely because a caller asked for it. `query` already
+    // reads this metadata for CJK and embedding-dimension drift diagnostics,
+    // so keep that legacy read unconditional.
+    const meta = await loadMeta(path.dirname(repo.lbugPath));
+    const includeContent = requestedContent && contentRetentionFromMeta(meta) !== 'none';
+    const contentAvailability = requestedContentAvailability(requestedContent, meta);
     const searchQuery = rawQuery.trim();
 
     // Per-phase timing instrumentation (#553). Records wall time for each
@@ -2585,9 +2996,11 @@ export class LocalBackend {
     // each so both get independent wall-time records without fighting
     // over a single `current` phase slot.
     const searchLimit = processLimit * maxSymbolsPerProcess; // fetch enough raw results
+    const ftsDisabledReason = getFtsDisabledReason(meta?.capabilities?.fts);
+    const vectorDegraded = { reason: undefined as string | undefined };
     const [bm25SearchResult, semanticResults] = await Promise.all([
-      timer.time('bm25', this.bm25Search(repo, searchQuery, searchLimit)),
-      timer.time('vector', this.semanticSearch(repo, searchQuery, searchLimit)),
+      timer.time('bm25', this.bm25Search(repo, searchQuery, searchLimit, ftsDisabledReason)),
+      timer.time('vector', this.semanticSearch(repo, searchQuery, searchLimit, vectorDegraded)),
     ]);
 
     // Guard against undefined results (#1489) — when FTS is entirely
@@ -2987,7 +3400,7 @@ export class LocalBackend {
       warnings.push(
         ftsQueryErrors
           ? ftsQueryFailedWarning({ ...warningContext, lastErrorRedacted: ftsQueryErrors[0] })
-          : ftsDegradedWarning(warningContext),
+          : ftsDegradedWarning(warningContext, ftsDisabledReason),
       );
     } else if (ftsQueryErrors) {
       // #2767: at least one FTS table succeeded (ftsUsed=true) but another
@@ -3041,7 +3454,6 @@ export class LocalBackend {
     // GITNEXUS_FTS_CJK_SEGMENTATION (the only thing that actually throws in
     // there) cannot take an unrelated diagnostic down with it. Needs no guard
     // of its own: loadMeta() returns null on any read/parse failure.
-    const meta = await loadMeta(path.dirname(repo.lbugPath));
     try {
       // meta.json is on-disk state inside the analyzed repo, read via a
       // schema-less JSON.parse — not trusted input. Validate before
@@ -3120,6 +3532,9 @@ export class LocalBackend {
           'Keyword results are unaffected.',
       );
     }
+    if (vectorDegraded.reason) {
+      warnings.push(vectorDegraded.reason);
+    }
     if (enrichmentDegraded) {
       warnings.push(
         'Symbol enrichment partially failed — some process/cohesion/content data may be missing from these results (see server logs).',
@@ -3135,6 +3550,7 @@ export class LocalBackend {
       process_symbols: dedupedSymbols,
       definitions: definitions.slice(0, 20), // cap standalone definitions
       timing,
+      ...(contentAvailability ? { contentAvailability } : {}),
       ...(warnings.length > 0 && { warning: warnings.join(' ') }),
       ...((enrichmentDegraded || ftsPartial) && { partial: true }),
     };
@@ -3147,7 +3563,9 @@ export class LocalBackend {
     repo: RepoHandle,
     query: string,
     limit: number,
+    disabledReason?: FtsDisabledReason,
   ): Promise<{ results: any[]; ftsUsed: boolean; nonBenignErrors?: string[] }> {
+    if (disabledReason) return { results: [], ftsUsed: false };
     let searchFTSFromLbug;
     try {
       ({ searchFTSFromLbug } = await import('../../core/search/bm25-index.js'));
@@ -3259,7 +3677,12 @@ export class LocalBackend {
   /**
    * Semantic vector search helper
    */
-  private async semanticSearch(repo: RepoHandle, query: string, limit: number): Promise<any[]> {
+  private async semanticSearch(
+    repo: RepoHandle,
+    query: string,
+    limit: number,
+    degraded?: { reason?: string },
+  ): Promise<any[]> {
     // Whether THIS call produced a query vector — see `lastQueryEmbeddingDims`.
     // A local flag, not a re-read of the map: the map may still hold an earlier
     // call's width, and the catch below must only clear an entry it did not set.
@@ -3290,21 +3713,31 @@ export class LocalBackend {
       this.lastQueryEmbeddingDims.set(repo.lbugPath, dims);
       const queryVecStr = `[${queryVec.join(',')}]`;
       const maxDistance = getVectorMaxDistance(DEFAULT_MCP_VECTOR_MAX_DISTANCE);
+      let vectorReady = false;
+      try {
+        vectorReady = await ensureVectorExtension(repo.lbugPath);
+      } catch (err) {
+        if (!this.warnedVectorLoadFailed) {
+          this.warnedVectorLoadFailed = true;
+          logger.warn(
+            { err },
+            'GitNexus [query:vector]: vector extension load failed; using exact scan fallback',
+          );
+        }
+      }
 
       let bestChunks = new Map<
         string,
         { distance: number; chunkIndex: number; startLine: number; endLine: number }
       >();
-      // Always TRY the vector lane — no platform gate. LadybugDB ships the
-      // VECTOR extension for every supported platform, Windows included
-      // (#2623 follow-up; the old `platform !== 'win32'` gate was stale), so
-      // whether the index is queryable is a per-machine runtime fact. The
-      // catch below is the fallback: any failure (extension unloadable, index
-      // absent, older DB) degrades to the exact scan with a once-per-backend
-      // diagnostic instead of being silently swallowed.
-      try {
-        bestChunks = await collectBestChunks(limit, async (fetchLimit) => {
-          const vectorQuery = `
+      // Try the vector lane only after its lazy load succeeds. An unavailable
+      // extension is already reported by ExtensionManager; an index/query
+      // failure below gets its own once-per-backend diagnostic before the exact
+      // scan fallback.
+      if (vectorReady) {
+        try {
+          bestChunks = await collectBestChunks(limit, async (fetchLimit) => {
+            const vectorQuery = `
             CALL QUERY_VECTOR_INDEX('${EMBEDDING_TABLE_NAME}', '${EMBEDDING_INDEX_NAME}',
               CAST(${queryVecStr} AS FLOAT[${dims}]), ${fetchLimit})
             YIELD node AS emb, distance
@@ -3315,26 +3748,27 @@ export class LocalBackend {
             ORDER BY distance
           `;
 
-          const embResults = await executeQuery(repo.lbugPath, vectorQuery);
-          return embResults.map((row) => ({
-            nodeId: row.nodeId ?? row[0],
-            chunkIndex: row.chunkIndex ?? row[1] ?? 0,
-            startLine: row.startLine ?? row[2] ?? 0,
-            endLine: row.endLine ?? row[3] ?? 0,
-            distance: row.distance ?? row[4],
-          }));
-        });
-      } catch (err) {
-        bestChunks = new Map();
-        if (!this.warnedVectorUnsupported) {
-          // Rare diagnostic: surface why semantic search fell back to the
-          // exact scan. Emitted once per `LocalBackend` instance lifetime to
-          // avoid noisy stderr on hot semantic-search paths (DoD §2.8).
-          this.warnedVectorUnsupported = true;
-          logger.warn(
-            { err },
-            'GitNexus [query:vector]: vector index query failed; using exact scan fallback',
-          );
+            const embResults = await executeQuery(repo.lbugPath, vectorQuery);
+            return embResults.map((row) => ({
+              nodeId: row.nodeId ?? row[0],
+              chunkIndex: row.chunkIndex ?? row[1] ?? 0,
+              startLine: row.startLine ?? row[2] ?? 0,
+              endLine: row.endLine ?? row[3] ?? 0,
+              distance: row.distance ?? row[4],
+            }));
+          });
+        } catch (err) {
+          bestChunks = new Map();
+          if (!this.warnedVectorQueryFailed) {
+            // Rare diagnostic: surface why semantic search fell back to the
+            // exact scan. Emitted once per `LocalBackend` instance lifetime to
+            // avoid noisy stderr on hot semantic-search paths (DoD §2.8).
+            this.warnedVectorQueryFailed = true;
+            logger.warn(
+              { err },
+              'GitNexus [query:vector]: vector index query failed; using exact scan fallback',
+            );
+          }
         }
       }
 
@@ -3414,18 +3848,21 @@ export class LocalBackend {
       // the width IS still the live one). Clearing only in the former case
       // keeps the recorded width a fact rather than a leftover (#2798).
       if (embeddedDims === undefined) this.lastQueryEmbeddingDims.delete(repo.lbugPath);
-      // Embeddings disabled is the common, silent case. But a pruned or
-      // Node-unloadable optional stack (#2370/#2372) also lands here — surface it
+      // Embeddings disabled is the common, silent case. But a missing or
+      // Node-unloadable local stack (#2370/#2372) also lands here — surface it
       // once so semantic search doesn't silently degrade to BM25 with no hint
       // (the exact silent-degradation mode #2370 exists to fix). Emitted once per
       // LocalBackend instance to keep stderr quiet on hot paths (like the VECTOR
       // fallback above). All other errors stay silent, as before.
       const message = err instanceof Error ? err.message : '';
-      if (
-        !this.warnedMissingEmbeddingStack &&
-        (isMissingLocalEmbeddingStackMessage(message) ||
-          isLocalEmbeddingRuntimeBlockerMessage(message))
-      ) {
+      const isDegradedVectorError =
+        isMissingLocalEmbeddingStackMessage(message) ||
+        isLocalEmbeddingRuntimeBlockerMessage(message) ||
+        isLocalEmbeddingSidecarAbortMessage(message);
+      if (isDegradedVectorError) {
+        if (degraded) degraded.reason = message;
+      }
+      if (!this.warnedMissingEmbeddingStack && isDegradedVectorError) {
         this.warnedMissingEmbeddingStack = true;
         logger.warn(`GitNexus [query:vector]: ${message}`);
       }
@@ -3848,7 +4285,22 @@ export class LocalBackend {
     } else if (isQualified) {
       // Parenthesised because the kind filter below is appended with AND, which
       // binds tighter than OR.
-      whereClause = `WHERE (n.id = $symName OR n.name = $symName)`;
+      // #3074: a repo-relative file path (e.g. "supabase/functions/_shared/crypto.ts")
+      // is the most natural way to name a File and is exactly what `target.filePath`
+      // reports, but the old clause only matched `n.id` (= "File:<path>") or basename
+      // `n.name`, so the same path the graph stores never resolved. Also match the
+      // repo-relative `n.filePath` exactly and via an anchored suffix (segment-boundary
+      // "ENDS WITH $suffix" where suffix is "/"+path) so "a.ts" does not spuriously
+      // match "mylib/a.ts" — same anchoring used in detect_changes (#2915).
+      const suffix = pathSuffixOf(name);
+      // File-path terms must be scoped to File nodes — n.filePath is shared by
+      // every symbol in the file, so an unlabeled predicate would turn
+      // "src/actions.ts" into every symbol in that file (bot review #3084 P1).
+      // LadybugDB does not allow label tests in WHERE (n:File), so scope via
+      // id prefix — File nodes are `File:<path>`.
+      whereClause = `WHERE (n.id = $symName OR n.name = $symName OR (n.id STARTS WITH $filePrefix AND (n.filePath = $symName OR n.filePath ENDS WITH $suffix)))`;
+      queryParams.suffix = suffix;
+      queryParams.filePrefix = 'File:';
     } else {
       whereClause = `WHERE n.name = $symName`;
     }
@@ -3939,7 +4391,7 @@ export class LocalBackend {
     if (rows.length === 0) return { kind: 'not_found' };
 
     // Normalise row shape across object / tuple returns from LadybugDB.
-    const normalized = rows.map((r: any) => ({
+    let normalized = rows.map((r: any) => ({
       id: (r.id ?? r[0]) as string,
       name: (r.name ?? r[1]) as string,
       type: (r.type ?? r[2] ?? '') as string,
@@ -3948,6 +4400,16 @@ export class LocalBackend {
       endLine: (r.endLine ?? r[5]) as number,
       ...(include_content ? { content: (r.content ?? r[6]) as string | undefined } : {}),
     }));
+
+    // An exact File path wins over anchored suffix candidates. Without this,
+    // `lib/a.ts` and `src/lib/a.ts` both score as File candidates and turn an
+    // otherwise unambiguous exact target into `ambiguous` (#3084 review P2).
+    if (isQualified) {
+      const exactFiles = normalized.filter(
+        (candidate) => candidate.id.startsWith('File:') && candidate.filePath === name,
+      );
+      if (exactFiles.length > 0) normalized = exactFiles;
+    }
 
     // The COUNT can never legitimately be below the page it accompanies, so a
     // value under `normalized.length` means the count leg failed or returned an
@@ -4115,6 +4577,12 @@ export class LocalBackend {
     await this.ensureInitialized(repo);
 
     const { name, uid, file_path, kind, include_content, chain_depth } = params;
+    const requestedContent = include_content ?? false;
+    // Content retention matters only to the opt-in content response. Avoid a
+    // metadata dependency for the long-standing default context operation.
+    const meta = requestedContent ? await loadMeta(path.dirname(repo.lbugPath)) : null;
+    const contentAvailability = requestedContentAvailability(requestedContent, meta);
+    const includeContent = requestedContent && contentRetentionFromMeta(meta) !== 'none';
 
     if (!name && !uid) {
       return { error: 'Either "name" or "uid" parameter is required.' };
@@ -4122,18 +4590,22 @@ export class LocalBackend {
 
     const outcome = await this.resolveSymbolCandidates(
       repo,
-      { uid, name, include_content },
+      { uid, name, include_content: includeContent },
       { file_path, kind },
     );
 
     if (outcome.kind === 'not_found') {
-      return { error: `Symbol '${name || uid}' not found` };
+      return {
+        error: `Symbol '${name || uid}' not found`,
+        ...(contentAvailability ? { contentAvailability } : {}),
+      };
     }
 
     if (outcome.kind === 'ambiguous') {
       const { atLeast, showing, fields } = ambiguityReport(outcome, outcome.candidates.length);
       return {
         status: 'ambiguous',
+        ...(contentAvailability ? { contentAvailability } : {}),
         message: `Found ${atLeast}${outcome.total} symbols matching '${name}'${showing}. Use uid, file_path, or kind to disambiguate.`,
         ...fields,
         candidates: outcome.candidates.map((c) => ({
@@ -4169,7 +4641,8 @@ export class LocalBackend {
         repo.lbugPath,
         `
       MATCH (caller)-[r:CodeRelation]->(n {id: $symId})
-      WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'USES', 'HAS_METHOD', 'HAS_PROPERTY', 'METHOD_OVERRIDES', 'OVERRIDES', 'METHOD_IMPLEMENTS', 'ACCESSES']
+      WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'MEMBER_OF', 'USES', 'DECLARES', 'HAS_METHOD', 'HAS_PROPERTY', 'METHOD_OVERRIDES', 'OVERRIDES', 'METHOD_IMPLEMENTS', 'ACCESSES']
+        AND (r.type <> 'MEMBER_OF' OR labels(n) <> 'Community')
       RETURN r.type AS relType, caller.id AS uid, caller.name AS name, caller.filePath AS filePath, labels(caller)[0] AS kind
       ORDER BY uid, relType
       LIMIT 30
@@ -4324,7 +4797,8 @@ export class LocalBackend {
         repo.lbugPath,
         `
       MATCH (n {id: $symId})-[r:CodeRelation]->(target)
-      WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'USES', 'HAS_METHOD', 'HAS_PROPERTY', 'METHOD_OVERRIDES', 'OVERRIDES', 'METHOD_IMPLEMENTS', 'ACCESSES']
+      WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'MEMBER_OF', 'USES', 'DECLARES', 'HAS_METHOD', 'HAS_PROPERTY', 'METHOD_OVERRIDES', 'OVERRIDES', 'METHOD_IMPLEMENTS', 'ACCESSES']
+        AND (r.type <> 'MEMBER_OF' OR labels(target) <> 'Community')
       RETURN r.type AS relType, target.id AS uid, target.name AS name, target.filePath AS filePath, labels(target)[0] AS kind
       ORDER BY uid, relType
       LIMIT 30
@@ -4559,6 +5033,7 @@ export class LocalBackend {
 
     return {
       status: 'found',
+      ...(contentAvailability ? { contentAvailability } : {}),
       symbol: {
         uid: sym.id || sym[0],
         name: sym.name || sym[1],
@@ -4566,7 +5041,7 @@ export class LocalBackend {
         filePath: sym.filePath || sym[3],
         startLine: toDisplayLine(sym.startLine ?? sym[4]),
         endLine: toDisplayLine(sym.endLine ?? sym[5]),
-        ...(include_content && (sym.content || sym[6]) ? { content: sym.content || sym[6] } : {}),
+        ...(includeContent && (sym.content || sym[6]) ? { content: sym.content || sym[6] } : {}),
         ...(methodMetadata ? { methodMetadata } : {}),
         ...(beanMetadata ? { bean: beanMetadata } : {}),
         ...(aopMetadata ? { aop: aopMetadata } : {}),
@@ -5534,11 +6009,11 @@ export class LocalBackend {
       return { error: `Git diff failed: ${err.message}` };
     }
 
-    const fileDiffs: FileDiff[] = parseDiffHunks(diffOutput);
+    const { files: fileDiffs, unparsedGitHeaders } = parseDiffHunksResult(diffOutput);
 
     if (fileDiffs.length === 0) {
-      // Git printed a diff but none of it parsed: the `+++ b/` headers were not
-      // where `parseDiffHunks` looks. That is a PARSE failure, not a clean tree,
+      // Git printed a diff but none of it parsed: no `diff --git` / `+++`
+      // file header was recognised. That is a PARSE failure, not a clean tree,
       // and the clean branch below would report it to the pre-commit gate as
       // `risk_level:'none'`, no `partial`, exit 0 — a false all-clear (#2915).
       const parseFailed = diffOutput.trim().length > 0;
@@ -5571,7 +6046,9 @@ export class LocalBackend {
     const changedSymbols = new Map<string, any>();
     // Set if a swallowed graph query fails below — surfaces `partial:true` so a
     // degraded run cannot report a false-clean `risk_level:'low'` (#2283).
-    let queryDegraded = false;
+    // An unparsed `diff --git` is the same class: later hunks must not make
+    // the gate look complete.
+    let queryDegraded = unparsedGitHeaders > 0;
 
     // Hunks arrive grouped per path and already in the graph's 0-based line
     // space, so every comparison below is base-neutral (#2377).
@@ -6355,6 +6832,7 @@ export class LocalBackend {
           direction: params.direction,
           suggestion,
           recoverySuggestion,
+          undetermined: true,
         });
         return pdgErr;
       }
@@ -6362,7 +6840,7 @@ export class LocalBackend {
         error: message,
         target: { name: params.target },
         direction: params.direction,
-        impactedCount: 0,
+        impactedCount: null,
         risk: 'UNKNOWN',
         suggestion,
         ...(recoverySuggestion ? { recoverySuggestion } : {}),
@@ -6457,6 +6935,7 @@ export class LocalBackend {
             `(single-repo PDG impact). Remove them or use mode:'callgraph' for cross-repo fan-out.`,
           target: crossDepthTarget,
           direction,
+          undetermined: true,
         });
         return pdgErr;
       }
@@ -6523,12 +7002,17 @@ export class LocalBackend {
             error: `Target '${missing}' not found`,
             target: notFoundTarget,
             direction,
+            undetermined: true,
           })
         : {
             error: `Target '${missing}' not found`,
             target: { name: target },
             direction,
-            impactedCount: 0,
+            // #3074 follow-up: do not ship a normal-shaped 0/UNKNOWN blast radius
+            // alongside the error — it reads as a real "nothing depends on this"
+            // answer. Null marks UNDETERMINED (same as the ambiguous path) so a
+            // consumer testing `impactedCount === 0` cannot misread a miss as safe.
+            impactedCount: null,
             risk: 'UNKNOWN',
           };
     }
@@ -6608,6 +7092,8 @@ export class LocalBackend {
           let summary: {
             impactedCount: number;
             risk: string;
+            riskSharedAxes?: string;
+            riskScale?: ImpactRiskResult['riskScale'];
             riskNote?: string;
             summary?: { direct: number };
           } | null = null;
@@ -6630,6 +7116,7 @@ export class LocalBackend {
                 summaryOnly: true,
                 skipEpistemic: true,
                 skipEnrichment: true,
+                hasExplicitRelationTypes,
               },
             );
           } catch (e) {
@@ -6646,6 +7133,10 @@ export class LocalBackend {
             score: Number(c.score.toFixed(2)),
             impactedCount: summary?.impactedCount ?? 0,
             risk: summary?.risk ?? 'UNKNOWN',
+            ...(summary?.riskSharedAxes !== undefined
+              ? { riskSharedAxes: summary.riskSharedAxes }
+              : {}),
+            ...(summary?.riskScale !== undefined ? { riskScale: summary.riskScale } : {}),
             direct: summary?.summary?.direct ?? 0,
             ...(summary?.riskNote !== undefined ? { riskNote: summary.riskNote } : {}),
             // Carry the explanation with the verdict. The single-symbol path
@@ -6884,6 +7375,7 @@ export class LocalBackend {
           limit: Number.isFinite(params.limit) ? params.limit : 100,
           offset: Number.isFinite(params.offset) ? params.offset : 0,
           pdgBridge,
+          hasExplicitRelationTypes,
         });
         return composeUnifiedPdgImpactResult(pdgResult, interproceduralResult);
       } catch (e) {
@@ -6900,6 +7392,7 @@ export class LocalBackend {
       limit: Number.isFinite(params.limit) ? params.limit : 100,
       offset: Number.isFinite(params.offset) ? params.offset : 0,
       summaryOnly: params.summaryOnly,
+      hasExplicitRelationTypes,
     });
   }
 
@@ -7049,6 +7542,7 @@ export class LocalBackend {
     symId: string,
     symType: string,
     symName: string,
+    direction?: 'upstream' | 'downstream',
   ): Promise<{
     epistemic: 'exact' | 'lower-bound';
     boundaries?: string[];
@@ -7076,6 +7570,10 @@ export class LocalBackend {
       meta = undefined;
     }
     const receiverDrops = unresolvedReceiverBoundaries(meta?.unresolvedReceiverMembers, symName);
+    const scopeExtractionDrops = scopeExtractionBoundaries(
+      meta?.scopeExtractionFailures,
+      meta?.scopeExtractionReceipt,
+    );
     // #2873 — satisfaction checks the analyzer never completed. Read on the
     // same footing as the receiver drops, and BEFORE the heritage probe for the
     // same reason: this cause leaves no edge for that probe to find, so a
@@ -7085,6 +7583,32 @@ export class LocalBackend {
     // the owning-type hop below would be a graph round-trip per method query in
     // every index that has no such record — which is every non-Go one, since Go
     // is the only language with a structural-satisfaction hook.
+    const convexDispatchPromise =
+      direction === 'downstream'
+        ? Promise.resolve(undefined)
+        : queryConvexDispatchMetadata(repo.lbugPath, symId, symName, symType);
+    // #3399 — callables named in value position. Upstream only: the question
+    // "who can reach this symbol" is the one a registration makes unanswerable.
+    // A downstream walk asks what THIS symbol reaches, which a reference INTO
+    // it does not affect.
+    //
+    // Issued alongside the heritage probe rather than after it, and read into
+    // `droppedBoundaries` below, so it hedges even when that probe finds
+    // nothing AND when it throws — a value reference is an independent reason
+    // a count is short, exactly as the receiver drops above are.
+    const valueRefPromise =
+      direction === 'downstream'
+        ? Promise.resolve({ notes: [] as string[], referrers: 0 })
+        : callableValueReferenceBoundaries(repo.lbugPath, symId);
+    const interfaceRowsPromise = executeParameterized(
+      repo.lbugPath,
+      `MATCH (x)-[r:CodeRelation]->(iface)
+       WHERE x.id = $symId AND r.type IN $heritage
+       RETURN DISTINCT iface.id AS id, iface.name AS name, labels(iface)[0] AS label
+       ORDER BY id
+       LIMIT 25`,
+      { symId, heritage: HERITAGE_TYPES },
+    ).catch(() => []);
     const undecidedSummary = meta?.undecidedInterfaceSatisfaction;
     const undecidedDrops =
       undecidedSummary === undefined
@@ -7095,10 +7619,24 @@ export class LocalBackend {
               ? await this.owningTypeNames(repo, symId)
               : []),
           ]);
+    const convexDispatch = await convexDispatchPromise;
+    const valueRefDrops = await valueRefPromise;
     const droppedBoundaries = {
       ...receiverDrops,
-      notes: [...receiverDrops.notes, ...undecidedDrops.notes],
+      notes: [
+        ...receiverDrops.notes,
+        ...scopeExtractionDrops.notes,
+        ...undecidedDrops.notes,
+        ...valueRefDrops.notes,
+        ...(convexDispatch === undefined ? [] : [convexDispatch.boundary]),
+      ],
       undecided: undecidedDrops.undecided,
+      // Endpoint/probe evidence proves incompleteness but does not expose a
+      // count of omitted symbols. Keep the magnitude at zero rather than
+      // inventing one from the presence of a note.
+      dispatch: 0,
+      scopeExtraction: scopeExtractionDrops.files,
+      callableValueReferences: valueRefDrops.referrers,
     };
     try {
       // Discover the interface / abstract supertypes on the target's boundary.
@@ -7107,15 +7645,7 @@ export class LocalBackend {
       if (symType === 'Interface') {
         boundary.set(symId, { name: symName || '', label: 'Interface' });
       }
-      const ifaceRows = await executeParameterized(
-        repo.lbugPath,
-        `MATCH (x)-[r:CodeRelation]->(iface)
-         WHERE x.id = $symId AND r.type IN $heritage
-         RETURN DISTINCT iface.id AS id, iface.name AS name, labels(iface)[0] AS label
-         ORDER BY id
-         LIMIT 25`,
-        { symId, heritage: HERITAGE_TYPES },
-      ).catch(() => []);
+      const ifaceRows = await interfaceRowsPromise;
       for (const r of ifaceRows) {
         const id = (r.id ?? r[0]) as string;
         if (id && !boundary.has(id)) {
@@ -7193,10 +7723,12 @@ export class LocalBackend {
         epistemic: 'lower-bound',
         boundaries: [...droppedBoundaries.notes, ...boundaries],
         causes: {
+          scopeExtractionFiles: droppedBoundaries.scopeExtraction,
           receiverTyping: droppedBoundaries.sites,
-          dispatchBoundary: dispatchBoundarySymbols,
+          dispatchBoundary: droppedBoundaries.dispatch + dispatchBoundarySymbols,
           externalBoundary: droppedBoundaries.external,
           undecidedSatisfaction: droppedBoundaries.undecided,
+          callableValueReferences: droppedBoundaries.callableValueReferences,
         },
       };
     } catch {
@@ -7258,6 +7790,8 @@ export class LocalBackend {
       skipEpistemic?: boolean;
       skipEnrichment?: boolean;
       pdgBridge?: PdgBridgeOptions;
+      /** Preserve an explicit caller filter; implicit structural seeds must not widen it. */
+      hasExplicitRelationTypes?: boolean;
     },
   ): Promise<any> {
     const { maxDepth, relationTypes, includeTests, minConfidence } = opts;
@@ -7301,7 +7835,13 @@ export class LocalBackend {
       causes?: EpistemicCauses;
     }> = opts.skipEpistemic
       ? Promise.resolve({})
-      : this.computeEpistemicBoundary(repo, symId, symType, (sym.name || sym[1]) as string);
+      : this.computeEpistemicBoundary(
+          repo,
+          symId,
+          symType,
+          (sym.name || sym[1]) as string,
+          direction,
+        );
     const beanMetadataPromise =
       opts.skipEpistemic || summaryOnly
         ? Promise.resolve(undefined)
@@ -7314,7 +7854,11 @@ export class LocalBackend {
     const visited = new Set<string>([symId]);
     const pdgBridgeEvidenceById = new Map<string, PdgBridgeEvidenceInfo>();
     let frontier = [symId];
+    const objectCallableFrontier: string[] = [];
     let traversalComplete = true;
+    // Fetch one sentinel row beyond the cap so generated object bindings
+    // degrade visibly instead of allocating an unbounded seed frontier.
+    const OBJECT_CALLABLE_MEMBER_CAP = 5000;
 
     // Fix #480: For Java (and other JVM) Class/Interface nodes, CALLS edges
     // point to Constructor nodes and IMPORTS edges point to File nodes — not
@@ -7389,6 +7933,63 @@ export class LocalBackend {
         }
       } catch (e) {
         logQueryError('impact:class-node-expansion', e);
+        traversalComplete = false;
+      }
+    }
+
+    // Function-valued properties on exported object bindings are represented
+    // as Const/Variable -[:HAS_METHOD]-> Function. HAS_METHOD is intentionally
+    // absent from the default usage traversal, but downstream impact on the
+    // binding still needs to enter its own callable member before following
+    // CALLS.
+    if (
+      direction === 'downstream' &&
+      (symType === 'Const' || symType === 'Variable') &&
+      relationTypes.includes('CALLS') &&
+      !relationTypes.includes('HAS_METHOD') &&
+      !opts.hasExplicitRelationTypes
+    ) {
+      try {
+        const memberRows = await executeParameterized(
+          repo.lbugPath,
+          `
+          MATCH (n)-[hm:CodeRelation]->(member:Function)
+          WHERE n.id = $symId AND hm.type = 'HAS_METHOD'
+          RETURN DISTINCT member.id AS id, member.name AS name,
+                 'Function' AS type, member.filePath AS filePath
+          ORDER BY id
+          LIMIT ${OBJECT_CALLABLE_MEMBER_CAP + 1}
+          UNION ALL
+          MATCH (n)-[hm:CodeRelation]->(member:Method)
+          WHERE n.id = $symId AND hm.type = 'HAS_METHOD'
+          RETURN DISTINCT member.id AS id, member.name AS name,
+                 'Method' AS type, member.filePath AS filePath
+          ORDER BY id
+          LIMIT ${OBJECT_CALLABLE_MEMBER_CAP + 1}
+        `,
+          { symId },
+        );
+        memberRows.sort((a, b) => compareCodeUnits(String(a.id ?? a[0]), String(b.id ?? b[0])));
+        if (memberRows.length > OBJECT_CALLABLE_MEMBER_CAP) traversalComplete = false;
+        for (const row of memberRows.slice(0, OBJECT_CALLABLE_MEMBER_CAP)) {
+          const memberId = row.id || row[0];
+          if (memberId && !visited.has(memberId)) {
+            visited.add(memberId);
+            objectCallableFrontier.push(memberId);
+            impacted.push({
+              depth: 1,
+              id: memberId,
+              name: row.name || row[1],
+              type: row.type || row[2],
+              filePath: row.filePath || row[3] || '',
+              relationType: 'HAS_METHOD',
+              confidence: 1,
+            });
+          }
+        }
+      } catch (e) {
+        logQueryError('impact:object-callable-expansion', e);
+        traversalComplete = false;
       }
     }
 
@@ -7434,8 +8035,8 @@ export class LocalBackend {
       // tool. `sourceId` closes the order for edges that tie on both.
       const query =
         direction === 'upstream'
-          ? `MATCH (caller)-[r:CodeRelation]->(n) WHERE n.id IN $frontierIds AND r.type IN $relTypes${confidenceFilter} RETURN n.id AS sourceId, caller.id AS id, caller.name AS name, labels(caller)[0] AS type, caller.filePath AS filePath, r.type AS relType, r.confidence AS confidence`
-          : `MATCH (n)-[r:CodeRelation]->(callee) WHERE n.id IN $frontierIds AND r.type IN $relTypes${confidenceFilter} RETURN n.id AS sourceId, callee.id AS id, callee.name AS name, labels(callee)[0] AS type, callee.filePath AS filePath, r.type AS relType, r.confidence AS confidence`;
+          ? `MATCH (caller)-[r:CodeRelation]->(n) WHERE n.id IN $frontierIds AND r.type IN $relTypes${confidenceFilter} RETURN n.id AS sourceId, caller.id AS id, caller.name AS name, labels(caller)[0] AS type, caller.filePath AS filePath, r.type AS relType, r.confidence AS confidence, r.staticGated AS staticGated`
+          : `MATCH (n)-[r:CodeRelation]->(callee) WHERE n.id IN $frontierIds AND r.type IN $relTypes${confidenceFilter} RETURN n.id AS sourceId, callee.id AS id, callee.name AS name, labels(callee)[0] AS type, callee.filePath AS filePath, r.type AS relType, r.confidence AS confidence, r.staticGated AS staticGated`;
 
       try {
         const related = await executeParameterized(repo.lbugPath, query, {
@@ -7452,6 +8053,9 @@ export class LocalBackend {
           relType: rel.relType || rel[5],
           confidence: rel.confidence ?? rel[6],
           sourceId: String(rel.sourceId ?? rel[0] ?? ''),
+          // Set only by languages that compute static gating (Zig); null/undefined
+          // from older indexes or other languages reads as live.
+          ...((rel.staticGated ?? rel[7]) === true ? { staticGated: true } : {}),
         }));
 
         // The pdg bridge is the ONE consumer here that accumulates sequentially
@@ -7533,6 +8137,9 @@ export class LocalBackend {
             filePath: edge.filePath,
             relationType,
             confidence: effectiveConfidence,
+            // Surfaced, never acted on: traversal and ranking ignore the flag
+            // (see GraphRelationship.staticGated). Absent = live or unmodelled.
+            ...(edge.staticGated === true ? { staticGated: true } : {}),
           });
         }
       } catch (e) {
@@ -7543,7 +8150,10 @@ export class LocalBackend {
         break;
       }
 
-      frontier = nextFrontier;
+      frontier =
+        depth === 1 && objectCallableFrontier.length > 0
+          ? [...new Set([...nextFrontier, ...objectCallableFrontier])]
+          : nextFrontier;
     }
 
     // Stamp the finalized, order-independent bridge evidence (strongest across
@@ -7603,6 +8213,10 @@ export class LocalBackend {
     const parsedMaxChunks = rawMaxChunks ? Number(rawMaxChunks) : Number.NaN;
     const MAX_CHUNKS =
       Number.isInteger(parsedMaxChunks) && parsedMaxChunks >= 0 ? parsedMaxChunks : 10;
+    let processQueryFailed = false;
+    let moduleQueryFailed = false;
+    let enrichmentDegraded = false;
+    let moduleClassificationFailed = false;
 
     // `skipEnrichment` (ambiguous #2129 per-candidate probes) bypasses the
     // process/module aggregation passes entirely — those probes need only the
@@ -7653,7 +8267,12 @@ export class LocalBackend {
             ORDER BY pId
           `,
             { ids },
-          ).catch(() => []);
+          ).catch((err) => {
+            processQueryFailed = true;
+            enrichmentDegraded = true;
+            logQueryError('impact:process-chunk', err);
+            return [];
+          });
 
           for (const row of rows) {
             const pId = row.pId ?? row[0];
@@ -7704,6 +8323,8 @@ export class LocalBackend {
             ep.earliest_broken_step = Math.min(ep.earliest_broken_step, minStep ?? Infinity);
           }
         } catch (e) {
+          processQueryFailed = true;
+          enrichmentDegraded = true;
           logQueryError('impact:process-chunk', e);
         }
       }
@@ -7723,7 +8344,11 @@ export class LocalBackend {
             RETURN p.id AS pid, MIN(r.step) AS minStep
           `,
             { pIds, ids: allImpactedIds },
-          ).catch(() => []);
+          ).catch((err) => {
+            enrichmentDegraded = true;
+            logQueryError('impact:process-chunk-backfill', err);
+            return [];
+          });
 
           for (const mr of missingRows) {
             const pid = mr.pid ?? mr[0];
@@ -7737,6 +8362,7 @@ export class LocalBackend {
             }
           }
         } catch (e) {
+          enrichmentDegraded = true;
           logQueryError('impact:process-chunk-backfill', e);
         }
       }
@@ -7797,7 +8423,12 @@ export class LocalBackend {
             LIMIT 20
           `,
             { ids: idsChunk },
-          ).catch(() => []);
+          ).catch((err) => {
+            moduleQueryFailed = true;
+            enrichmentDegraded = true;
+            logQueryError('impact:module-chunk', err);
+            return [];
+          });
 
           for (const r of rows) {
             const name = r.name ?? r[0] ?? null;
@@ -7806,6 +8437,8 @@ export class LocalBackend {
             moduleHitsMap.set(name, (moduleHitsMap.get(name) || 0) + hits);
           }
         } catch (e) {
+          moduleQueryFailed = true;
+          enrichmentDegraded = true;
           logQueryError('impact:module-chunk', e);
         }
       };
@@ -7831,12 +8464,19 @@ export class LocalBackend {
             RETURN DISTINCT c.heuristicLabel AS name
           `,
             { ids: idsChunk },
-          ).catch(() => []);
+          ).catch((err) => {
+            enrichmentDegraded = true;
+            moduleClassificationFailed = true;
+            logQueryError('impact:direct-module-chunk', err);
+            return [];
+          });
           for (const r of rows) {
             const name = r.name ?? r[0] ?? null;
             if (name) directModuleSet.add(name);
           }
         } catch (e) {
+          enrichmentDegraded = true;
+          moduleClassificationFailed = true;
           logQueryError('impact:direct-module-chunk', e);
         }
       };
@@ -7861,7 +8501,11 @@ export class LocalBackend {
         return {
           name,
           hits,
-          impact: directModuleNameSet.has(name) ? 'direct' : 'indirect',
+          impact: moduleClassificationFailed
+            ? 'classification-unavailable'
+            : directModuleNameSet.has(name)
+              ? 'direct'
+              : 'indirect',
         };
       });
     }
@@ -7869,40 +8513,25 @@ export class LocalBackend {
     // Risk scoring
     const processCount = affectedProcesses.length;
     const moduleCount = affectedModules.length;
-    let risk: string;
-    if (direction === 'upstream' && impacted.length === 0) {
-      // An upstream walk that resolved NO callers cannot support `LOW`. "Safe
-      // to change" is a claim ABOUT callers, and this walk found none to reason
-      // about: the symbol may be genuinely unused, or reached only through a
-      // reference class this index does not record — a property access on a
-      // plain object, or a bare-identifier read of a module-scope `Const`,
-      // neither of which mints a reference site today. Seeding `LOW` from an
-      // empty result is the same false-safe signal `anyKnownRisk` refuses to
-      // emit on the ambiguous-candidate path, and that #2687 removed by making
-      // an undetermined `impactedCount` `null` instead of `0`.
-      //
-      // Downstream is deliberately untouched: an empty downstream walk reports
-      // that this symbol resolved no callees, which is not a safety verdict.
-      risk = 'UNKNOWN';
-    } else if (
-      directCount >= 30 ||
-      processCount >= 5 ||
-      moduleCount >= 5 ||
-      impacted.length >= 200
-    ) {
-      risk = 'CRITICAL';
-    } else if (
-      directCount >= 15 ||
-      processCount >= 3 ||
-      moduleCount >= 3 ||
-      impacted.length >= 100
-    ) {
-      risk = 'HIGH';
-    } else if (directCount >= 5 || impacted.length >= 30) {
-      risk = 'MEDIUM';
-    } else {
-      risk = 'LOW';
-    }
+    const isFileTarget = symType === 'File' || String(symId).startsWith('File:');
+    const unusedAxes = unusedAxesForImpactWalk({
+      isFileTarget,
+      skipEnrichment,
+      maxChunks: MAX_CHUNKS,
+      processQueryFailed,
+      moduleQueryFailed,
+      impactedCount: impacted.length,
+      enrichmentTruncated:
+        !skipEnrichment && MAX_CHUNKS > 0 && impacted.length > MAX_CHUNKS * CHUNK_SIZE,
+    });
+    const { risk, riskSharedAxes, riskScale } = scoreImpactRisk({
+      direction,
+      directCount,
+      processCount,
+      moduleCount,
+      impactedCount: impacted.length,
+      unusedAxes,
+    });
 
     // Build per-depth counts (always included, even in summaryOnly mode)
     const byDepthCounts: Record<number, number> = {};
@@ -7922,7 +8551,7 @@ export class LocalBackend {
       target: {
         id: symId,
         name: sym.name || sym[1],
-        type: symType,
+        type: isFileTarget ? symType || 'File' : symType,
         filePath: sym.filePath || sym[2],
         ...(beanMetadata ? { bean: beanMetadata } : {}),
         ...(aopMetadata ? { aop: aopMetadata } : {}),
@@ -7930,18 +8559,27 @@ export class LocalBackend {
       direction,
       impactedCount: impacted.length,
       risk,
+      riskSharedAxes,
+      riskScale,
       ...(risk === 'UNKNOWN'
         ? {
             riskNote:
-              'No callers resolved. Absence of edges is not evidence the symbol is unused: ' +
-              'a caller reaching it through a reference class this index does not record — ' +
-              'plain-object property access, a bare-identifier read of a module-scope const — ' +
-              'produces no edge to find. Confirm with a text search before treating the ' +
-              'change as safe.',
+              processQueryFailed || moduleQueryFailed
+                ? 'Risk is unresolved because process/module enrichment failed. Observed counts ' +
+                  'are lower bounds; retry impact before treating the change as safe.'
+                : unusedAxes.some((axis) => axis.reason === 'enrichment-truncated')
+                  ? 'Risk is unresolved because process/module enrichment was truncated. Observed ' +
+                    'counts are lower bounds; retry with a higher IMPACT_MAX_CHUNKS before ' +
+                    'treating the change as safe.'
+                  : 'No callers resolved. Absence of edges is not evidence the symbol is unused: ' +
+                    'a caller reaching it through a reference class this index does not record — ' +
+                    'plain-object property access, a bare-identifier read of a module-scope const — ' +
+                    'produces no edge to find. Confirm with a text search before treating the ' +
+                    'change as safe.',
           }
         : {}),
       ...epistemic,
-      ...(!traversalComplete && { partial: true }),
+      ...((!traversalComplete || enrichmentDegraded) && { partial: true }),
       summary: {
         direct: directCount,
         processes_affected: processCount,
@@ -8157,6 +8795,7 @@ export class LocalBackend {
         // the #1858 epistemic/boundaries fields — computing them per neighbor is
         // dead work on the highest-volume path, so suppress them here too.
         skipEpistemic: true,
+        hasExplicitRelationTypes: opts.relationTypes.length > 0,
       });
     } catch {
       return null;
@@ -8256,6 +8895,14 @@ export class LocalBackend {
         target: params.target,
         direction: params.direction,
       };
+      // Forward the target-selector params like the trace branch above.
+      // @group impact used to drop target_uid/file_path/kind here, so a name
+      // shared by same-named Api/Impl/Controller layers resolved ambiguously
+      // in the member repo and the documented "re-call with target_uid"
+      // disambiguation loop (impact tool schema) never worked in group mode.
+      if (typeof params.target_uid === 'string') impactArgs.target_uid = params.target_uid;
+      if (typeof params.file_path === 'string') impactArgs.file_path = params.file_path;
+      if (typeof params.kind === 'string') impactArgs.kind = params.kind;
       if (params.maxDepth !== undefined) impactArgs.maxDepth = params.maxDepth;
       if (params.crossDepth !== undefined) impactArgs.crossDepth = params.crossDepth;
       if (params.relationTypes !== undefined) impactArgs.relationTypes = params.relationTypes;
@@ -8384,6 +9031,9 @@ export class LocalBackend {
       responseKeys: string[] | null;
       errorKeys: string[] | null;
       middleware: string[] | null;
+      runtimeConfirmed: boolean;
+      runtimeSource: string | null;
+      runtimeStatus: string | null;
       consumers: Array<{
         name: string;
         filePath: string;
@@ -8392,9 +9042,7 @@ export class LocalBackend {
       }>;
     }>
   > {
-    const rows = await executeParameterized(
-      repoId,
-      `
+    const routeQuery = (includeRuntimeEvidence: boolean) => `
       MATCH (n:Route)
       WHERE n.id STARTS WITH 'Route:' ${routeFilter}
       OPTIONAL MATCH (consumer)-[r:CodeRelation]->(n)
@@ -8402,10 +9050,19 @@ export class LocalBackend {
       RETURN n.id AS routeId, n.name AS routeName, n.filePath AS handlerFile,
              n.responseKeys AS responseKeys, n.errorKeys AS errorKeys, n.middleware AS middleware,
              consumer.name AS consumerName, consumer.filePath AS consumerFile,
-             r.reason AS fetchReason, n.method AS method
-    `,
-      params,
-    );
+             r.reason AS fetchReason, n.method AS method${
+               includeRuntimeEvidence
+                 ? ', n.runtimeConfirmed AS runtimeConfirmed, n.runtimeSource AS runtimeSource, n.runtimeStatus AS runtimeStatus'
+                 : ''
+             }
+    `;
+    let rows;
+    try {
+      rows = await executeParameterized(repoId, routeQuery(true), params);
+    } catch (error) {
+      if (!isMissingRouteRuntimePropertyError(error)) throw error;
+      rows = await executeParameterized(repoId, routeQuery(false), params);
+    }
 
     // Strip wrapping quotes from DB array elements — CSV COPY stores ['key'] which
     // LadybugDB may return as "'key'" rather than "key"
@@ -8422,6 +9079,9 @@ export class LocalBackend {
         responseKeys: string[] | null;
         errorKeys: string[] | null;
         middleware: string[] | null;
+        runtimeConfirmed: boolean;
+        runtimeSource: string | null;
+        runtimeStatus: string | null;
         consumers: Array<{
           name: string;
           filePath: string;
@@ -8445,6 +9105,9 @@ export class LocalBackend {
       // resource). Appended last in RETURN so positional fallbacks for the
       // consumer/reason columns above stay stable.
       const method: string | null = row.method ?? row[9] ?? null;
+      const runtimeConfirmed = (row.runtimeConfirmed ?? row[10]) === true;
+      const runtimeSource: string | null = row.runtimeSource ?? row[11] ?? null;
+      const runtimeStatus: string | null = row.runtimeStatus ?? row[12] ?? null;
 
       if (!routeMap.has(id)) {
         routeMap.set(id, {
@@ -8455,6 +9118,9 @@ export class LocalBackend {
           responseKeys,
           errorKeys,
           middleware,
+          runtimeConfirmed,
+          runtimeSource,
+          runtimeStatus,
           consumers: [],
         });
       }
@@ -8550,6 +9216,7 @@ export class LocalBackend {
         route: r.name,
         method: r.method,
         handler: r.filePath,
+        runtimeEvidence: routeRuntimeEvidence(r),
         middleware: r.middleware || [],
         consumers: r.consumers,
         flows: flowMap.get(r.id) || [],
@@ -8618,6 +9285,7 @@ export class LocalBackend {
           route: r.name,
           method: r.method,
           handler: r.filePath,
+          runtimeEvidence: routeRuntimeEvidence(r),
           ...(responseKeys.length > 0 ? { responseKeys } : {}),
           ...(errorKeys.length > 0 ? { errorKeys } : {}),
           consumers,
@@ -8819,6 +9487,7 @@ export class LocalBackend {
         route: r.name,
         method: r.method,
         handler: r.filePath,
+        runtimeEvidence: routeRuntimeEvidence(r),
         responseShape: {
           success: responseKeys,
           error: errorKeys,
@@ -9032,14 +9701,15 @@ export class LocalBackend {
   }
 
   async disconnect(): Promise<void> {
-    await closeLbug(); // close all connections
-    // Note: we intentionally do NOT call disposeEmbedder() here.
-    // ONNX Runtime's native cleanup segfaults on macOS and some Linux configs,
-    // and importing the embedder module on Node v24+ crashes if onnxruntime
-    // was never loaded during the session. Since process.exit(0) follows
-    // immediately after disconnect(), the OS reclaims everything. See #38, #89.
-    this.repos.clear();
-    this.contextCache.clear();
-    this.initializedRepos.clear();
+    try {
+      await closeLbug(); // close all connections
+    } finally {
+      // Reap even when Ladybug close rejects. Do not run ONNX dispose in this
+      // process (native dispose can SIGSEGV). The reap helper does not load ONNX.
+      await reapEmbeddingSidecarSafely();
+      this.repos.clear();
+      this.contextCache.clear();
+      this.initializedRepos.clear();
+    }
   }
 }

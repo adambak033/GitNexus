@@ -10,12 +10,13 @@ import readline from 'readline';
 import { execSync, execFileSync } from 'child_process';
 import cliProgress from 'cli-progress';
 import { getGitRoot, isGitRepo } from '../storage/git.js';
+import { getStoragePaths, loadCLIConfig, saveCLIConfig } from '../storage/repo-manager.js';
 import {
-  getStoragePaths,
-  loadMeta,
-  loadCLIConfig,
-  saveCLIConfig,
-} from '../storage/repo-manager.js';
+  requireStoragePath,
+  STATUS_STORAGE_REQUIREMENTS,
+  StorageRequirementError,
+  isUnusableIndexInspection,
+} from '../storage/storage-resolver.js';
 import { WikiGenerator, type WikiOptions } from '../core/wiki/generator.js';
 import {
   MINIMAX_MODEL_IDS,
@@ -25,6 +26,7 @@ import {
   type LLMProvider,
 } from '../core/wiki/llm-client.js';
 import { detectCursorCLI } from '../core/wiki/cursor-client.js';
+import { detectGrokCLI } from '../core/wiki/grok-client.js';
 import { detectLocalCLI } from '../core/wiki/local-cli-client.js';
 import { logger } from '../core/logger.js';
 
@@ -65,20 +67,22 @@ function parsePositiveIntegerOption(
 
 function isLocalProvider(
   provider: LLMProvider | undefined,
-): provider is 'cursor' | 'claude' | 'codex' | 'opencode' {
+): provider is 'cursor' | 'claude' | 'codex' | 'opencode' | 'grok' {
   return (
     provider === 'cursor' ||
     provider === 'claude' ||
     provider === 'codex' ||
-    provider === 'opencode'
+    provider === 'opencode' ||
+    provider === 'grok'
   );
 }
 
-function localModelConfigKey(provider: 'cursor' | 'claude' | 'codex' | 'opencode') {
+function localModelConfigKey(provider: 'cursor' | 'claude' | 'codex' | 'opencode' | 'grok') {
   if (provider === 'cursor') return 'cursorModel';
   if (provider === 'claude') return 'claudeModel';
   if (provider === 'codex') return 'codexModel';
   if (provider === 'opencode') return 'opencodeModel';
+  if (provider === 'grok') return 'grokModel';
   throw new Error(`Unsupported local provider: ${provider satisfies never}`);
 }
 
@@ -180,15 +184,23 @@ const wikiCommandImpl = async (inputPath?: string, options?: WikiCommandOptions)
   }
 
   // ── Check for existing index ────────────────────────────────────────
-  const { storagePath, lbugPath } = getStoragePaths(repoPath);
-  const meta = await loadMeta(storagePath);
-
-  if (!meta) {
-    console.log('  Error: No GitNexus index found.');
+  let storagePath: string;
+  try {
+    storagePath = await requireStoragePath(repoPath, STATUS_STORAGE_REQUIREMENTS);
+  } catch (error) {
+    if (!(error instanceof StorageRequirementError)) throw error;
+    const inspection = error.inspection;
+    if (!isUnusableIndexInspection(inspection)) {
+      console.log(`  Error: ${error.message}\n`);
+      process.exitCode = 1;
+      return;
+    }
+    console.log(`  Error: No GitNexus index found at ${error.inspection.storagePath}.`);
     console.log('  Run `gitnexus analyze` first to index this repository.\n');
     process.exitCode = 1;
     return;
   }
+  const { lbugPath } = getStoragePaths(repoPath, undefined, storagePath);
 
   let timeoutSeconds: number | undefined;
   let retries: number | undefined;
@@ -287,7 +299,9 @@ const wikiCommandImpl = async (inputPath?: string, options?: WikiCommandOptions)
       if (!llmConfig.apiKey && !isLocalProvider(llmConfig.provider)) {
         console.log('  Error: No LLM API key found.');
         console.log('  Set MINIMAX_API_KEY, GITNEXUS_API_KEY, or OPENAI_API_KEY,');
-        console.log('  or pass --api-key <key>, or use --provider cursor|claude|codex|opencode.\n');
+        console.log(
+          '  or pass --api-key <key>, or use --provider cursor|claude|codex|opencode|grok.\n',
+        );
         process.exitCode = 1;
         return;
       }
@@ -301,9 +315,10 @@ const wikiCommandImpl = async (inputPath?: string, options?: WikiCommandOptions)
       const hasClaude = detectLocalCLI('claude');
       const hasCodex = detectLocalCLI('codex');
       const hasOpenCode = detectLocalCLI('opencode');
+      const hasGrok = detectGrokCLI();
       const localChoices: Array<{
         choice: string;
-        provider: 'cursor' | 'claude' | 'codex' | 'opencode';
+        provider: 'cursor' | 'claude' | 'codex' | 'opencode' | 'grok';
       }> = [];
 
       // Provider selection
@@ -345,6 +360,14 @@ const wikiCommandImpl = async (inputPath?: string, options?: WikiCommandOptions)
           provider: 'opencode',
         });
         console.log(`  [${choice}] OpenCode CLI (local, uses your OpenCode login/config)`);
+      }
+      if (hasGrok) {
+        const choice = String(nextChoice++);
+        localChoices.push({
+          choice,
+          provider: 'grok',
+        });
+        console.log(`  [${choice}] Grok CLI (local, uses your Grok Build login)`);
       }
       console.log('');
 
